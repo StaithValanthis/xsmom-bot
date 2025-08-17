@@ -1,0 +1,63 @@
+exchange:
+  id: bybit
+  account_type: swap
+  quote: USDT
+  only_perps: true
+  unified_margin: true
+  testnet: false
+  max_symbols: 10
+  min_usd_volume_24h: 50000000
+  min_price: 0.01
+  timeframe: "1h"
+  candles_limit: 1000
+
+strategy:
+  lookbacks: [1, 4, 12]
+  lookback_weights: [1.0, 1.0, 1.0]
+  vol_lookback: 36
+  k_min: 1
+  k_max: 2
+  market_neutral: false          # allow directional exposure
+  gross_leverage: 1.0
+  max_weight_per_asset: 0.5
+  regime_filter:
+    enabled: false               # too noisy at this size
+    ema_len: 200
+    slope_min_bps_per_day: 0
+  funding_tilt:
+    enabled: false
+
+liquidity:
+  adv_cap_pct: 0.01              # irrelevant at this size
+  notional_cap_usdt: 1000
+
+execution:
+  order_type: market
+  post_only: false
+  price_offset_bps: 0
+  slippage_bps_guard: 25
+  set_leverage: 3
+  rebalance_minute: 5
+  poll_seconds: 15
+
+risk:
+  atr_mult_sl: 1.5
+  atr_mult_tp: 0
+  use_tp: false
+  max_daily_loss_pct: 5.0
+  trade_disable_minutes: 120
+
+costs:
+  taker_fee_bps: 6.0
+  maker_fee_bps: 0.0
+  slippage_bps: 8.0
+  funding_bps_per_day: 1.0
+
+paths:
+  state_path: "state/state.json"
+  logs_dir: "logs"
+
+logging:
+  level: INFO
+  file_max_mb: 20
+  file_backups: 5

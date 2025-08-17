@@ -5,20 +5,16 @@ APP_DIR="/opt/xsmom-bot"
 SERVICE_NAME="xsmom-bot"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 PYTHON_BIN="/usr/bin/python3"
-
-# You can override the run user by exporting RUN_AS before calling install.sh
 RUN_AS="${RUN_AS:-ubuntu}"
 RUN_GROUP="${RUN_GROUP:-$RUN_AS}"
 
 echo "[*] Creating app directory at ${APP_DIR}..."
-sudo mkdir -p "${APP_DIR}"
-sudo mkdir -p "${APP_DIR}/src" "${APP_DIR}/systemd" "${APP_DIR}/state" "${APP_DIR}/logs"
+sudo mkdir -p "${APP_DIR}"/{src,systemd,state,logs,config,tests}
 
 echo "[*] Copying repository files..."
-# Assumes you run this from the repo root
 sudo rsync -a --delete \
   README.md requirements.txt .env.example install.sh run_local.sh \
-  src/ systemd/ state/ logs/ \
+  config/ src/ systemd/ state/ logs/ tests/ \
   "${APP_DIR}/"
 
 echo "[*] Setting permissions..."
@@ -33,6 +29,12 @@ echo "[*] Creating .env from example (if missing)..."
 if [ ! -f "${APP_DIR}/.env" ]; then
   sudo -u "${RUN_AS}" cp "${APP_DIR}/.env.example" "${APP_DIR}/.env"
   echo "    -> Edit ${APP_DIR}/.env to set your BYBIT_API_KEY/SECRET"
+fi
+
+echo "[*] Creating config.yaml from example (if missing)..."
+if [ ! -f "${APP_DIR}/config/config.yaml" ]; then
+  sudo -u "${RUN_AS}" cp "${APP_DIR}/config/config.yaml.example" "${APP_DIR}/config/config.yaml"
+  echo "    -> Edit ${APP_DIR}/config/config.yaml to tune strategy"
 fi
 
 echo "[*] Installing systemd service..."

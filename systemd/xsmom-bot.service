@@ -9,16 +9,14 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/xsmom-bot
 EnvironmentFile=/opt/xsmom-bot/.env
-ExecStart=/opt/xsmom-bot/venv/bin/python -u /opt/xsmom-bot/src/multi_pair_xsmom.py --live --dry
-# Replace '--dry' with nothing once you are ready to trade live:
-# ExecStart=/opt/xsmom-bot/venv/bin/python -u /opt/xsmom-bot/src/multi_pair_xsmom.py --live
+ExecStart=/opt/xsmom-bot/venv/bin/python -m src.main live --config /opt/xsmom-bot/config/config.yaml --dry
+# Live trading (remove --dry after validation):
+# ExecStart=/opt/xsmom-bot/venv/bin/python -m src.main live --config /opt/xsmom-bot/config/config.yaml
 
 Restart=always
 RestartSec=10
-# Helpful resource limits for busy universes
 LimitNOFILE=65535
 
-# Hardening (optional but recommended)
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
