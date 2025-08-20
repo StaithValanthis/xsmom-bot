@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from typing import Optional
 
 
@@ -11,6 +11,20 @@ def utcnow() -> datetime:
 
 
 def setup_logging(level: str, logs_dir: str, file_max_mb: int, file_backups: int):
+    """
+    Configure logging to:
+      - Console (stdout)
+      - Daily rotating log file in `logs/` that rolls at UTC midnight
+
+    Files created:
+      logs/xsmom.log              (current file)
+      logs/xsmom.log.YYYYMMDD     (previous days, rotated automatically)
+
+    Notes:
+      * We keep `file_backups` days of history.
+      * We still accept `file_max_mb` param for backward-compat, but
+        rotation is now time-based (daily) instead of size-based.
+    """
     os.makedirs(logs_dir, exist_ok=True)
     root = logging.getLogger()
     root.setLevel(level.upper())
@@ -20,20 +34,31 @@ def setup_logging(level: str, logs_dir: str, file_max_mb: int, file_backups: int
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
 
-    # stdout
+    # --- Console handler (stdout) ---
     sh = logging.StreamHandler()
     sh.setLevel(level.upper())
     sh.setFormatter(fmt)
-    root.addHandler(sh)
 
-    # rotating file
-    fh = RotatingFileHandler(
-        os.path.join(logs_dir, "xsmom.log"),
-        maxBytes=file_max_mb * 1024 * 1024,
+    # --- Daily rotating file handler (UTC midnight rollover) ---
+    # Base filename stays 'xsmom.log' while rotated files are suffixed with date:
+    #   xsmom.log.20250820, xsmom.log.20250821, ...
+    file_path = os.path.join(logs_dir, "xsmom.log")
+    fh = TimedRotatingFileHandler(
+        file_path,
+        when="midnight",
+        interval=1,
         backupCount=file_backups,
+        utc=True,
     )
+    # Add YYYYMMDD suffix to the rotated filenames
+    # Result: xsmom.log.20250820
+    fh.suffix = "%Y%m%d"
     fh.setLevel(level.upper())
     fh.setFormatter(fmt)
+
+    # Replace existing handlers (avoid duplicates when re-running in same process)
+    root.handlers = []
+    root.addHandler(sh)
     root.addHandler(fh)
 
 
