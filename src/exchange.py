@@ -269,7 +269,7 @@ class ExchangeWrapper:
             )
             return 0.0
 
-    # -------- Precision / Orders / Leverage --------
+    # -------- Precision / Limits / Orders / Leverage --------
 
     def get_precision(self, symbol: str) -> Tuple[float, float]:
         m = self.x.market(symbol)
@@ -277,10 +277,47 @@ class ExchangeWrapper:
         price = m.get("precision", {}).get("price", None)
         return amt or 0.0001, price or 0.0001
 
+    def get_trade_limits(self, symbol: str) -> Tuple[float, float, float]:
+        """
+        Returns (min_amount, min_cost, min_price) from the exchange market metadata.
+        Missing fields are returned as 0.0.
+        """
+        try:
+            m = self.x.market(symbol)
+            limits = m.get("limits", {}) or {}
+            min_amt = (limits.get("amount", {}) or {}).get("min") or 0.0
+            min_cost = (limits.get("cost", {}) or {}).get("min") or 0.0
+            min_price = (limits.get("price", {}) or {}).get("min") or 0.0
+            return float(min_amt or 0.0), float(min_cost or 0.0), float(min_price or 0.0)
+        except Exception as e:
+            log.debug(f"get_trade_limits error for {symbol}: {e}")
+            return 0.0, 0.0, 0.0
+
     def quantize(self, symbol: str, amount: float, price: Optional[float]):
-        q_amount = float(self.x.amount_to_precision(symbol, amount))
-        q_price = None if price is None else float(self.x.price_to_precision(symbol, price))
-        return q_amount, q_price
+        """
+        Quantize amount/price to exchange precision AND drop orders that violate min
+        amount or min notional (cost) constraints. If the order is too small, return 0.
+        """
+        try:
+            q_amount = float(self.x.amount_to_precision(symbol, amount))
+            q_price = None if price is None else float(self.x.price_to_precision(symbol, price))
+
+            # Enforce minimums
+            min_amt, min_cost, _ = self.get_trade_limits(symbol)
+            if abs(q_amount) < (min_amt or 0.0):
+                return 0.0, q_price
+
+            # If we have a usable price, check min notional/cost
+            px_for_cost = q_price if (q_price is not None) else price
+            if (min_cost or 0.0) > 0.0 and px_for_cost:
+                notional = abs(q_amount) * float(px_for_cost)
+                if notional < min_cost:
+                    return 0.0, q_price
+
+            return q_amount, q_price
+        except Exception as e:
+            log.debug(f"quantize error for {symbol}: {e}")
+            return 0.0, None
 
     def create_order_safe(
         self,
