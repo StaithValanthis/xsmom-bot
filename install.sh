@@ -14,6 +14,10 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 START_NOW="${START_NOW:-ask}"      # ask | yes | no
 RUN_NONINTERACTIVE="${RUN_NONINTERACTIVE:-0}"
 
+# NEW: choose if the systemd service runs in dry-run or live mode
+# 1 = dry-run (default, safe), 0 = live trading
+SERVICE_DRY="${SERVICE_DRY:-1}"
+
 # =========================
 # Helpers
 # =========================
@@ -114,6 +118,7 @@ logging:
 EOF
   fi
 
+  # Seed a basic unit file; we'll normalize/patch it later with actual paths & flags
   if [ ! -f "systemd/${SERVICE_NAME}.service" ]; then
     cat > "systemd/${SERVICE_NAME}.service" <<'EOF'
 [Unit]
@@ -252,12 +257,18 @@ WantedBy=multi-user.target
 EOF
   fi
 
+  # Build ExecStart flags (respect SERVICE_DRY)
+  local EXEC_FLAGS="--config ${dest}/config/config.yaml"
+  if [ "${SERVICE_DRY}" = "1" ]; then
+    EXEC_FLAGS="${EXEC_FLAGS} --dry"
+  fi
+
   # Patch User/Group/WorkingDirectory/ExecStart to match this installation
   sudo sed -i "s|^User=.*|User=${RUN_AS}|" "$svc"
   sudo sed -i "s|^Group=.*|Group=${RUN_GROUP}|" "$svc" || true
   sudo sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${dest}|" "$svc"
-  # Force --config path to ${dest}/config/config.yaml and python venv path
-  sudo sed -i "s|ExecStart=.*python .* -m src.main live .*|ExecStart=${dest}/venv/bin/python -m src.main live --config ${dest}/config/config.yaml --dry|" "$svc"
+  # Force --config path to ${dest}/config/config.yaml and python venv path; toggle --dry based on SERVICE_DRY
+  sudo sed -i "s|^ExecStart=.*|ExecStart=${dest}/venv/bin/python -m src.main live ${EXEC_FLAGS}|" "$svc"
 }
 
 # =========================
@@ -334,3 +345,22 @@ else
 fi
 
 info "Done."
+
+echo
+echo "=== Next steps ==="
+echo "1) Edit ${APP_DIR}/.env and set BYBIT_API_KEY / BYBIT_API_SECRET"
+echo "2) Edit ${APP_DIR}/config/config.yaml as needed"
+if [ "${SERVICE_DRY}" = "1" ]; then
+  echo "Service mode: DRY-RUN (no live orders). To switch to LIVE:"
+  echo "   sudo systemctl stop ${SERVICE_NAME}"
+  echo "   sudo sed -i 's/ --dry\\b//' ${SERVICE_FILE}"
+  echo "   sudo systemctl daemon-reload && sudo systemctl start ${SERVICE_NAME}"
+else
+  echo "Service mode: LIVE TRADING (no --dry). Make sure keys/permissions are correct!"
+fi
+echo
+echo "Manage service:"
+echo "  sudo systemctl status ${SERVICE_NAME}"
+echo "  sudo systemctl restart ${SERVICE_NAME}"
+echo "  sudo systemctl stop ${SERVICE_NAME}"
+echo "  journalctl -u ${SERVICE_NAME} -f -o cat"
