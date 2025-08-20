@@ -8,8 +8,18 @@ from .signals import compute_atr
 
 log = logging.getLogger("risk")
 
-def per_symbol_stops(df: pd.DataFrame, atr_mult_sl: float, atr_mult_tp: float, use_tp: bool):
-    atr = compute_atr(df, 14)
+def per_symbol_stops(
+    df: pd.DataFrame,
+    atr_mult_sl: float,
+    atr_mult_tp: float,
+    use_tp: bool,
+    atr_len: int = 14,
+):
+    """
+    Legacy helper (still used by parts of the bot/backtests).
+    Now uses Wilder's ATR by default via compute_atr(..., method='rma').
+    """
+    atr = compute_atr(df, atr_len, method="rma")
     close = df["close"].iloc[-1]
     last_atr = atr.iloc[-1]
     sl_long = close - atr_mult_sl * last_atr

@@ -9,7 +9,7 @@ import pandas as pd
 
 from .config import AppConfig
 from .exchange import ExchangeWrapper
-from .signals import regime_ok
+from .signals import regime_ok, compute_atr
 from .sizing import build_targets, apply_liquidity_caps
 from .risk import (
     per_symbol_stops,
@@ -23,10 +23,6 @@ log = logging.getLogger("live")
 
 
 def wait_until_minute(minute, poll_seconds: int):
-    """Sleep in poll_seconds increments until wall-clock minute equals `minute`.
-    If minute == "*", run every minute (when now.second < poll_seconds).
-    Emits a DEBUG heartbeat so operators can see liveness.
-    """
     while True:
         now = utcnow()
         log.debug(f"Heartbeat: waiting for rebalance minute={minute}, now={now.isoformat()}")
@@ -40,7 +36,6 @@ def wait_until_minute(minute, poll_seconds: int):
 
 
 def compute_qtys(targets, prices: Dict[str, float], equity_usdt: float):
-    """Convert target weights into target contract qty using latest prices and equity."""
     out = {}
     items = targets.items() if isinstance(targets, dict) else targets.to_dict().items()
     for s, w in items:
@@ -56,7 +51,6 @@ def compute_qtys(targets, prices: Dict[str, float], equity_usdt: float):
 
 
 def next_rebalance_at(minute):
-    """Compute next UTC datetime when we will rebalance (for UX logs). Supports minute="*"."""
     now = utcnow().replace(second=0, microsecond=0)
     if isinstance(minute, str) and minute == "*":
         return now + timedelta(minutes=1)
@@ -71,7 +65,6 @@ def next_rebalance_at(minute):
 
 
 def refresh_universe(ex: ExchangeWrapper, state: dict, state_path: str):
-    """Pull a fresh filtered symbol list and persist it; log the exact selection at INFO."""
     try:
         syms = ex.fetch_markets_filtered()
         state["universe"] = syms
@@ -94,15 +87,15 @@ def run_live(cfg: AppConfig, dry: bool):
             "trading_paused_until": None,
             "universe": [],
             "last_universe_refresh": None,
+            # NEW: per-symbol trailing/entry state
+            "perpos": {},  # {sym: {sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done}}
         },
     )
 
     try:
-        # Bootstrap universe at startup
         refresh_universe(ex, state, state_path)
         log.info(f"Initial universe: {len(state.get('universe', []))} symbols")
 
-        # Run first cycle immediately; subsequent cycles align to rebalance_minute
         first_cycle = True
 
         while True:
@@ -116,7 +109,7 @@ def run_live(cfg: AppConfig, dry: bool):
                 wait_until_minute(cfg.execution.rebalance_minute, cfg.execution.poll_seconds)
                 now = utcnow()
 
-            # NEW: Optional deferral to X minutes after funding windows (e.g., 00/08/16 UTC)
+            # Optional funding-window deferral
             try:
                 align_min = int(getattr(cfg.execution, "align_after_funding_minutes", 0))
                 funding_hours = set(getattr(cfg.execution, "funding_hours_utc", [0, 8, 16]) or [])
@@ -125,12 +118,12 @@ def run_live(cfg: AppConfig, dry: bool):
                     wait_until_minute(align_min, cfg.execution.poll_seconds)
                     now = utcnow()
             except Exception as e:
-                log.debug(f"Funding-window alignment step skipped due to error: {e}")
+                log.debug(f"Funding alignment skipped: {e}")
 
             cycle_started_at = now
             log.info(f"=== Cycle start {cycle_started_at.isoformat()} ===")
 
-            # Daily universe refresh (first cycle after UTC midnight)
+            # Daily universe refresh
             try:
                 last_ref = state.get("last_universe_refresh")
                 if last_ref is None or now.date().isoformat() > last_ref:
@@ -138,7 +131,7 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.warning(f"Daily universe refresh check failed: {e}")
 
-            # Trading pause gate
+            # Pause gate
             try:
                 paused_until_iso = state.get("trading_paused_until")
                 if paused_until_iso:
@@ -154,12 +147,11 @@ def run_live(cfg: AppConfig, dry: bool):
                         state["trading_paused_until"] = None
                         write_json(state_path, state)
             except Exception as e:
-                log.warning(f"Pause gate check failed (continuing): {e}")
+                log.warning(f"Pause gate check failed: {e}")
 
-            # Equity & daily anchor (+ configured leverage)
+            # Equity & kill switch
             try:
                 equity = ex.fetch_balance_usdt()
-                # NEW: show equity and configured leverage knobs up front
                 log.info(
                     f"Equity snapshot: {equity:.2f} USDT | "
                     f"config.gross_leverage={cfg.strategy.gross_leverage} | "
@@ -181,7 +173,7 @@ def run_live(cfg: AppConfig, dry: bool):
                 log.info(f"=== Cycle end (error) {utcnow().isoformat()} ===")
                 continue
 
-            # OHLCV backfill & closes matrix (timed)
+            # OHLCV & closes
             t_ohlcv_start = perf_counter()
             closes = {}
             latest_bars = {}
@@ -236,7 +228,7 @@ def run_live(cfg: AppConfig, dry: bool):
                 log.info(f"=== Cycle end (concat error) {utcnow().isoformat()} ===")
                 continue
 
-            # Regime filter (optional)
+            # Regime filter
             try:
                 if cfg.strategy.regime_filter.enabled:
                     ok = regime_ok(
@@ -251,7 +243,7 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.warning(f"Regime filter calc failed (not blocking): {e}")
 
-            # Target construction (timed)
+            # Targets
             try:
                 t_targets_start = perf_counter()
                 targets = build_targets(
@@ -273,7 +265,7 @@ def run_live(cfg: AppConfig, dry: bool):
                 log.info(f"=== Cycle end (target error) {utcnow().isoformat()} ===")
                 continue
 
-            # Liquidity caps (timed)
+            # Liquidity caps
             try:
                 t_liq_start = perf_counter()
                 ticks = ex.fetch_tickers(list(targets.index))
@@ -289,7 +281,7 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.warning(f"Liquidity capping failed; using raw targets: {e}")
 
-            # Prices & target quantities (timed) + target preview + effective leverage
+            # Prices & qtys
             try:
                 t_px_start = perf_counter()
                 prices = {s: ex.fetch_price(s) for s in targets.index}
@@ -297,7 +289,6 @@ def run_live(cfg: AppConfig, dry: bool):
                 t_px = perf_counter() - t_px_start
                 log.info(f"Prices/qtys computed for {len(prices)} symbols in {t_px:.2f}s")
 
-                # Preview top-5 targets by |weight| with price and qty
                 try:
                     tdf = targets.to_frame(name="w").assign(px=pd.Series(prices)).assign(qty=pd.Series(qtys))
                     tdf["absw"] = tdf["w"].abs()
@@ -306,7 +297,6 @@ def run_live(cfg: AppConfig, dry: bool):
                 except Exception as e:
                     log.debug(f"Target preview failed: {e}")
 
-                # NEW: compute effective portfolio gross leverage from intended targets
                 try:
                     gross_notional = 0.0
                     for s, q in qtys.items():
@@ -350,7 +340,7 @@ def run_live(cfg: AppConfig, dry: bool):
                     cur = 0.0
                 current_qtys[s] = cur
 
-            # Best-effort leverage (per-symbol on exchange)
+            # Per-symbol leverage setting (best-effort)
             try:
                 lev = cfg.execution.set_leverage
                 if lev and lev > 0:
@@ -362,7 +352,7 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.debug(f"Leverage loop failed (ignored): {e}")
 
-            # Order diff construction + placement (timed) + quantize diagnostics
+            # Orders for rebalance (respect PnL gate)
             t_ord_start = perf_counter()
             orders = []
             try:
@@ -379,11 +369,11 @@ def run_live(cfg: AppConfig, dry: bool):
                         sign = 1 if side == "buy" else -1
                         order_px = px * (1.0 + sign * (cfg.execution.price_offset_bps / 10_000))
 
-                    # NEW: gate reductions / flips by unrealized PnL to avoid churn
+                    # PnL gate for reductions/flips (unchanged semantics)
                     try:
                         pnl_gate = float(getattr(cfg.risk, "min_close_pnl_pct", 0.0))
                         if pnl_gate > 0 and cur != 0.0:
-                            reducing = (abs(tgt) < abs(cur))  # reducing size
+                            reducing = (abs(tgt) < abs(cur))
                             flipping = (np.sign(tgt) != np.sign(cur)) and (tgt != 0.0)
                             if reducing or flipping:
                                 pinfo = pos_map.get(s, {}) or {}
@@ -395,7 +385,6 @@ def run_live(cfg: AppConfig, dry: bool):
                                     sign_pos = 1.0 if cur > 0 else -1.0
                                     pnl_pct = (px_now - entry) / entry * sign_pos * 100.0
                                     if abs(pnl_pct) < pnl_gate:
-                                        # Skip this reduction/flip (stops/TP still act later)
                                         continue
                     except Exception as e:
                         log.debug(f"PnL gate check failed for {s}: {e}")
@@ -411,7 +400,6 @@ def run_live(cfg: AppConfig, dry: bool):
 
             for (s, side, q, px) in orders:
                 try:
-                    # Enriched log: show approx notional in USDT for clarity (esp. 1000- markets)
                     px_eff = px if px is not None else prices.get(s)
                     notional = (abs(float(q)) * float(px_eff)) if (px_eff and q) else 0.0
                     if dry:
@@ -424,66 +412,150 @@ def run_live(cfg: AppConfig, dry: bool):
             t_ord = perf_counter() - t_ord_start
             log.info(f"Orders processed (n={len(orders)}) in {t_ord:.2f}s")
 
-            # Soft stops / TP per symbol (timed)
+            # ======== Enhanced SL/TP / trailing / partials (fast TF) ========
             t_stop_start = perf_counter()
             try:
+                stop_tf = getattr(cfg.risk, "stop_timeframe", cfg.exchange.timeframe) or cfg.exchange.timeframe
+                atr_len = int(getattr(cfg.risk, "atr_len", 14))
                 for s in targets.index:
                     try:
-                        raw = ex.fetch_ohlcv(s, timeframe=cfg.exchange.timeframe, limit=60)
+                        cur = float(current_qtys.get(s, 0.0))
+                        if cur == 0.0:
+                            # Clear any stale perpos state
+                            if state["perpos"].get(s):
+                                del state["perpos"][s]
+                            continue
+
+                        # Fetch faster timeframe for reactive stops
+                        raw = ex.fetch_ohlcv(s, timeframe=stop_tf, limit=max(60, atr_len * 5))
                         if not raw:
                             continue
                         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
                         df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
                         df.set_index("dt", inplace=True)
-                        if len(df) < 20:
+                        if len(df) < max(20, atr_len + 5):
                             continue
 
-                        sl_long, sl_short, tp_long, tp_short = per_symbol_stops(
-                            df, cfg.risk.atr_mult_sl, cfg.risk.atr_mult_tp, cfg.risk.use_tp
-                        )
+                        # Latest bar and ATR
                         lr = df.iloc[-1]
+                        atr = compute_atr(df, n=atr_len, method="rma").iloc[-1]
 
-                        cur = float(current_qtys.get(s, 0.0))
-                        if cur == 0.0:
-                            continue
+                        # Ensure per-symbol state is initialized/reset on side change
+                        sign = 1 if cur > 0 else -1
+                        pinfo = state["perpos"].get(s) or {}
+                        pmap = (ex.fetch_positions_map() or {}).get(s, {})  # cheap reuse; ok if empty
+                        entry_px = None
+                        try:
+                            entry_px = pmap.get("entryPrice") or pmap.get("averagePrice") or pmap.get("avgPrice")
+                            entry_px = float(entry_px) if entry_px else None
+                        except Exception:
+                            entry_px = None
+                        if entry_px is None:
+                            # fallback if exchange didn't give us entry
+                            entry_px = float(lr["close"])
 
-                        if cur > 0:  # long
-                            if check_soft_stop(lr, "long", sl_long):
-                                q = cur
+                        if not pinfo or pinfo.get("sign") != sign:
+                            # New position or flipped side: reset anchors
+                            pinfo = {
+                                "sign": sign,
+                                "entry_price": float(entry_px),
+                                "entry_atr": float(atr),
+                                "trail_hh": float(lr["high"]),
+                                "trail_ll": float(lr["low"]),
+                                "partial_done": False,
+                            }
+                            state["perpos"][s] = pinfo
+                        else:
+                            # Update trail anchors
+                            if sign > 0:
+                                pinfo["trail_hh"] = float(max(pinfo.get("trail_hh", lr["high"]), float(lr["high"])))
+                            else:
+                                pinfo["trail_ll"] = float(min(pinfo.get("trail_ll", lr["low"]), float(lr["low"])))
+
+                        entry_price = float(pinfo["entry_price"])
+                        entry_atr = float(pinfo["entry_atr"])
+                        R = entry_atr * float(cfg.risk.atr_mult_sl)
+
+                        # Initial (non-trailing) stop from entry
+                        if sign > 0:
+                            init_sl = entry_price - float(cfg.risk.atr_mult_sl) * entry_atr
+                        else:
+                            init_sl = entry_price + float(cfg.risk.atr_mult_sl) * entry_atr
+
+                        # Trailing stop (Chandelier style)
+                        trail_enabled = bool(getattr(cfg.risk, "trailing_enabled", True))
+                        trail_k = float(getattr(cfg.risk, "trail_atr_mult", cfg.risk.atr_mult_sl))
+                        if trail_enabled:
+                            if sign > 0:
+                                trail_sl = float(pinfo["trail_hh"]) - trail_k * float(atr)
+                                stop_price = max(init_sl, trail_sl)
+                            else:
+                                trail_sl = float(pinfo["trail_ll"]) + trail_k * float(atr)
+                                stop_price = min(init_sl, trail_sl)
+                        else:
+                            stop_price = init_sl
+
+                        # Breakeven bump after +1R
+                        be_after = float(getattr(cfg.risk, "breakeven_after_r", 0.0))
+                        if be_after > 0.0:
+                            if sign > 0:
+                                be_trigger = entry_price + be_after * R
+                                if float(lr["high"]) >= be_trigger:
+                                    stop_price = max(stop_price, entry_price)
+                            else:
+                                be_trigger = entry_price - be_after * R
+                                if float(lr["low"]) <= be_trigger:
+                                    stop_price = min(stop_price, entry_price)
+
+                        # Partial TP at +partial_tp_r * R (once)
+                        if bool(getattr(cfg.risk, "partial_tp_enabled", True)) and (not pinfo.get("partial_done", False)):
+                            ptp_r = float(getattr(cfg.risk, "partial_tp_r", 1.5))
+                            ptp_px = entry_price + (ptp_r * R if sign > 0 else -ptp_r * R)
+                            hit = (float(lr["high"]) >= ptp_px) if sign > 0 else (float(lr["low"]) <= ptp_px)
+                            if hit:
+                                size_frac = float(getattr(cfg.risk, "partial_tp_size", 0.5))
+                                q = abs(cur) * size_frac
                                 q, _ = ex.quantize(s, q, None)
                                 if q > 0:
                                     if dry:
-                                        log.info(f"[DRY-STOP] {s}: sell {q} @ mkt (long SL)")
+                                        log.info(f"[DRY-PARTIAL] {s}: {'sell' if sign>0 else 'buy'} {q} @ mkt (~{q * float(lr['close']):.2f} USDT)")
                                     else:
-                                        ex.create_order_safe(s, "sell", q, None, post_only=False, reduce_only=True)
-                            elif cfg.risk.use_tp and tp_long is not None and check_soft_stop(lr, "short", tp_long):
-                                q = cur
-                                q, _ = ex.quantize(s, q, None)
-                                if q > 0:
-                                    if dry:
-                                        log.info(f"[DRY-TP] {s}: sell {q} @ mkt (long TP)")
-                                    else:
-                                        ex.create_order_safe(s, "sell", q, None, post_only=False, reduce_only=True)
+                                        ex.create_order_safe(s, "sell" if sign > 0 else "buy", q, None, post_only=False, reduce_only=True)
+                                        log.info(f"[LIVE-PARTIAL] {s}: {'sell' if sign>0 else 'buy'} {q} @ mkt (~{q * float(lr['close']):.2f} USDT)")
+                                    pinfo["partial_done"] = True
+                                    state["perpos"][s] = pinfo  # persist
 
-                        elif cur < 0:  # short
-                            if check_soft_stop(lr, "short", sl_short):
+                        # Stop trigger check (soft)
+                        if sign > 0:
+                            stop_hit = float(lr["low"]) <= float(stop_price)
+                            if stop_hit:
                                 q = abs(cur)
                                 q, _ = ex.quantize(s, q, None)
                                 if q > 0:
                                     if dry:
-                                        log.info(f"[DRY-STOP] {s}: buy {q} @ mkt (short SL)")
+                                        log.info(f"[DRY-STOP] {s}: sell {q} @ mkt (SL {stop_price:.6g})")
                                     else:
-                                        ex.create_order_safe(s, "buy", q, None, post_only=False, reduce_only=True)
-                            elif cfg.risk.use_tp and tp_short is not None and check_soft_stop(lr, "long", tp_short):
+                                        ex.create_order_safe(s, "sell", q, None, post_only=False, reduce_only=True)
+                                        log.info(f"[LIVE-STOP] {s}: sell {q} @ mkt (SL {stop_price:.6g})")
+                                # clear state after full exit
+                                if s in state["perpos"]:
+                                    del state["perpos"][s]
+                        else:
+                            stop_hit = float(lr["high"]) >= float(stop_price)
+                            if stop_hit:
                                 q = abs(cur)
                                 q, _ = ex.quantize(s, q, None)
                                 if q > 0:
                                     if dry:
-                                        log.info(f"[DRY-TP] {s}: buy {q} @ mkt (short TP)")
+                                        log.info(f"[DRY-STOP] {s}: buy {q} @ mkt (SL {stop_price:.6g})")
                                     else:
                                         ex.create_order_safe(s, "buy", q, None, post_only=False, reduce_only=True)
+                                        log.info(f"[LIVE-STOP] {s}: buy {q} @ mkt (SL {stop_price:.6g})")
+                                if s in state["perpos"]:
+                                    del state["perpos"][s]
+
                     except Exception as ie:
-                        log.error(f"Stop/TP check failed for {s}: {ie}")
+                        log.error(f"Enhanced stop/TP check failed for {s}: {ie}")
             except Exception as e:
                 log.error(f"Stops/TP loop failed: {e}")
             t_stop = perf_counter() - t_stop_start
@@ -496,7 +568,6 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.warning(f"State persist failed: {e}")
 
-            # Cycle summary
             cycle_time = (utcnow() - cycle_started_at).total_seconds()
             log.info(f"Cycle complete in {cycle_time:.2f}s")
             log.info(f"=== Cycle end {utcnow().isoformat()} ===")

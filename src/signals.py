@@ -5,7 +5,12 @@ import pandas as pd
 
 log = logging.getLogger("signals")
 
-def compute_atr(df: pd.DataFrame, n=14) -> pd.Series:
+def compute_atr(df: pd.DataFrame, n=14, method: str = "rma") -> pd.Series:
+    """
+    ATR using:
+      - 'rma' (default): Wilder's ATR via EMA(alpha=1/n)
+      - 'sma'         : simple moving average of TR
+    """
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
     tr = pd.concat([
@@ -13,7 +18,12 @@ def compute_atr(df: pd.DataFrame, n=14) -> pd.Series:
         (high - prev_close).abs(),
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
+
+    if method.lower() == "rma":
+        # Wilder's ATR
+        return tr.ewm(alpha=1.0 / float(n), adjust=False).mean()
+    else:
+        return tr.rolling(n).mean()
 
 def momentum_score(prices: pd.DataFrame, lookbacks: List[int], weights: List[float]) -> pd.Series:
     score = pd.Series(0.0, index=prices.columns)
@@ -30,13 +40,10 @@ def inverse_vol_weights(prices: pd.DataFrame, vol_lookback: int) -> pd.Series:
     return iv.replace(np.nan, 0.0)
 
 def dispersion(series: pd.Series) -> float:
-    # cross-sectional dispersion proxy
     return float(series.std())
 
 def dynamic_k(score: pd.Series, k_min: int, k_max: int) -> Tuple[int,int]:
     d = dispersion(score.fillna(0.0))
-    # Scale K linearly with dispersion (ad hoc: wider dispersion => more breadth)
-    # use reasonable clamps so it doesn't swing wildly
     if d < 0.01:
         k = k_min
     elif d > 0.05:
@@ -48,6 +55,6 @@ def dynamic_k(score: pd.Series, k_min: int, k_max: int) -> Tuple[int,int]:
 
 def regime_ok(close: pd.Series, ema_len: int, slope_min_bps_per_day: float) -> bool:
     ema = close.ewm(span=ema_len, adjust=False).mean()
-    slope = ema.diff().tail(ema_len).mean()  # average slope over the last window
+    slope = ema.diff().tail(ema_len).mean()
     slope_bps = 10_000 * slope / close.iloc[-1]
     return float(slope_bps) >= slope_min_bps_per_day

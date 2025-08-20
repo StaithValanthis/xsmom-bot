@@ -17,18 +17,18 @@ strategy:
   vol_lookback: 36
   k_min: 1
   k_max: 2
-  market_neutral: false          # allow directional exposure
+  market_neutral: false
   gross_leverage: 1.0
   max_weight_per_asset: 0.5
   regime_filter:
-    enabled: false               # too noisy at this size
+    enabled: false
     ema_len: 200
     slope_min_bps_per_day: 0
   funding_tilt:
     enabled: false
 
 liquidity:
-  adv_cap_pct: 0.01              # irrelevant at this size
+  adv_cap_pct: 0.01
   notional_cap_usdt: 1000
 
 execution:
@@ -39,18 +39,34 @@ execution:
   set_leverage: 3
   rebalance_minute: 5
   poll_seconds: 15
-  # NEW: avoid paying funding by rebalancing a bit *after* 00/08/16 UTC
+  # Rebalance slightly *after* funding windows (00/08/16 UTC) to avoid fees/noise
   align_after_funding_minutes: 5
   funding_hours_utc: [0, 8, 16]
 
 risk:
-  atr_mult_sl: 1.5
-  atr_mult_tp: 0
-  use_tp: false
-  max_daily_loss_pct: 5.0
-  trade_disable_minutes: 120
-  # NEW: require some unrealized PnL% before reducing/flip during rebalance
-  # (stops/TP/kill-switch ignore this gate)
+  # --- ATR & core stop/TP settings ---
+  atr_len: 14            # Wilder's ATR length (RMA)
+  atr_mult_sl: 2.0       # initial stop = entry ± atr_mult_sl * entry_ATR
+  atr_mult_tp: 3.5       # legacy TP multiple (unused if use_tp=false)
+  use_tp: false          # we prefer trailing + partials; leave false
+
+  # --- Fast stop checks (separate from signal timeframe) ---
+  stop_timeframe: "5m"   # check SL/TP/trailing on faster bars
+
+  # --- Trailing stop (Chandelier style) ---
+  trailing_enabled: true
+  trail_atr_mult: 2.5    # trail = highest-high - k*ATR (long), or lowest-low + k*ATR (short)
+
+  # --- Profit management ---
+  breakeven_after_r: 1.0 # after +1R in favor, move stop to entry
+  partial_tp_enabled: true
+  partial_tp_r: 1.5      # take partial at +1.5R
+  partial_tp_size: 0.5   # 50% scale-out
+
+  # --- Safety & churn controls ---
+  max_daily_loss_pct: 2.5
+  trade_disable_minutes: 720
+  # Block reductions/flips during rebalance unless unrealized PnL exceeds this abs % (SL/TP ignore this)
   min_close_pnl_pct: 0.5
 
 costs:

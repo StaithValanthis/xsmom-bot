@@ -48,19 +48,34 @@ class ExecutionCfg(BaseModel):
     set_leverage: int = 3
     rebalance_minute: int = 5
     poll_seconds: int = 15
-    # NEW: align rebalances a few minutes after funding windows
+    # Optional: defer rebalance slightly after funding
     align_after_funding_minutes: int = 0
     funding_hours_utc: List[int] = Field(default_factory=lambda: [0, 8, 16])
 
 class RiskCfg(BaseModel):
+    # Core ATR/Stops
+    atr_len: int = 14                  # NEW: ATR length (Wilder)
     atr_mult_sl: float = 2.5
     atr_mult_tp: float = 4.0
     use_tp: bool = False
+
+    # Live safety
     max_daily_loss_pct: float = 3.0
     trade_disable_minutes: int = 1440
-    # NEW: minimum unrealized PnL% to allow reductions/flips during rebalance
-    # (does not affect SL/TP/kill-switch)
+
+    # Rebalance churn gate (unchanged semantics)
     min_close_pnl_pct: float = 0.0
+
+    # NEW: Stop mechanics
+    stop_timeframe: str = "5m"         # check stops on a faster TF than signals
+    trailing_enabled: bool = True
+    trail_atr_mult: float = 2.5        # k for chandelier trail
+
+    # NEW: Profit management
+    breakeven_after_r: float = 1.0     # move SL to entry after +1R
+    partial_tp_enabled: bool = True
+    partial_tp_r: float = 1.5          # take partial at +1.5R
+    partial_tp_size: float = 0.5       # 50% scale-out
 
 class CostsCfg(BaseModel):
     taker_fee_bps: float = 7.0
