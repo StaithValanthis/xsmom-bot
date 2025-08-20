@@ -201,6 +201,50 @@ class ExchangeWrapper:
                 out[sym] = p
         return out
 
+    def parse_position(self, p: dict) -> dict:
+        """
+        Normalize a raw ccxt position dict into:
+          {'symbol': str|None, 'qty': float, 'entry': float|None, 'side': str|None}
+        qty is signed (+ long, - short). Works across common ccxt field variants.
+        """
+        if not p:
+            return {"symbol": None, "qty": 0.0, "entry": None, "side": None}
+
+        sym = p.get("symbol")
+
+        # Quantity (try several common keys)
+        qty = (
+            p.get("contracts")
+            or p.get("positionAmt")
+            or p.get("size")
+            or p.get("contractsSize")
+            or p.get("amount")
+            or 0.0
+        )
+        try:
+            qty = float(qty)
+        except Exception:
+            qty = 0.0
+
+        side = p.get("side")
+        # Normalize sign: ccxt often reports positive with side; make shorts negative
+        if side in ("short", "sell") and qty > 0:
+            qty = -qty
+
+        # Entry price (try several common keys)
+        entry = (
+            p.get("entryPrice")
+            or p.get("averagePrice")
+            or p.get("avgPrice")
+            or ((p.get("info") or {}).get("avgPrice"))
+        )
+        try:
+            entry = float(entry) if entry not in (None, "", "0", "0.0") else None
+        except Exception:
+            entry = None
+
+        return {"symbol": sym, "qty": qty, "entry": entry, "side": side}
+
     # -------- Balance (robust UTA support) --------
 
     def _parse_unified_equity_from_info(self, info: dict) -> Optional[float]:

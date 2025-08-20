@@ -18,7 +18,7 @@ strategy:
   k_min: 1
   k_max: 2
   market_neutral: false
-  gross_leverage: 1.0
+  gross_leverage: 2.0            # was 1.0 → increase notional vs equity
   max_weight_per_asset: 0.5
   regime_filter:
     enabled: false
@@ -37,37 +37,36 @@ execution:
   price_offset_bps: 0
   slippage_bps_guard: 25
   set_leverage: 3
-  rebalance_minute: 5
+  rebalance_minute: 15           # was 5 → reduce churn on small balance
   poll_seconds: 15
-  # Rebalance slightly *after* funding windows (00/08/16 UTC) to avoid fees/noise
   align_after_funding_minutes: 5
   funding_hours_utc: [0, 8, 16]
 
 risk:
-  # --- ATR & core stop/TP settings ---
-  atr_len: 14            # Wilder's ATR length (RMA)
-  atr_mult_sl: 2.0       # initial stop = entry ± atr_mult_sl * entry_ATR
-  atr_mult_tp: 3.5       # legacy TP multiple (unused if use_tp=false)
-  use_tp: false          # we prefer trailing + partials; leave false
+  # Core SL/TP sizing
+  atr_len: 14
+  atr_mult_sl: 1.6               # was 1.5 → slightly tighter risk
+  atr_mult_tp: 3.5               # enable TP to book winners
+  use_tp: true
 
-  # --- Fast stop checks (separate from signal timeframe) ---
-  stop_timeframe: "5m"   # check SL/TP/trailing on faster bars
-
-  # --- Trailing stop (Chandelier style) ---
+  # Event-driven fast loop (intrabar management)
+  fast_check_seconds: 2           # how often to check for SL/TP intrabar
+  stop_timeframe: "1m"            # ATR/stop baseline timeframe
   trailing_enabled: true
-  trail_atr_mult: 2.5    # trail = highest-high - k*ATR (long), or lowest-low + k*ATR (short)
+  trail_atr_mult: 1.6             # match SL multiple
+  breakeven_after_r: 1.0          # move stop to BE after +1R (0 = disabled)
 
-  # --- Profit management ---
-  breakeven_after_r: 1.0 # after +1R in favor, move stop to entry
+  # One-shot partial TP when +R reached (independent of use_tp)
   partial_tp_enabled: true
-  partial_tp_r: 1.5      # take partial at +1.5R
-  partial_tp_size: 0.5   # 50% scale-out
+  partial_tp_r: 1.5
+  partial_tp_size: 0.5
 
-  # --- Safety & churn controls ---
-  max_daily_loss_pct: 2.5
-  trade_disable_minutes: 720
-  # Block reductions/flips during rebalance unless unrealized PnL exceeds this abs % (SL/TP ignore this)
-  min_close_pnl_pct: 0.5
+  # Kill switch
+  max_daily_loss_pct: 5.0
+  trade_disable_minutes: 120
+
+  # Rebalance churn gate (skip tiny PnL flips/reductions)
+  min_close_pnl_pct: 0.8          # was 0.5
 
 costs:
   taker_fee_bps: 6.0

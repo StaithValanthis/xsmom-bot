@@ -1,8 +1,9 @@
 import logging
+import threading
 import time
 from time import perf_counter
 from datetime import datetime, timezone, timedelta
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -11,12 +12,6 @@ from .config import AppConfig
 from .exchange import ExchangeWrapper
 from .signals import regime_ok, compute_atr
 from .sizing import build_targets, apply_liquidity_caps
-from .risk import (
-    per_symbol_stops,
-    check_soft_stop,
-    kill_switch_should_trigger,
-    resume_time_after_kill,
-)
 from .utils import utcnow, read_json, write_json
 
 log = logging.getLogger("live")
@@ -76,6 +71,238 @@ def refresh_universe(ex: ExchangeWrapper, state: dict, state_path: str):
         log.error(f"Universe refresh failed: {e}")
 
 
+# -------------------- FAST EVENT-DRIVEN SL/TP THREAD --------------------
+
+class FastSLTPThread(threading.Thread):
+    """
+    Poll-based 'event-driven' SL/TP enforcement:
+      - Every fast_check_seconds: read open positions, last price, compare to stop levels.
+      - Every ~60s (per symbol): refresh 1m OHLCV to recompute ATR & trailing anchors.
+    Uses and maintains `state["perpos"]`:
+      perpos[sym] = {
+        sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done
+      }
+    """
+    def __init__(self, ex: ExchangeWrapper, cfg: AppConfig, state: dict, dry: bool, stop_event: threading.Event):
+        super().__init__(daemon=True)
+        self.ex = ex
+        self.cfg = cfg
+        self.state = state
+        self.dry = dry
+        self.stop_event = stop_event
+        self._last_ohlcv_ts: Dict[str, float] = {}  # symbol -> unix ts of last ATR refresh
+
+    def _now_ts(self) -> float:
+        return time.time()
+
+    def _init_or_update_perpos(self, symbol: str, cur_qty: float, lr: pd.Series, atr_val: float, entry_price: Optional[float]):
+        sign = 1 if cur_qty > 0 else -1
+        perpos = self.state.setdefault("perpos", {})
+        pinfo = perpos.get(symbol)
+        if (not pinfo) or (pinfo.get("sign") != sign):
+            base_entry = float(entry_price if entry_price else lr["close"])
+            perpos[symbol] = {
+                "sign": sign,
+                "entry_price": float(base_entry),
+                "entry_atr": float(atr_val),
+                "trail_hh": float(lr["high"]),
+                "trail_ll": float(lr["low"]),
+                "partial_done": False,
+            }
+        else:
+            # update trails
+            if sign > 0:
+                pinfo["trail_hh"] = float(max(pinfo.get("trail_hh", lr["high"]), float(lr["high"])))
+            else:
+                pinfo["trail_ll"] = float(min(pinfo.get("trail_ll", lr["low"]), float(lr["low"])))
+            perpos[symbol] = pinfo
+
+    def _compute_stop_px(self, symbol: str, lr: pd.Series):
+        cfg = self.cfg
+        pinfo = self.state.get("perpos", {}).get(symbol)
+        if not pinfo:
+            return None
+        sign = int(pinfo["sign"])
+        entry_price = float(pinfo["entry_price"])
+        entry_atr = float(pinfo["entry_atr"])
+        atr_mult_sl = float(cfg.risk.atr_mult_sl)
+        trail_enabled = bool(cfg.risk.trailing_enabled)
+        trail_k = float(cfg.risk.trail_atr_mult)
+
+        # initial stop from entry
+        init_sl = entry_price - atr_mult_sl * entry_atr if sign > 0 else entry_price + atr_mult_sl * entry_atr
+
+        # refresh ATR on last OHLCV update
+        atr_len = int(cfg.risk.atr_len)
+        # we pass the latest ATR via lr['_atr'] injected by caller
+        cur_atr = float(lr["_atr"])
+
+        if trail_enabled:
+            if sign > 0:
+                trail_sl = float(pinfo["trail_hh"]) - trail_k * cur_atr
+                stop_price = max(init_sl, trail_sl)
+            else:
+                trail_sl = float(pinfo["trail_ll"]) + trail_k * cur_atr
+                stop_price = min(init_sl, trail_sl)
+        else:
+            stop_price = init_sl
+
+        # Breakeven bump after +R
+        R = entry_atr * atr_mult_sl
+        be_after = float(cfg.risk.breakeven_after_r)
+        if be_after > 0.0:
+            if sign > 0:
+                be_trigger = entry_price + be_after * R
+                if float(lr["high"]) >= be_trigger:
+                    stop_price = max(stop_price, entry_price)
+            else:
+                be_trigger = entry_price - be_after * R
+                if float(lr["low"]) <= be_trigger:
+                    stop_price = min(stop_price, entry_price)
+
+        return float(stop_price)
+
+    def _maybe_partial_tp(self, symbol: str, cur_qty: float, lr: pd.Series):
+        cfg = self.cfg
+        if not bool(cfg.risk.partial_tp_enabled):
+            return
+        perpos = self.state.get("perpos", {})
+        pinfo = perpos.get(symbol)
+        if not pinfo or pinfo.get("partial_done", False):
+            return
+
+        sign = int(pinfo["sign"])
+        entry_price = float(pinfo["entry_price"])
+        entry_atr = float(pinfo["entry_atr"])
+        R = entry_atr * float(cfg.risk.atr_mult_sl)
+        ptp_r = float(cfg.risk.partial_tp_r)
+        ptp_px = entry_price + (ptp_r * R if sign > 0 else -ptp_r * R)
+        hit = (float(lr["last"]) >= ptp_px) if sign > 0 else (float(lr["last"]) <= ptp_px)
+        if hit:
+            size_frac = float(cfg.risk.partial_tp_size)
+            q = abs(cur_qty) * size_frac
+            q, _ = self.ex.quantize(symbol, q, None)
+            if q > 0:
+                if self.dry:
+                    log.info(f"[DRY-PARTIAL] {symbol}: {'sell' if sign>0 else 'buy'} {q} @ mkt")
+                else:
+                    self.ex.create_order_safe(symbol, "sell" if sign > 0 else "buy", q, None, post_only=False, reduce_only=True)
+                    log.info(f"[LIVE-PARTIAL] {symbol}: {'sell' if sign>0 else 'buy'} {q} @ mkt")
+            pinfo["partial_done"] = True
+            perpos[symbol] = pinfo
+            self.state["perpos"] = perpos
+
+    def run(self):
+        cfg = self.cfg
+        fast_s = int(getattr(cfg.risk, "fast_check_seconds", 0))
+        if fast_s <= 0:
+            log.info("Fast SL/TP loop disabled (fast_check_seconds <= 0).")
+            return
+
+        log.info(f"Fast SL/TP loop starting: check every {fast_s}s on timeframe={cfg.risk.stop_timeframe}")
+        stop_tf = getattr(cfg.risk, "stop_timeframe", cfg.exchange.timeframe) or cfg.exchange.timeframe
+        atr_len = int(cfg.risk.atr_len)
+
+        while not self.stop_event.is_set():
+            try:
+                # 1) fetch positions
+                pos_map = self.ex.fetch_positions_map() or {}
+                if not pos_map:
+                    # Clear all perpos if nothing is open
+                    if self.state.get("perpos"):
+                        self.state["perpos"] = {}
+                    time.sleep(fast_s)
+                    continue
+
+                # 2) iterate open positions
+                for sym, p in list(pos_map.items()):
+                    # derive signed qty (long +, short -)
+                    try:
+                        qty = float(p.get("contracts") or p.get("positionAmt") or p.get("contractsSize") or 0.0)
+                        side = p.get("side")
+                        if side == "short" and qty > 0:
+                            qty = -qty
+                    except Exception:
+                        qty = 0.0
+                    if qty == 0.0:
+                        # clear state if any
+                        if self.state.get("perpos", {}).get(sym):
+                            self.state["perpos"].pop(sym, None)
+                        continue
+
+                    # 3) refresh OHLCV/ATR for this symbol at most once per ~60s
+                    need_ohlcv = (self._now_ts() - self._last_ohlcv_ts.get(sym, 0)) > 55
+                    if need_ohlcv:
+                        raw = self.ex.fetch_ohlcv(sym, timeframe=stop_tf, limit=max(60, atr_len * 5))
+                        if not raw:
+                            continue
+                        df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+                        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+                        df.set_index("dt", inplace=True)
+                        if len(df) < max(20, atr_len + 5):
+                            continue
+                        atr_series = compute_atr(df, n=atr_len, method="rma")
+                        last_bar = df.iloc[-1].copy()
+                        last_bar["_atr"] = float(atr_series.iloc[-1])
+                        self._last_ohlcv_ts[sym] = self._now_ts()
+                        self._last_bar_cache = getattr(self, "_last_bar_cache", {})
+                        self._last_bar_cache[sym] = last_bar
+                    else:
+                        last_bar = getattr(self, "_last_bar_cache", {}).get(sym)
+                        if last_bar is None:
+                            # force refresh if cache empty
+                            self._last_ohlcv_ts[sym] = 0
+                            continue
+
+                    # 4) embed latest last price (fetch_ticker)
+                    try:
+                        t = self.ex.x.fetch_ticker(sym)
+                        last_px = float(t.get("last") or t.get("close"))
+                    except Exception:
+                        last_px = float(last_bar["close"])
+                    lr = last_bar.copy()
+                    lr["last"] = last_px
+
+                    # entry price
+                    try:
+                        entry_px = p.get("entryPrice") or p.get("averagePrice") or p.get("avgPrice")
+                        entry_px = float(entry_px) if entry_px else None
+                    except Exception:
+                        entry_px = None
+
+                    # 5) ensure perpos exists/updated
+                    self._init_or_update_perpos(sym, qty, lr, lr["_atr"], entry_px)
+
+                    # 6) compute stop price, then check live price cross
+                    stop_px = self._compute_stop_px(sym, lr)
+                    if stop_px is not None:
+                        long_pos = qty > 0
+                        stop_hit = (last_px <= stop_px) if long_pos else (last_px >= stop_px)
+                        if stop_hit:
+                            q = abs(qty)
+                            q, _ = self.ex.quantize(sym, q, None)
+                            if q > 0:
+                                if self.dry:
+                                    log.info(f"[DRY-FAST-STOP] {sym}: {'sell' if long_pos else 'buy'} {q} @ mkt (SL {stop_px:.6g})")
+                                else:
+                                    self.ex.create_order_safe(sym, "sell" if long_pos else "buy", q, None, post_only=False, reduce_only=True)
+                                    log.info(f"[LIVE-FAST-STOP] {sym}: {'sell' if long_pos else 'buy'} {q} @ mkt (SL {stop_px:.6g})")
+                            # clear perpos after exit
+                            self.state.get("perpos", {}).pop(sym, None)
+                            # move on to next position
+                            continue
+
+                    # 7) partial take profit check
+                    self._maybe_partial_tp(sym, qty, lr)
+
+                time.sleep(fast_s)
+            except Exception as e:
+                log.error(f"Fast SL/TP loop error: {e}")
+                time.sleep(max(1, fast_s))
+
+
+# -------------------- MAIN LIVE LOOP --------------------
+
 def run_live(cfg: AppConfig, dry: bool):
     ex = ExchangeWrapper(cfg.exchange)
     state_path = cfg.paths.state_path
@@ -87,12 +314,19 @@ def run_live(cfg: AppConfig, dry: bool):
             "trading_paused_until": None,
             "universe": [],
             "last_universe_refresh": None,
-            # NEW: per-symbol trailing/entry state
             "perpos": {},  # {sym: {sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done}}
         },
     )
 
+    # start fast SL/TP thread if enabled
+    stop_evt = threading.Event()
+    fast_thread: Optional[FastSLTPThread] = None
     try:
+        if int(getattr(cfg.risk, "fast_check_seconds", 0)) > 0:
+            fast_thread = FastSLTPThread(ex, cfg, state, dry, stop_evt)
+            fast_thread.start()
+
+        # Bootstrap universe at startup
         refresh_universe(ex, state, state_path)
         log.info(f"Initial universe: {len(state.get('universe', []))} symbols")
 
@@ -161,6 +395,7 @@ def run_live(cfg: AppConfig, dry: bool):
                 if state.get("day_start_equity") is None or (now.hour == 0 and now.minute < 10):
                     state["day_start_equity"] = equity
                     write_json(state_path, state)
+                from .risk import kill_switch_should_trigger, resume_time_after_kill
                 if kill_switch_should_trigger(state.get("day_start_equity") or 0.0, equity, cfg.risk.max_daily_loss_pct):
                     pause_until = resume_time_after_kill(now, cfg.risk.trade_disable_minutes)
                     state["trading_paused_until"] = pause_until.isoformat()
@@ -340,7 +575,7 @@ def run_live(cfg: AppConfig, dry: bool):
                     cur = 0.0
                 current_qtys[s] = cur
 
-            # Per-symbol leverage setting (best-effort)
+            # Per-symbol leverage setting
             try:
                 lev = cfg.execution.set_leverage
                 if lev and lev > 0:
@@ -369,7 +604,7 @@ def run_live(cfg: AppConfig, dry: bool):
                         sign = 1 if side == "buy" else -1
                         order_px = px * (1.0 + sign * (cfg.execution.price_offset_bps / 10_000))
 
-                    # PnL gate for reductions/flips (unchanged semantics)
+                    # PnL gate for reductions/flips
                     try:
                         pnl_gate = float(getattr(cfg.risk, "min_close_pnl_pct", 0.0))
                         if pnl_gate > 0 and cur != 0.0:
@@ -412,155 +647,6 @@ def run_live(cfg: AppConfig, dry: bool):
             t_ord = perf_counter() - t_ord_start
             log.info(f"Orders processed (n={len(orders)}) in {t_ord:.2f}s")
 
-            # ======== Enhanced SL/TP / trailing / partials (fast TF) ========
-            t_stop_start = perf_counter()
-            try:
-                stop_tf = getattr(cfg.risk, "stop_timeframe", cfg.exchange.timeframe) or cfg.exchange.timeframe
-                atr_len = int(getattr(cfg.risk, "atr_len", 14))
-                for s in targets.index:
-                    try:
-                        cur = float(current_qtys.get(s, 0.0))
-                        if cur == 0.0:
-                            # Clear any stale perpos state
-                            if state["perpos"].get(s):
-                                del state["perpos"][s]
-                            continue
-
-                        # Fetch faster timeframe for reactive stops
-                        raw = ex.fetch_ohlcv(s, timeframe=stop_tf, limit=max(60, atr_len * 5))
-                        if not raw:
-                            continue
-                        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
-                        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-                        df.set_index("dt", inplace=True)
-                        if len(df) < max(20, atr_len + 5):
-                            continue
-
-                        # Latest bar and ATR
-                        lr = df.iloc[-1]
-                        atr = compute_atr(df, n=atr_len, method="rma").iloc[-1]
-
-                        # Ensure per-symbol state is initialized/reset on side change
-                        sign = 1 if cur > 0 else -1
-                        pinfo = state["perpos"].get(s) or {}
-                        pmap = (ex.fetch_positions_map() or {}).get(s, {})  # cheap reuse; ok if empty
-                        entry_px = None
-                        try:
-                            entry_px = pmap.get("entryPrice") or pmap.get("averagePrice") or pmap.get("avgPrice")
-                            entry_px = float(entry_px) if entry_px else None
-                        except Exception:
-                            entry_px = None
-                        if entry_px is None:
-                            # fallback if exchange didn't give us entry
-                            entry_px = float(lr["close"])
-
-                        if not pinfo or pinfo.get("sign") != sign:
-                            # New position or flipped side: reset anchors
-                            pinfo = {
-                                "sign": sign,
-                                "entry_price": float(entry_px),
-                                "entry_atr": float(atr),
-                                "trail_hh": float(lr["high"]),
-                                "trail_ll": float(lr["low"]),
-                                "partial_done": False,
-                            }
-                            state["perpos"][s] = pinfo
-                        else:
-                            # Update trail anchors
-                            if sign > 0:
-                                pinfo["trail_hh"] = float(max(pinfo.get("trail_hh", lr["high"]), float(lr["high"])))
-                            else:
-                                pinfo["trail_ll"] = float(min(pinfo.get("trail_ll", lr["low"]), float(lr["low"])))
-
-                        entry_price = float(pinfo["entry_price"])
-                        entry_atr = float(pinfo["entry_atr"])
-                        R = entry_atr * float(cfg.risk.atr_mult_sl)
-
-                        # Initial (non-trailing) stop from entry
-                        if sign > 0:
-                            init_sl = entry_price - float(cfg.risk.atr_mult_sl) * entry_atr
-                        else:
-                            init_sl = entry_price + float(cfg.risk.atr_mult_sl) * entry_atr
-
-                        # Trailing stop (Chandelier style)
-                        trail_enabled = bool(getattr(cfg.risk, "trailing_enabled", True))
-                        trail_k = float(getattr(cfg.risk, "trail_atr_mult", cfg.risk.atr_mult_sl))
-                        if trail_enabled:
-                            if sign > 0:
-                                trail_sl = float(pinfo["trail_hh"]) - trail_k * float(atr)
-                                stop_price = max(init_sl, trail_sl)
-                            else:
-                                trail_sl = float(pinfo["trail_ll"]) + trail_k * float(atr)
-                                stop_price = min(init_sl, trail_sl)
-                        else:
-                            stop_price = init_sl
-
-                        # Breakeven bump after +1R
-                        be_after = float(getattr(cfg.risk, "breakeven_after_r", 0.0))
-                        if be_after > 0.0:
-                            if sign > 0:
-                                be_trigger = entry_price + be_after * R
-                                if float(lr["high"]) >= be_trigger:
-                                    stop_price = max(stop_price, entry_price)
-                            else:
-                                be_trigger = entry_price - be_after * R
-                                if float(lr["low"]) <= be_trigger:
-                                    stop_price = min(stop_price, entry_price)
-
-                        # Partial TP at +partial_tp_r * R (once)
-                        if bool(getattr(cfg.risk, "partial_tp_enabled", True)) and (not pinfo.get("partial_done", False)):
-                            ptp_r = float(getattr(cfg.risk, "partial_tp_r", 1.5))
-                            ptp_px = entry_price + (ptp_r * R if sign > 0 else -ptp_r * R)
-                            hit = (float(lr["high"]) >= ptp_px) if sign > 0 else (float(lr["low"]) <= ptp_px)
-                            if hit:
-                                size_frac = float(getattr(cfg.risk, "partial_tp_size", 0.5))
-                                q = abs(cur) * size_frac
-                                q, _ = ex.quantize(s, q, None)
-                                if q > 0:
-                                    if dry:
-                                        log.info(f"[DRY-PARTIAL] {s}: {'sell' if sign>0 else 'buy'} {q} @ mkt (~{q * float(lr['close']):.2f} USDT)")
-                                    else:
-                                        ex.create_order_safe(s, "sell" if sign > 0 else "buy", q, None, post_only=False, reduce_only=True)
-                                        log.info(f"[LIVE-PARTIAL] {s}: {'sell' if sign>0 else 'buy'} {q} @ mkt (~{q * float(lr['close']):.2f} USDT)")
-                                    pinfo["partial_done"] = True
-                                    state["perpos"][s] = pinfo  # persist
-
-                        # Stop trigger check (soft)
-                        if sign > 0:
-                            stop_hit = float(lr["low"]) <= float(stop_price)
-                            if stop_hit:
-                                q = abs(cur)
-                                q, _ = ex.quantize(s, q, None)
-                                if q > 0:
-                                    if dry:
-                                        log.info(f"[DRY-STOP] {s}: sell {q} @ mkt (SL {stop_price:.6g})")
-                                    else:
-                                        ex.create_order_safe(s, "sell", q, None, post_only=False, reduce_only=True)
-                                        log.info(f"[LIVE-STOP] {s}: sell {q} @ mkt (SL {stop_price:.6g})")
-                                # clear state after full exit
-                                if s in state["perpos"]:
-                                    del state["perpos"][s]
-                        else:
-                            stop_hit = float(lr["high"]) >= float(stop_price)
-                            if stop_hit:
-                                q = abs(cur)
-                                q, _ = ex.quantize(s, q, None)
-                                if q > 0:
-                                    if dry:
-                                        log.info(f"[DRY-STOP] {s}: buy {q} @ mkt (SL {stop_price:.6g})")
-                                    else:
-                                        ex.create_order_safe(s, "buy", q, None, post_only=False, reduce_only=True)
-                                        log.info(f"[LIVE-STOP] {s}: buy {q} @ mkt (SL {stop_price:.6g})")
-                                if s in state["perpos"]:
-                                    del state["perpos"][s]
-
-                    except Exception as ie:
-                        log.error(f"Enhanced stop/TP check failed for {s}: {ie}")
-            except Exception as e:
-                log.error(f"Stops/TP loop failed: {e}")
-            t_stop = perf_counter() - t_stop_start
-            log.info(f"Stops/TP checked for {len(targets)} symbols in {t_stop:.2f}s")
-
             # Persist state
             try:
                 state["last_targets"] = targets.to_dict()
@@ -573,6 +659,13 @@ def run_live(cfg: AppConfig, dry: bool):
             log.info(f"=== Cycle end {utcnow().isoformat()} ===")
 
     finally:
+        try:
+            if stop_evt and isinstance(stop_evt, threading.Event):
+                stop_evt.set()
+            if fast_thread and fast_thread.is_alive():
+                fast_thread.join(timeout=2.0)
+        except Exception:
+            pass
         try:
             ex.close()
         except Exception:

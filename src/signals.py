@@ -1,15 +1,13 @@
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Literal
 import numpy as np
 import pandas as pd
 
 log = logging.getLogger("signals")
 
-def compute_atr(df: pd.DataFrame, n=14, method: str = "rma") -> pd.Series:
+def compute_atr(df: pd.DataFrame, n: int = 14, method: Literal["sma","rma"]="sma") -> pd.Series:
     """
-    ATR using:
-      - 'rma' (default): Wilder's ATR via EMA(alpha=1/n)
-      - 'sma'         : simple moving average of TR
+    ATR using either SMA (classic Wilder-like) or RMA (Wilder's smoothing).
     """
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
@@ -19,10 +17,12 @@ def compute_atr(df: pd.DataFrame, n=14, method: str = "rma") -> pd.Series:
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
 
-    if method.lower() == "rma":
-        # Wilder's ATR
-        return tr.ewm(alpha=1.0 / float(n), adjust=False).mean()
+    if method == "rma":
+        # Wilder's smoothing (RMA)
+        rma = tr.ewm(alpha=1.0/n, adjust=False).mean()
+        return rma
     else:
+        # Simple moving average of TR
         return tr.rolling(n).mean()
 
 def momentum_score(prices: pd.DataFrame, lookbacks: List[int], weights: List[float]) -> pd.Series:
