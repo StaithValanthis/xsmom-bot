@@ -328,14 +328,26 @@ class ExchangeWrapper:
         post_only: bool,
         reduce_only: bool,
     ):
+        """
+        Create orders with sensible defaults per order type.
+        - MARKET: do NOT set PostOnly; Bybit/CCXT rejects it (causes decimal errors).
+        - LIMIT: may set PostOnly via timeInForce='PostOnly'.
+        """
         params = {}
+        # Bybit linear perps hint (no harm on other ids that ignore it)
+        if self.x.id == "bybit" and self.cfg.account_type == "swap":
+            params["category"] = "linear"
+
         if reduce_only:
             params["reduceOnly"] = True
-        if post_only:
-            params["timeInForce"] = "PostOnly"
+
         if price is None:
+            # MARKET ORDER: never set PostOnly here
             return self.x.create_market_order(symbol, side, abs(amount), params)
         else:
+            # LIMIT ORDER: allow PostOnly if requested
+            if post_only:
+                params["timeInForce"] = "PostOnly"
             return self.x.create_limit_order(symbol, side, abs(amount), price, params)
 
     def try_set_leverage(self, symbol: str, leverage: int):
