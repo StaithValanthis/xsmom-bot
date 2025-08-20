@@ -15,28 +15,39 @@ class ExchangeWrapper:
         self.cfg = cfg
         api_key = os.getenv("BYBIT_API_KEY", "")
         secret = os.getenv("BYBIT_API_SECRET", "")
+        if not api_key or not secret:
+            log.warning(
+                "BYBIT_API_KEY/SECRET not found in environment. "
+                "Private endpoints (balances, orders) will fail; equity will appear as 0. "
+                "Set them in .env or export them before running."
+            )
+
         klass = getattr(ccxt, cfg.id)
 
-        self.x = klass({
-            "apiKey": api_key,
-            "secret": secret,
-            "enableRateLimit": True,
-            "timeout": 20000,
-            "options": {
-                "defaultType": "swap" if cfg.account_type == "swap" else "spot",
-            },
-        })
+        self.x = klass(
+            {
+                "apiKey": api_key,
+                "secret": secret,
+                "enableRateLimit": True,
+                "timeout": 20000,
+                "options": {
+                    "defaultType": "swap" if cfg.account_type == "swap" else "spot",
+                },
+            }
+        )
 
         # Unified Trading Account (UTA) setup for Bybit
         self.unified_margin = bool(getattr(cfg, "unified_margin", False))
         if self.x.id == "bybit" and self.unified_margin:
             opts = getattr(self.x, "options", {}) or {}
-            opts.update({
-                "defaultType": "swap",
-                "accountType": "UNIFIED",
-                # ensure CCXT uses these params when it builds balance requests internally
-                "fetchBalance": {"accountType": "UNIFIED", "coin": self.cfg.quote},
-            })
+            opts.update(
+                {
+                    "defaultType": "swap",
+                    "accountType": "UNIFIED",
+                    # ensure CCXT uses these params when it builds balance requests internally
+                    "fetchBalance": {"accountType": "UNIFIED", "coin": self.cfg.quote},
+                }
+            )
             self.x.options = opts
 
         # Testnet toggle
@@ -177,7 +188,6 @@ class ExchangeWrapper:
         """
         if self.x.id != "bybit":
             return None
-        # Not all ccxt builds expose this method name; guard carefully
         method_name = "privateGetV5AccountWalletBalance"
         if not hasattr(self.x, method_name):
             return None
@@ -217,7 +227,6 @@ class ExchangeWrapper:
 
             # 2) Unified-friendly totals exposed via CCXT mapping
             if self.x.id == "bybit" and self.unified_margin:
-                # Try total['USDT'] or total['USD']
                 try:
                     total = bal.get("total") or {}
                     if self.cfg.quote in total and total[self.cfg.quote] is not None:
@@ -253,7 +262,11 @@ class ExchangeWrapper:
 
             return 0.0
         except Exception as e:
-            log.debug(f"fetch_balance_usdt failed: {e}")
+            # Make this LOUD so you see missing keys/permission issues
+            log.warning(
+                "fetch_balance_usdt failed (returning 0.0). "
+                "This usually means missing BYBIT_API_KEY/SECRET or a Bybit permission problem: %s", e
+            )
             return 0.0
 
     # -------- Precision / Orders / Leverage --------

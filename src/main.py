@@ -1,12 +1,17 @@
 import argparse
 import logging
+
 from .config import load_config
 from .exchange import ExchangeWrapper
 from .backtester import run_backtest
 from .live import run_live
-from .utils import setup_logging
+from .utils import setup_logging, load_env_file_if_present
+
 
 def main():
+    # Ensure .env is loaded for manual runs (systemd and run_local.sh already export it)
+    load_env_file_if_present()
+
     p = argparse.ArgumentParser(prog="xsmom-bot")
     p.add_argument("cmd", choices=["backtest", "live", "scan"])
     p.add_argument("--config", required=True, help="Path to YAML config")
@@ -20,7 +25,9 @@ def main():
         ex = ExchangeWrapper(cfg.exchange)
         try:
             syms = ex.fetch_markets_filtered()
-            logging.getLogger("scan").info(f"Symbols ({len(syms)}): {', '.join(syms[:50])}{'...' if len(syms)>50 else ''}")
+            logging.getLogger("scan").info(
+                f"Symbols ({len(syms)}): {', '.join(syms[:50])}{'...' if len(syms) > 50 else ''}"
+            )
         finally:
             ex.close()
 
@@ -32,6 +39,7 @@ def main():
 
     elif args.cmd == "live":
         run_live(cfg, dry=args.dry)
+
 
 if __name__ == "__main__":
     main()
