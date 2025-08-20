@@ -173,9 +173,9 @@ normalize_destination_tree() {
       sudo mv "${dest}/${f}" "${dest}/src/"
     fi
   done
-  # Fix common typo: sizing,py → sizing.py
-  if [ -f "${dest}/sizing,py" ]; then
-    sudo mv "${dest}/sizing,py" "${dest}/src/sizing.py"
+  # Move sizing.py if exists (flat → src/)
+  if [ -f "${dest}/sizing.py" ]; then
+    sudo mv "${dest}/sizing.py" "${dest}/src/sizing.py"
   fi
 }
 
