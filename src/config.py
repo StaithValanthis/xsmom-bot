@@ -14,6 +14,7 @@ class ExchangeCfg(BaseModel):
     min_price: float = 0.005
     timeframe: str = "1h"
     candles_limit: int = 1200
+    ohlcv_pause_ms: int = 0
 
 class RegimeFilterCfg(BaseModel):
     enabled: bool = False
@@ -24,6 +25,17 @@ class FundingTiltCfg(BaseModel):
     enabled: bool = False
     weight: float = 0.2
 
+class DiversifyCfg(BaseModel):
+    enabled: bool = False
+    corr_lookback: int = 48
+    max_pair_corr: float = 0.9
+
+class VolTargetCfg(BaseModel):
+    enabled: bool = False
+    target_daily_vol_bps: float = 0.0   # e.g. 80 bps/day
+    min_scale: float = 0.5
+    max_scale: float = 2.0
+
 class StrategyCfg(BaseModel):
     lookbacks: List[int] = Field(default_factory=lambda: [1, 6, 24])
     lookback_weights: List[float] = Field(default_factory=lambda: [1.0, 1.0, 1.0])
@@ -33,8 +45,11 @@ class StrategyCfg(BaseModel):
     market_neutral: bool = True
     gross_leverage: float = 2.0
     max_weight_per_asset: float = 0.10
+    entry_zscore_min: float = 0.0
     regime_filter: RegimeFilterCfg = RegimeFilterCfg()
     funding_tilt: FundingTiltCfg = FundingTiltCfg()
+    diversify: DiversifyCfg = DiversifyCfg()
+    vol_target: VolTargetCfg = VolTargetCfg()
 
 class LiquidityCfg(BaseModel):
     adv_cap_pct: float = 0.004
@@ -50,6 +65,7 @@ class ExecutionCfg(BaseModel):
     poll_seconds: int = 15
     align_after_funding_minutes: int = 0
     funding_hours_utc: List[int] = Field(default_factory=lambda: [0, 8, 16])
+    min_order_notional_usdt: float = 5.0
 
 class RiskCfg(BaseModel):
     # Stop/TP sizing

@@ -10,6 +10,7 @@ exchange:
   min_price: 0.01
   timeframe: "1h"
   candles_limit: 1000
+  ohlcv_pause_ms: 0
 
 strategy:
   lookbacks: [1, 4, 12]
@@ -18,14 +19,34 @@ strategy:
   k_min: 1
   k_max: 2
   market_neutral: false
-  gross_leverage: 2.0            # was 1.0 → increase notional vs equity
+  gross_leverage: 2.0
   max_weight_per_asset: 0.5
+
+  # NEW: require some cross-sectional conviction before entering
+  entry_zscore_min: 0.20
+
+  # NEW: diversification (cap pairwise correlation during selection)
+  diversify:
+    enabled: true
+    corr_lookback: 48
+    max_pair_corr: 0.85
+
+  # NEW: volatility targeting (daily vol in bps, from hourly returns)
+  vol_target:
+    enabled: true
+    target_daily_vol_bps: 80
+    min_scale: 0.5
+    max_scale: 2.0
+
   regime_filter:
     enabled: false
     ema_len: 200
     slope_min_bps_per_day: 0
+
+  # Funding-aware tilt (carry)
   funding_tilt:
-    enabled: false
+    enabled: true
+    weight: 0.15
 
 liquidity:
   adv_cap_pct: 0.01
@@ -37,26 +58,28 @@ execution:
   price_offset_bps: 0
   slippage_bps_guard: 25
   set_leverage: 3
-  rebalance_minute: 15           # was 5 → reduce churn on small balance
+  rebalance_minute: 15
   poll_seconds: 15
   align_after_funding_minutes: 5
   funding_hours_utc: [0, 8, 16]
+  # NEW: skip dust rebalances
+  min_order_notional_usdt: 5.0
 
 risk:
   # Core SL/TP sizing
   atr_len: 14
-  atr_mult_sl: 1.6               # was 1.5 → slightly tighter risk
-  atr_mult_tp: 3.5               # enable TP to book winners
+  atr_mult_sl: 1.6
+  atr_mult_tp: 3.5
   use_tp: true
 
   # Event-driven fast loop (intrabar management)
-  fast_check_seconds: 2           # how often to check for SL/TP intrabar
-  stop_timeframe: "1m"            # ATR/stop baseline timeframe
+  fast_check_seconds: 2
+  stop_timeframe: "1m"
   trailing_enabled: true
-  trail_atr_mult: 1.6             # match SL multiple
-  breakeven_after_r: 1.0          # move stop to BE after +1R (0 = disabled)
+  trail_atr_mult: 1.6
+  breakeven_after_r: 1.0
 
-  # One-shot partial TP when +R reached (independent of use_tp)
+  # One-shot partial TP when +R reached
   partial_tp_enabled: true
   partial_tp_r: 1.5
   partial_tp_size: 0.5
@@ -66,7 +89,7 @@ risk:
   trade_disable_minutes: 120
 
   # Rebalance churn gate (skip tiny PnL flips/reductions)
-  min_close_pnl_pct: 0.8          # was 0.5
+  min_close_pnl_pct: 0.8
 
 costs:
   taker_fee_bps: 6.0

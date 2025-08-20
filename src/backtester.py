@@ -5,7 +5,7 @@ import pandas as pd
 
 from .config import AppConfig
 from .exchange import ExchangeWrapper
-from .signals import regime_ok
+from .signals import regime_ok, dynamic_k
 from .sizing import build_targets
 from .utils import utcnow
 
@@ -30,6 +30,16 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
                 bars[s] = df
         except Exception as e:
             log.warning(f"Failed OHLCV {s}: {e}")
+
+    # Funding tilt snapshot (static in BT)
+    funding_map: Dict[str, float] = {}
+    try:
+        if getattr(cfg.strategy.funding_tilt, "enabled", False):
+            funding_map = ex.fetch_funding_rates(list(bars.keys())) or {}
+    except Exception as e:
+        log.debug(f"Funding rates fetch failed in BT: {e}")
+        funding_map = {}
+
     ex.close()
 
     if not bars:
@@ -45,7 +55,8 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
     weights_hist = []
     turnover_hist = []
 
-    for i in range(max(max(cfg.strategy.lookbacks), cfg.strategy.vol_lookback) + 5, len(idx) - 1):
+    warmup = max(max(cfg.strategy.lookbacks), cfg.strategy.vol_lookback) + 5
+    for i in range(warmup, len(idx) - 1):
         window = closes.iloc[:i+1]
 
         # Optional regime gating
@@ -67,7 +78,17 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
             cfg.strategy.market_neutral,
             cfg.strategy.gross_leverage,
             cfg.strategy.max_weight_per_asset,
-            dynamic_k_fn=lambda sc, kmin, kmax: (kmin, kmax),  # fixed for backtest unless you want real dispersion-based
+            dynamic_k_fn=dynamic_k,  # dispersion-sensitive K
+            funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, "enabled", False) else None,
+            funding_weight=float(getattr(cfg.strategy.funding_tilt, "weight", 0.0)) if getattr(cfg.strategy.funding_tilt, "enabled", False) else 0.0,
+            entry_zscore_min=float(getattr(cfg.strategy, "entry_zscore_min", 0.0)),
+            diversify_enabled=bool(getattr(cfg.strategy.diversify, "enabled", False)),
+            corr_lookback=int(getattr(cfg.strategy.diversify, "corr_lookback", 48)),
+            max_pair_corr=float(getattr(cfg.strategy.diversify, "max_pair_corr", 0.9)),
+            vol_target_enabled=bool(getattr(cfg.strategy.vol_target, "enabled", False)),
+            target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, "target_daily_vol_bps", 0.0)),
+            vol_target_min_scale=float(getattr(cfg.strategy.vol_target, "min_scale", 0.5)),
+            vol_target_max_scale=float(getattr(cfg.strategy.vol_target, "max_scale", 2.0)),
         ).reindex(closes.columns).fillna(0.0)
 
         prev_w = weights_hist[-1] if len(weights_hist) else pd.Series(0.0, index=closes.columns)
@@ -76,7 +97,7 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
         # one-bar forward return
         port_ret = (rets.iloc[i+1] * w).sum()
 
-        # turnover estimate (very rough): sum abs(delta_w)
+        # turnover estimate: sum abs(delta_w)
         delta = (w - prev_w).abs().sum()
         turnover_notional = delta  # equity assumed 1.0; scale by equity for real
         turnover_hist.append(turnover_notional)
