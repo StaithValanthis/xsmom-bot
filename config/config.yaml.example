@@ -18,7 +18,7 @@ strategy:
   vol_lookback: 36
   k_min: 1
   k_max: 2
-  market_neutral: false
+  market_neutral: true
   gross_leverage: 2.0
   max_weight_per_asset: 0.5
 
