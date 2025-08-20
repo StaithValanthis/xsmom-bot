@@ -17,36 +17,29 @@ class ExchangeWrapper:
         secret = os.getenv("BYBIT_API_SECRET", "")
         klass = getattr(ccxt, cfg.id)
 
-        # Base client
-        self.x = klass(
-            {
-                "apiKey": api_key,
-                "secret": secret,
-                "enableRateLimit": True,
-                "timeout": 20000,
-                "options": {
-                    # trading perps by default when account_type == "swap"
-                    "defaultType": "swap" if cfg.account_type == "swap" else "spot",
-                },
-            }
-        )
+        self.x = klass({
+            "apiKey": api_key,
+            "secret": secret,
+            "enableRateLimit": True,
+            "timeout": 20000,
+            "options": {
+                "defaultType": "swap" if cfg.account_type == "swap" else "spot",
+            },
+        })
 
-        # UNIFIED Trading Account (UTA) hint for Bybit (very important for balances)
-        # If you are on Bybit UTA, ccxt needs accountType='UNIFIED' for v5 balance/positions.
+        # Unified Trading Account (UTA) setup for Bybit
         self.unified_margin = bool(getattr(cfg, "unified_margin", False))
         if self.x.id == "bybit" and self.unified_margin:
             opts = getattr(self.x, "options", {}) or {}
-            opts.update(
-                {
-                    "defaultType": "swap",  # we trade linear perps
-                    "accountType": "UNIFIED",
-                    # ensure fetchBalance passes proper params by default
-                    "fetchBalance": {"accountType": "UNIFIED"},
-                }
-            )
-            self.x.options = opts  # assign back
+            opts.update({
+                "defaultType": "swap",
+                "accountType": "UNIFIED",
+                # ensure CCXT uses these params when it builds balance requests internally
+                "fetchBalance": {"accountType": "UNIFIED", "coin": self.cfg.quote},
+            })
+            self.x.options = opts
 
-        # Testnet
+        # Testnet toggle
         if cfg.testnet and hasattr(self.x, "set_sandbox_mode"):
             self.x.set_sandbox_mode(True)
 
@@ -63,18 +56,22 @@ class ExchangeWrapper:
         except Exception:
             pass
 
+    # -------- Markets / Universe --------
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
     def load_markets(self):
         return self.x.load_markets()
 
     def fetch_markets_filtered(self) -> List[str]:
         markets = self.load_markets()
-        symbols = []
+        symbols: List[str] = []
+
         for sym, m in markets.items():
             if m.get("active") is not True:
                 continue
+
             if self.cfg.only_perps:
-                # USDT linear perps
+                # USDT linear perps (swap)
                 if (m.get("swap") is True) and m.get("quote") == self.cfg.quote:
                     if m.get("type") == "swap" or m.get("contract", False):
                         if m.get("settle") in (self.cfg.quote, None) and m.get("linear", True):
@@ -108,6 +105,8 @@ class ExchangeWrapper:
         log.info(f"Universe after filters: {len(keep)} symbols")
         return keep
 
+    # -------- Market Data --------
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int):
         return self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -119,13 +118,26 @@ class ExchangeWrapper:
             log.debug(f"fetch_tickers error: {e}")
             return {}
 
+    def fetch_price(self, symbol: str) -> Optional[float]:
+        try:
+            t = self.x.fetch_ticker(symbol)
+            px = t.get("last") or t.get("close")
+            return float(px) if px is not None else None
+        except Exception as e:
+            log.debug(f"fetch_price error {symbol}: {e}")
+            return None
+
+    # -------- Positions --------
+
     def fetch_positions_map(self) -> Dict[str, dict]:
         """
         Map of symbol -> position dict.
-        Under UTA, pass accountType='UNIFIED' to ensure correct wallet.
+        Under UTA, pass accountType='UNIFIED' (and settle='USDT' defensively).
         """
         try:
-            params = {"accountType": "UNIFIED"} if (self.x.id == "bybit" and self.unified_margin) else {}
+            params = {}
+            if self.x.id == "bybit" and self.unified_margin:
+                params = {"accountType": "UNIFIED", "settle": self.cfg.quote}
             pos = self.x.fetch_positions(params=params)
         except Exception as e:
             log.debug(f"fetch_positions failed: {e}")
@@ -137,51 +149,62 @@ class ExchangeWrapper:
                 out[sym] = p
         return out
 
-    def _parse_unified_equity(self, bal: dict) -> Optional[float]:
-        """
-        For Bybit UTA, ccxt may not populate bal['USDT'].
-        Try bal['total'] then raw info payload (result->list[0]).
-        """
-        # 1) Standard 'total' mapping
-        try:
-            total = bal.get("total") or {}
-            # Prefer USDT if present, else USD-equivalent if exposed
-            if "USDT" in total and total["USDT"] is not None:
-                return float(total["USDT"])
-            if "USD" in total and total["USD"] is not None:
-                return float(total["USD"])
-        except Exception:
-            pass
+    # -------- Balance (robust UTA support) --------
 
-        # 2) Raw info fallbacks (common UTA shape)
+    def _parse_unified_equity_from_info(self, info: dict) -> Optional[float]:
+        """
+        Parse Bybit v5 wallet response (privateGetV5AccountWalletBalance).
+        Typical shape:
+          {'retCode':0,'result':{'list':[{'totalAvailableBalance':'...','totalEquity':'...'}]}}
+        """
         try:
-            info = bal.get("info") or {}
-            # bybit v5 often: {'result': {'list': [{'totalEquity': '...', 'totalAvailableBalance': '...'}]}}
-            res = info.get("result") or {}
+            res = (info or {}).get("result") or {}
             lst = res.get("list") or []
             if lst:
                 row = lst[0]
                 for key in ("totalAvailableBalance", "availableBalance", "totalEquity"):
-                    if key in row and row[key] is not None:
-                        return float(row[key])
+                    v = row.get(key)
+                    if v is not None:
+                        return float(v)
         except Exception:
             pass
+        return None
 
+    def _bybit_raw_wallet_balance(self) -> Optional[float]:
+        """
+        Fallback: call Bybit v5 wallet balance endpoint directly via ccxt's raw method
+        when fetch_balance() does not surface UTA equity.
+        """
+        if self.x.id != "bybit":
+            return None
+        # Not all ccxt builds expose this method name; guard carefully
+        method_name = "privateGetV5AccountWalletBalance"
+        if not hasattr(self.x, method_name):
+            return None
+        try:
+            method = getattr(self.x, method_name)
+            params = {"accountType": "UNIFIED", "coin": self.cfg.quote}
+            data = method(params)
+            val = self._parse_unified_equity_from_info(data)
+            if val is not None:
+                return float(val)
+        except Exception as e:
+            log.debug(f"raw bybit wallet balance call failed: {e}")
         return None
 
     def fetch_balance_usdt(self) -> float:
         """
-        Fetch equity in USDT terms. For Bybit UTA, request accountType='UNIFIED' and
-        parse using multiple fallbacks in case per-asset buckets are not populated.
+        Fetch equity in USDT terms.
+        For Bybit UTA, send params and include a direct v5 fallback if needed.
         """
         try:
             params = {}
             if self.x.id == "bybit" and self.unified_margin:
-                params["accountType"] = "UNIFIED"
+                params = {"accountType": "UNIFIED", "coin": self.cfg.quote}
 
             bal = self.x.fetch_balance(params)
 
-            # First, try the explicit quote bucket (works on classic accounts)
+            # 1) Try explicit quote bucket (classic accounts or when CCXT fills it)
             try:
                 usdt_bucket = bal.get(self.cfg.quote, {}) or {}
                 usdt_direct = usdt_bucket.get("total") or usdt_bucket.get("free")
@@ -192,18 +215,37 @@ class ExchangeWrapper:
             except Exception:
                 pass
 
-            # Unified fallbacks
+            # 2) Unified-friendly totals exposed via CCXT mapping
             if self.x.id == "bybit" and self.unified_margin:
-                uni = self._parse_unified_equity(bal)
+                # Try total['USDT'] or total['USD']
+                try:
+                    total = bal.get("total") or {}
+                    if self.cfg.quote in total and total[self.cfg.quote] is not None:
+                        v = float(total[self.cfg.quote])
+                        if v >= 0:
+                            return v
+                    if "USD" in total and total["USD"] is not None:
+                        v = float(total["USD"])
+                        if v >= 0:
+                            return v
+                except Exception:
+                    pass
+
+                # 3) Parse raw info blob
+                uni = self._parse_unified_equity_from_info(bal.get("info") or {})
                 if uni is not None:
                     return float(uni)
 
-            # Last resort: try any 'total' value aggregation
+                # 4) FINAL FALLBACK: call raw v5 wallet endpoint directly
+                raw = self._bybit_raw_wallet_balance()
+                if raw is not None:
+                    return float(raw)
+
+            # Non-unified or no data
             try:
                 total = bal.get("total") or {}
                 if self.cfg.quote in total and total[self.cfg.quote] is not None:
                     return float(total[self.cfg.quote])
-                # could be mapped under 'USD' on unified accounts
                 if "USD" in total and total["USD"] is not None:
                     return float(total["USD"])
             except Exception:
@@ -214,14 +256,7 @@ class ExchangeWrapper:
             log.debug(f"fetch_balance_usdt failed: {e}")
             return 0.0
 
-    def fetch_price(self, symbol: str) -> Optional[float]:
-        try:
-            t = self.x.fetch_ticker(symbol)
-            px = t.get("last") or t.get("close")
-            return float(px) if px is not None else None
-        except Exception as e:
-            log.debug(f"fetch_price error {symbol}: {e}")
-            return None
+    # -------- Precision / Orders / Leverage --------
 
     def get_precision(self, symbol: str) -> Tuple[float, float]:
         m = self.x.market(symbol)
@@ -247,7 +282,6 @@ class ExchangeWrapper:
         if reduce_only:
             params["reduceOnly"] = True
         if post_only:
-            # CCXT Bybit supports "PostOnly" via timeInForce param on v5 routes
             params["timeInForce"] = "PostOnly"
         if price is None:
             return self.x.create_market_order(symbol, side, abs(amount), params)
@@ -256,7 +290,6 @@ class ExchangeWrapper:
 
     def try_set_leverage(self, symbol: str, leverage: int):
         try:
-            # Some ccxt versions expose setLeverage, newer ones may require set_margin_mode+set_leverage per market
             if hasattr(self.x, "setLeverage"):
                 self.x.setLeverage(leverage, symbol, params={"buyLeverage": leverage, "sellLeverage": leverage})
                 log.info(f"Set leverage {leverage}x for {symbol}")
