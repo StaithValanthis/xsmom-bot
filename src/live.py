@@ -119,6 +119,10 @@ def run_live(cfg: AppConfig, dry: bool):
             cycle_started_at = now
             log.info(f"=== Cycle start {cycle_started_at.isoformat()} ===")
 
+            # Gate: only rebalance every N hours; always manage stops each cycle.
+            reb_every = max(1, int(getattr(cfg.execution, "rebalance_every_hours", 1)))
+            do_rebalance = ((now.hour % reb_every) == 0)
+
             # Daily universe refresh (first cycle after UTC midnight)
             try:
                 last_ref = state.get("last_universe_refresh")
@@ -148,7 +152,6 @@ def run_live(cfg: AppConfig, dry: bool):
             # Equity & daily anchor (+ configured leverage)
             try:
                 equity = ex.fetch_balance_usdt()
-                # NEW: show equity and configured leverage knobs up front
                 log.info(
                     f"Equity snapshot: {equity:.2f} USDT | "
                     f"config.gross_leverage={cfg.strategy.gross_leverage} | "
@@ -235,10 +238,18 @@ def run_live(cfg: AppConfig, dry: bool):
                     )
                     if not ok:
                         log.info("Regime filter blocking new entries this cycle.")
-                        log.info(f"=== Cycle end (regime) {utcnow().isoformat()} ===")
-                        continue
+                        # Even if we block entries, still manage stops below
+                        do_rebalance = False
             except Exception as e:
                 log.warning(f"Regime filter calc failed (not blocking): {e}")
+
+            # Funding rates (optional tilt)
+            funding_map = {}
+            try:
+                if cfg.strategy.funding_tilt.enabled:
+                    funding_map = ex.fetch_funding_rates(list(closes.columns))
+            except Exception as e:
+                log.debug(f"Funding fetch failed (ignored): {e}")
 
             # Target construction (timed)
             try:
@@ -254,6 +265,8 @@ def run_live(cfg: AppConfig, dry: bool):
                     cfg.strategy.gross_leverage,
                     cfg.strategy.max_weight_per_asset,
                     dynamic_k_fn=lambda sc, kmin, kmax: (kmin, kmax),
+                    funding_tilt=funding_map if cfg.strategy.funding_tilt.enabled else None,
+                    funding_weight=cfg.strategy.funding_tilt.weight if cfg.strategy.funding_tilt.enabled else 0.0,
                 )
                 t_targets = perf_counter() - t_targets_start
                 log.info(f"Targets built for {len(targets)} symbols in {t_targets:.2f}s")
@@ -295,7 +308,7 @@ def run_live(cfg: AppConfig, dry: bool):
                 except Exception as e:
                     log.debug(f"Target preview failed: {e}")
 
-                # NEW: compute effective portfolio gross leverage from intended targets
+                # Effective portfolio gross leverage from intended targets
                 try:
                     gross_notional = 0.0
                     for s, q in qtys.items():
@@ -342,7 +355,7 @@ def run_live(cfg: AppConfig, dry: bool):
             # Best-effort leverage (per-symbol on exchange)
             try:
                 lev = cfg.execution.set_leverage
-                if lev and lev > 0:
+                if lev and lev > 0 and do_rebalance:
                     for s in targets.index:
                         try:
                             ex.try_set_leverage(s, lev)
@@ -351,38 +364,55 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.debug(f"Leverage loop failed (ignored): {e}")
 
-            # Order diff construction + placement (timed) + quantize diagnostics
-            t_ord_start = perf_counter()
+            # Order diff construction + placement (timed)
             orders = []
+            t_ord_start = perf_counter()
             try:
-                for s in targets.index:
-                    tgt = float(qtys.get(s, 0.0))
-                    cur = float(current_qtys.get(s, 0.0))
-                    diff = tgt - cur
-                    if abs(diff) < 1e-8:
-                        continue
-                    side = "buy" if diff > 0 else "sell"
-                    px = prices.get(s)
-                    order_px = None
-                    if isinstance(px, (int, float)) and cfg.execution.order_type.lower() == "limit":
-                        sign = 1 if side == "buy" else -1
-                        order_px = px * (1.0 + sign * (cfg.execution.price_offset_bps / 10_000))
-                    raw_diff = diff
-                    q_diff, q_px = ex.quantize(s, diff, order_px)
-                    if abs(raw_diff) > 0 and q_diff == 0.0:
-                        log.info(f"Rounded to 0 by quantize: {s} raw_diff={raw_diff} order_px={order_px}")
-                    if q_diff != 0.0:
-                        orders.append((s, side, q_diff, q_px))
+                if not do_rebalance:
+                    log.info(f"Skipping rebalance this hour (rebalance_every_hours={reb_every}); managing stops only.")
+                else:
+                    min_frac = float(getattr(cfg.execution, "min_rebalance_frac", 0.0))
+                    min_notional = float(getattr(cfg.execution, "min_order_notional_usdt", 0.0))
+
+                    for s in targets.index:
+                        tgt = float(qtys.get(s, 0.0))
+                        cur = float(current_qtys.get(s, 0.0))
+                        diff = tgt - cur
+                        if abs(diff) < 1e-8:
+                            continue
+
+                        # Skip micro-changes relative to target (but still allow position close)
+                        if abs(tgt) > 0 and abs(diff) < (min_frac * abs(tgt)):
+                            continue
+
+                        px = prices.get(s)
+                        # Guard against tiny notional orders before quantize
+                        if px and min_notional > 0.0 and (abs(diff) * float(px) < min_notional):
+                            continue
+
+                        side = "buy" if diff > 0 else "sell"
+                        order_px = None
+                        if isinstance(px, (int, float)) and cfg.execution.order_type.lower() == "limit":
+                            sign = 1 if side == "buy" else -1
+                            order_px = px * (1.0 + sign * (cfg.execution.price_offset_bps / 10_000))
+
+                        raw_diff = diff
+                        q_diff, q_px = ex.quantize(s, diff, order_px)
+                        if abs(raw_diff) > 0 and q_diff == 0.0:
+                            log.info(f"Rounded to 0 by quantize: {s} raw_diff={raw_diff} order_px={order_px}")
+                        if q_diff != 0.0:
+                            orders.append((s, side, q_diff, q_px, px))
             except Exception as e:
                 log.error(f"Order diff construction failed: {e}")
 
-            for (s, side, q, px) in orders:
+            for (s, side, q, px, last_px) in orders:
                 try:
+                    notional = (abs(q) * (px if px is not None else (last_px or 0.0))) if (px or last_px) else 0.0
                     if dry:
-                        log.info(f"[DRY] {s}: {side} {q} @ {px or 'mkt'}")
+                        log.info(f"[DRY] {s}: {side} {q} @ {px or 'mkt'} (~{notional:.2f} USDT)")
                     else:
                         ex.create_order_safe(s, side, q, px, post_only=cfg.execution.post_only, reduce_only=False)
-                        log.info(f"[LIVE] {s}: {side} {q} @ {px or 'mkt'}")
+                        log.info(f"[LIVE] {s}: {side} {q} @ {px or 'mkt'} (~{notional:.2f} USDT)")
                 except Exception as e:
                     log.error(f"Order error {s} {side} {q}: {e}")
             t_ord = perf_counter() - t_ord_start
@@ -391,6 +421,7 @@ def run_live(cfg: AppConfig, dry: bool):
             # Soft stops / TP per symbol (timed)
             t_stop_start = perf_counter()
             try:
+                # Manage stops for all symbols we have targets for (cheap) – could be broadened to universe.
                 for s in targets.index:
                     try:
                         raw = ex.fetch_ohlcv(s, timeframe=cfg.exchange.timeframe, limit=60)

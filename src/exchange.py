@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import ccxt
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -138,6 +138,47 @@ class ExchangeWrapper:
             log.debug(f"fetch_price error {symbol}: {e}")
             return None
 
+    def fetch_funding_rates(self, symbols: List[str]) -> Dict[str, float]:
+        """
+        Best-effort map: symbol -> fundingRate (as float per funding interval).
+        Not fatal if unsupported or fails; returns {}.
+        """
+        out: Dict[str, float] = {}
+        try:
+            if hasattr(self.x, "fetch_funding_rates"):
+                data = self.x.fetch_funding_rates(symbols)
+            elif hasattr(self.x, "fetchFundingRates"):  # some ccxt drivers
+                data = getattr(self.x, "fetchFundingRates")(symbols)
+            else:
+                return out
+
+            # ccxt returns dict keyed by symbol or a list of dicts
+            if isinstance(data, dict):
+                # {'BTC/USDT:USDT': {'symbol':..., 'fundingRate': ...}, ...}
+                for k, v in data.items():
+                    fr = (v or {}).get("fundingRate")
+                    if fr is None:
+                        fr = (v or {}).get("info", {}).get("fundingRate")
+                    if fr is not None:
+                        try:
+                            out[k] = float(fr)
+                        except Exception:
+                            pass
+            elif isinstance(data, list):
+                for v in data:
+                    sym = (v or {}).get("symbol")
+                    fr = (v or {}).get("fundingRate")
+                    if fr is None:
+                        fr = (v or {}).get("info", {}).get("fundingRate")
+                    if sym and fr is not None:
+                        try:
+                            out[sym] = float(fr)
+                        except Exception:
+                            pass
+        except Exception as e:
+            log.debug(f"fetch_funding_rates error: {e}")
+        return out
+
     # -------- Positions --------
 
     def fetch_positions_map(self) -> Dict[str, dict]:
@@ -262,7 +303,6 @@ class ExchangeWrapper:
 
             return 0.0
         except Exception as e:
-            # Make this LOUD so you see missing keys/permission issues
             log.warning(
                 "fetch_balance_usdt failed (returning 0.0). "
                 "This usually means missing BYBIT_API_KEY/SECRET or a Bybit permission problem: %s", e

@@ -1,11 +1,20 @@
 import logging
 import pandas as pd
 import numpy as np
-from typing import Dict
+from typing import Dict, Optional
 
 from .signals import momentum_score, inverse_vol_weights
 
 log = logging.getLogger("sizing")
+
+def _percentile_tilt(series: pd.Series) -> pd.Series:
+    """Map values to [-1, +1] by percentile.
+    Higher values -> closer to +1. We’ll invert for funding costs in caller.
+    """
+    if series.empty:
+        return series
+    r = series.rank(pct=True)  # [0,1]
+    return (r - 0.5) * 2.0
 
 def build_targets(
     prices: pd.DataFrame,
@@ -18,6 +27,9 @@ def build_targets(
     gross_leverage: float,
     max_weight_per_asset: float,
     dynamic_k_fn,
+    # NEW: optional funding-rate tilt (pass dict symbol->fundingRate)
+    funding_tilt: Optional[Dict[str, float]] = None,
+    funding_weight: float = 0.0,
 ) -> pd.Series:
     assert prices.shape[0] > max(max(lookbacks), vol_lookback) + 5, "Not enough bars"
     last_prices = prices.iloc[-1]
@@ -25,6 +37,18 @@ def build_targets(
     prices = prices[valid_cols]
 
     score = momentum_score(prices, lookbacks, weights)
+
+    # === Funding tilt (optional) ============================================
+    # Funding rates: positive = expensive to be long. We *penalize* positive
+    # funding and reward negative (cheaper) funding.
+    if funding_tilt and abs(funding_weight) > 1e-12:
+        f = pd.Series({k: float(v) for k, v in (funding_tilt or {}).items()}, dtype="float64")
+        f = f.reindex(prices.columns)
+        f = f.fillna(f.median())  # be conservative on missing
+        # Convert to percentile tilt in [-1, +1], then invert so expensive funding -> negative
+        tilt = -_percentile_tilt(f)
+        score = score.add(funding_weight * tilt, fill_value=0.0)
+
     iv = inverse_vol_weights(prices, vol_lookback)
 
     topk, bottomk = dynamic_k_fn(score, k_min, k_max)
@@ -80,5 +104,4 @@ def apply_liquidity_caps(
         if max_notional > 0 and notional > max_notional:
             new_weight = max_notional / equity_usdt
             capped[s] = new_weight * np.sign(targets[s])
-    # re-balance legs proportionally to keep gross approx. same (optional, simple approach: leave as-capped)
     return capped

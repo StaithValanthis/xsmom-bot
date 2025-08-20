@@ -10,6 +10,7 @@ exchange:
   min_price: 0.01
   timeframe: "1h"
   candles_limit: 1000
+  ohlcv_pause_ms: 0    # add >0 if you hit rate limits
 
 strategy:
   lookbacks: [1, 4, 12]
@@ -25,7 +26,8 @@ strategy:
     ema_len: 200
     slope_min_bps_per_day: 0
   funding_tilt:
-    enabled: false
+    enabled: false               # turn on to tilt away from expensive funding
+    weight: 0.15
 
 liquidity:
   adv_cap_pct: 0.01              # irrelevant at this size
@@ -39,6 +41,9 @@ execution:
   set_leverage: 3
   rebalance_minute: 5
   poll_seconds: 15
+  rebalance_every_hours: 1       # set 4 or 8 to reduce churn
+  min_rebalance_frac: 0.10       # skip micro-changes (<10% of target size)
+  min_order_notional_usdt: 5.0   # ignore tiny orders
 
 risk:
   atr_mult_sl: 1.5

@@ -14,6 +14,8 @@ class ExchangeCfg(BaseModel):
     min_price: float = 0.005
     timeframe: str = "1h"
     candles_limit: int = 1200
+    # Optional throttle between OHLCV calls (ms) to avoid rate-limit spikes
+    ohlcv_pause_ms: int = 0
 
 class RegimeFilterCfg(BaseModel):
     enabled: bool = False
@@ -22,6 +24,8 @@ class RegimeFilterCfg(BaseModel):
 
 class FundingTiltCfg(BaseModel):
     enabled: bool = False
+    # Adds this *weight* (in score space) against expensive funding and toward
+    # cheap funding. Positive funding (costly longs) gets a negative tilt.
     weight: float = 0.2
 
 class StrategyCfg(BaseModel):
@@ -48,6 +52,12 @@ class ExecutionCfg(BaseModel):
     set_leverage: int = 3
     rebalance_minute: int = 5
     poll_seconds: int = 15
+    # New: trade *less often* to reduce churn & fees, while still using 1h bars
+    rebalance_every_hours: int = 1  # 1 = every hour (current behavior)
+    # New: skip micro-changes to reduce noise/churn
+    min_rebalance_frac: float = 0.10  # require >=10% of target to trade
+    # New: don't send tiny orders (pre-quantize guard)
+    min_order_notional_usdt: float = 5.0
 
 class RiskCfg(BaseModel):
     atr_mult_sl: float = 2.5
