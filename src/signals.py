@@ -1,3 +1,4 @@
+# v1.1.0 – 2025-08-21
 import logging
 from typing import List, Tuple, Literal
 import numpy as np
@@ -53,8 +54,20 @@ def dynamic_k(score: pd.Series, k_min: int, k_max: int) -> Tuple[int,int]:
     k = max(k_min, min(k, k_max))
     return k, k
 
-def regime_ok(close: pd.Series, ema_len: int, slope_min_bps_per_day: float) -> bool:
+def regime_ok(
+    close: pd.Series,
+    ema_len: int,
+    slope_min_bps_per_day: float,
+    use_abs: bool = False
+) -> bool:
+    """
+    True if regime is 'tradable' by EMA slope.
+      - If use_abs=False: allow when slope >= threshold (directional up-trend gating).
+      - If use_abs=True: allow when |slope| >= threshold (trend/noise gating).
+    """
     ema = close.ewm(span=ema_len, adjust=False).mean()
     slope = ema.diff().tail(ema_len).mean()
     slope_bps = 10_000 * slope / close.iloc[-1]
+    if use_abs:
+        return abs(float(slope_bps)) >= slope_min_bps_per_day
     return float(slope_bps) >= slope_min_bps_per_day

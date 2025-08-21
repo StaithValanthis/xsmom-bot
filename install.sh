@@ -14,7 +14,6 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 START_NOW="${START_NOW:-ask}"      # ask | yes | no
 RUN_NONINTERACTIVE="${RUN_NONINTERACTIVE:-0}"
 
-# NEW: choose if the systemd service runs in dry-run or live mode
 # 1 = dry-run (default, safe), 0 = live trading
 SERVICE_DRY="${SERVICE_DRY:-1}"
 
@@ -32,7 +31,6 @@ ensure_dir_owned() {
 }
 
 seed_local_if_missing() {
-  # Seed minimal files in the LOCAL repo (cwd) so rsync won't choke
   mkdir -p config src systemd state logs tests
 
   if [ ! -f ".env.example" ]; then
@@ -118,7 +116,6 @@ logging:
 EOF
   fi
 
-  # Seed a basic unit file; we'll normalize/patch it later with actual paths & flags
   if [ ! -f "systemd/${SERVICE_NAME}.service" ]; then
     cat > "systemd/${SERVICE_NAME}.service" <<'EOF'
 [Unit]
@@ -149,31 +146,24 @@ EOF
 
 normalize_destination_tree() {
   local dest="$1"
-
-  # Ensure core folders exist
   sudo mkdir -p "${dest}/config" "${dest}/src" "${dest}/systemd" "${dest}/state" "${dest}/logs"
   sudo chown -R "${RUN_AS}:${RUN_GROUP}" "${dest}"
 
-  # Move misplaced config files (flat → config/)
   if [ -f "${dest}/config.yaml.example" ]; then
     sudo mv "${dest}/config.yaml.example" "${dest}/config/"
   fi
   if [ -f "${dest}/config.yaml" ]; then
     sudo mv "${dest}/config.yaml" "${dest}/config/"
   fi
-
-  # Move service file (flat → systemd/)
   if [ -f "${dest}/${SERVICE_NAME}.service" ]; then
     sudo mv "${dest}/${SERVICE_NAME}.service" "${dest}/systemd/"
   fi
 
-  # Move python modules (flat → src/)
   for f in __init__.py backtester.py config.py exchange.py live.py main.py risk.py signals.py utils.py; do
     if [ -f "${dest}/${f}" ]; then
       sudo mv "${dest}/${f}" "${dest}/src/"
     fi
   done
-  # Move sizing.py if exists (flat → src/)
   if [ -f "${dest}/sizing.py" ]; then
     sudo mv "${dest}/sizing.py" "${dest}/src/sizing.py"
   fi
@@ -181,7 +171,6 @@ normalize_destination_tree() {
 
 ensure_active_config() {
   local dest="$1"
-  # Ensure config.yaml exists at destination, copying from example or seeding minimal
   if [ ! -f "${dest}/config/config.yaml" ]; then
     if [ -f "${dest}/config/config.yaml.example" ]; then
       sudo -u "${RUN_AS}" cp "${dest}/config/config.yaml.example" "${dest}/config/config.yaml"
@@ -228,7 +217,6 @@ fix_service_user_and_paths() {
   local dest="$1"
   local svc="${dest}/systemd/${SERVICE_NAME}.service"
 
-  # Ensure service file exists (seed minimal if not)
   if [ ! -f "$svc" ]; then
     warn "Service file missing; seeding a minimal one."
     cat > "$svc" <<EOF
@@ -257,17 +245,14 @@ WantedBy=multi-user.target
 EOF
   fi
 
-  # Build ExecStart flags (respect SERVICE_DRY)
   local EXEC_FLAGS="--config ${dest}/config/config.yaml"
   if [ "${SERVICE_DRY}" = "1" ]; then
     EXEC_FLAGS="${EXEC_FLAGS} --dry"
   fi
 
-  # Patch User/Group/WorkingDirectory/ExecStart to match this installation
   sudo sed -i "s|^User=.*|User=${RUN_AS}|" "$svc"
   sudo sed -i "s|^Group=.*|Group=${RUN_GROUP}|" "$svc" || true
   sudo sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${dest}|" "$svc"
-  # Force --config path to ${dest}/config/config.yaml and python venv path; toggle --dry based on SERVICE_DRY
   sudo sed -i "s|^ExecStart=.*|ExecStart=${dest}/venv/bin/python -m src.main live ${EXEC_FLAGS}|" "$svc"
 }
 
@@ -275,7 +260,6 @@ EOF
 # Begin installation
 # =========================
 
-# Decide destination APP_DIR (/opt or fallback to $HOME)
 APP_DIR="$DEFAULT_APP_DIR"
 info "Ensuring /opt exists (or fallback to \$HOME)..."
 if ! sudo mkdir -p /opt 2>/dev/null; then
@@ -308,7 +292,6 @@ sudo chown -R "${RUN_AS}:${RUN_GROUP}" "${APP_DIR}"
 info "Creating Python venv and installing requirements..."
 sudo -u "${RUN_AS}" "${PYTHON_BIN}" -m venv "${APP_DIR}/venv"
 sudo -u "${RUN_AS}" "${APP_DIR}/venv/bin/pip" install --upgrade pip
-# Fix common typo in requirements (tccxt -> ccxt)
 if grep -q '^tccxt' "${APP_DIR}/requirements.txt"; then
   sudo sed -i 's/^tccxt/ccxt/' "${APP_DIR}/requirements.txt"
 fi
@@ -323,8 +306,24 @@ ensure_active_config "${APP_DIR}"
 info "Installing systemd service..."
 fix_service_user_and_paths "${APP_DIR}"
 sudo cp "${APP_DIR}/systemd/${SERVICE_NAME}.service" "${SERVICE_FILE}"
+
+# Install optimizer service + timer
+if [ -f "${APP_DIR}/systemd/xsmom-opt.service" ]; then
+  sudo cp "${APP_DIR}/systemd/xsmom-opt.service" "/etc/systemd/system/xsmom-opt.service"
+fi
+if [ -f "${APP_DIR}/systemd/xsmom-opt.timer" ]; then
+  sudo cp "${APP_DIR}/systemd/xsmom-opt.timer" "/etc/systemd/system/xsmom-opt.timer"
+fi
+
 sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE_NAME}"
+
+# Enable optimizer timer if present
+if systemctl list-unit-files | grep -q "^xsmom-opt.timer"; then
+  sudo systemctl enable xsmom-opt.timer || true
+  sudo systemctl start xsmom-opt.timer || true
+  info "Optimizer timer enabled (xsmom-opt.timer)."
+fi
 
 # Start service now?
 if [ "${RUN_NONINTERACTIVE}" = "1" ] || [ "${START_NOW}" = "yes" ]; then

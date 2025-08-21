@@ -1,3 +1,4 @@
+# v1.1.0 – 2025-08-21
 from typing import List, Optional
 from pydantic import BaseModel, Field
 
@@ -18,12 +19,14 @@ class RegimeFilterCfg(BaseModel):
     enabled: bool = False
     ema_len: int = 200
     slope_min_bps_per_day: float = 5.0
+    # NEW in v1.1.0: absolute slope gating
+    use_abs: bool = False
 
 class FundingTiltCfg(BaseModel):
     enabled: bool = False
     weight: float = 0.2
 
-# NEW: optional sub-configs for diversification & volatility targeting
+# optional sub-configs for diversification & volatility targeting
 class DiversifyCfg(BaseModel):
     enabled: bool = False
     corr_lookback: int = 48
@@ -47,7 +50,7 @@ class StrategyCfg(BaseModel):
     regime_filter: RegimeFilterCfg = RegimeFilterCfg()
     funding_tilt: FundingTiltCfg = FundingTiltCfg()
 
-    # NEW: quality & shaping
+    # quality & shaping
     entry_zscore_min: float = 0.0
     diversify: DiversifyCfg = DiversifyCfg()
     vol_target: VolTargetCfg = VolTargetCfg()
@@ -67,7 +70,7 @@ class ExecutionCfg(BaseModel):
     align_after_funding_minutes: int = 0
     funding_hours_utc: List[int] = Field(default_factory=lambda: [0, 8, 16])
 
-    # NEW: small-account churn guards
+    # small-account churn guards
     min_notional_per_order_usdt: float = 5.0
     min_rebalance_delta_bps: float = 25.0  # 0.25% of equity
 
@@ -100,7 +103,7 @@ class RiskCfg(BaseModel):
     trade_disable_minutes: int = 120
     min_close_pnl_pct: float = 1.0
 
-    # NEW: time-based exit
+    # time-based exit
     max_hours_in_trade: int = 48
 
 class CostsCfg(BaseModel):

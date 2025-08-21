@@ -1,0 +1,11 @@
+[Unit]
+Description=Run XSMOM optimizer daily and at boot
+
+[Timer]
+OnBootSec=3min
+OnCalendar=*-*-* 00:20:00
+Persistent=true
+Unit=xsmom-opt.service
+
+[Install]
+WantedBy=timers.target

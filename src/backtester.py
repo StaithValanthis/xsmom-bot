@@ -1,5 +1,6 @@
+# v1.1.0 – 2025-08-21
 import logging
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import numpy as np
 import pandas as pd
 
@@ -16,6 +17,25 @@ def _costs(turnover_notional: float, maker_ratio: float, cfg: AppConfig) -> floa
     slip_bps = cfg.costs.slippage_bps
     total_bps = fee_bps + slip_bps
     return -(total_bps / 10_000.0) * turnover_notional
+
+def _perf_stats(eq: pd.Series) -> Dict[str, float]:
+    rets = eq.pct_change().dropna()
+    if rets.empty:
+        return {"total_return": 0.0, "max_drawdown": 0.0, "annualized": 0.0, "sharpe": 0.0, "calmar": 0.0}
+    hours_per_year = 24 * 365
+    ann = (1.0 + rets.mean()) ** hours_per_year - 1.0
+    vol_ann = rets.std() * np.sqrt(hours_per_year)
+    sharpe = ann / vol_ann if vol_ann > 0 else 0.0
+    dd = (eq / eq.cummax() - 1.0).min()
+    total = float(eq.iloc[-1] - 1.0)
+    calmar = (ann / abs(dd)) if dd < 0 else 0.0
+    return {
+        "total_return": float(total),
+        "max_drawdown": float(dd),
+        "annualized": float(ann),
+        "sharpe": float(sharpe),
+        "calmar": float(calmar),
+    }
 
 def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
     ex = ExchangeWrapper(cfg.exchange)
@@ -61,7 +81,12 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
 
         # Optional regime gating
         if cfg.strategy.regime_filter.enabled:
-            ok = regime_ok(window.mean(axis=1), cfg.strategy.regime_filter.ema_len, cfg.strategy.regime_filter.slope_min_bps_per_day)
+            ok = regime_ok(
+                window.mean(axis=1),
+                cfg.strategy.regime_filter.ema_len,
+                cfg.strategy.regime_filter.slope_min_bps_per_day,
+                use_abs=bool(getattr(cfg.strategy.regime_filter, "use_abs", False)),
+            )
             if not ok:
                 weights_hist.append(pd.Series(0.0, index=closes.columns))
                 equity.append(equity[-1])  # flat
@@ -109,18 +134,11 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
         equity.append(equity[-1] + pnl + costs + funding)
 
     eq = pd.Series(equity, index=idx[-len(equity):])
-    total_ret = eq.iloc[-1] - 1.0
-    cagr = (eq.iloc[-1]) ** (24*365 / max(1, len(eq))) - 1.0
-    dd = (eq / eq.cummax() - 1.0).min()
+    stats = _perf_stats(eq)
 
     log.info("=== BACKTEST (cost-aware) ===")
     log.info(f"Samples: {len(eq)} bars  |  Universe size: {len(closes.columns)}")
-    log.info(f"Total Return: {total_ret:.2%}")
-    log.info(f"Max Drawdown: {dd:.2%}")
-    log.info(f"Rough Annualized: {cagr:.2%}")
+    log.info(f"Total Return: {stats['total_return']:.2%} | Annualized: {stats['annualized']:.2%} | Sharpe: {stats['sharpe']:.2f}")
+    log.info(f"Max Drawdown: {stats['max_drawdown']:.2%} | Calmar: {stats['calmar']:.2f}")
 
-    return {
-        "total_return": float(total_ret),
-        "max_drawdown": float(dd),
-        "annualized": float(cagr),
-    }
+    return stats

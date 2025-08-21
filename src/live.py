@@ -1,3 +1,4 @@
+# v1.1.0 – 2025-08-21
 import logging
 import threading
 import time
@@ -563,13 +564,14 @@ def run_live(cfg: AppConfig, dry: bool):
                 log.info(f"=== Cycle end (concat error) {utcnow().isoformat()} ===")
                 continue
 
-            # Regime filter
+            # Regime filter (UPDATED: pass use_abs)
             try:
                 if cfg.strategy.regime_filter.enabled:
                     ok = regime_ok(
                         closes.mean(axis=1),
                         cfg.strategy.regime_filter.ema_len,
                         cfg.strategy.regime_filter.slope_min_bps_per_day,
+                        use_abs=bool(getattr(cfg.strategy.regime_filter, "use_abs", False)),
                     )
                     if not ok:
                         log.info("Regime filter blocking new entries this cycle.")

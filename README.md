@@ -1,4 +1,5 @@
 # XSMOM Multi-Pair Crypto Bot (Bybit USDT-Perps)
+<!-- v1.1.0 – 2025-08-21 -->
 
 Production-ready cross-sectional momentum bot with inverse-volatility sizing, liquidity-aware caps, cost-aware backtests, and strong risk controls. Modularized for maintainability. Deploys via `systemd`.
 
@@ -15,11 +16,15 @@ cp config/config.yaml.example config/config.yaml
 nano .env        # add BYBIT API keys
 nano config/config.yaml  # tune strategy parameters
 
-# Backtest
-./venv/bin/python -m src.main backtest --config config/config.yaml
+### Auto-optimization (boot + daily)
 
-# Live (dry-run)
-./venv/bin/python -m src.main live --config config/config.yaml --dry
+A background optimizer sweeps timeframe & regime (EMA/slope), writes improvements to `config/config.yaml`, and restarts the bot.
 
-# Live (real)
-./venv/bin/python -m src.main live --config config/config.yaml
+- Service: `xsmom-opt.service`
+- Timer: `xsmom-opt.timer` (runs at boot + daily 00:20 UTC)
+
+Manage:
+```bash
+sudo systemctl status xsmom-opt.timer
+sudo systemctl start  xsmom-opt.service   # run now
+journalctl -u xsmom-opt.service -f -o cat
