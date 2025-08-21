@@ -1,4 +1,3 @@
-# v1.1.0 – 2025-08-21
 import logging
 import threading
 import time
@@ -78,10 +77,10 @@ class FastSLTPThread(threading.Thread):
     """
     Poll-based 'event-driven' SL/TP enforcement:
       - Every fast_check_seconds: read open positions, last price, compare to stop levels.
-      - Every ~60s (per symbol): refresh 1m/3m OHLCV to recompute ATR & trailing anchors.
+      - Every ~60s (per symbol): refresh 1m/3m/5m OHLCV to recompute ATR & trailing anchors.
 
     Maintains state["perpos"][sym] = {sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done}
-    Also uses state["enter_bar_time"][sym] for time-based exits.
+    Also uses state["enter_bar_time"][sym] (ISO string) for time-based exits.
     """
     def __init__(self, ex: ExchangeWrapper, cfg: AppConfig, state: dict, dry: bool, stop_event: threading.Event):
         super().__init__(daemon=True)
@@ -134,7 +133,8 @@ class FastSLTPThread(threading.Thread):
                 "trail_ll": float(low_v),
                 "partial_done": False,
             }
-            self.state.setdefault("enter_bar_time", {})[symbol] = pd.Timestamp.utcnow()
+            # Store ISO string for JSON safety
+            self.state.setdefault("enter_bar_time", {})[symbol] = pd.Timestamp.utcnow().isoformat()
         else:
             # update trails
             if sign > 0:
@@ -352,7 +352,9 @@ class FastSLTPThread(threading.Thread):
                         max_hours_in_trade = int(getattr(self.cfg.risk, "max_hours_in_trade", 0))
                         entered = self.state.get("enter_bar_time", {}).get(sym, None)
                         if max_hours_in_trade > 0 and entered is not None:
-                            hours = (pd.Timestamp.utcnow() - pd.Timestamp(entered)).total_seconds() / 3600.0
+                            # Parse stored ISO string to Timestamp
+                            entered_ts = pd.Timestamp(entered)
+                            hours = (pd.Timestamp.utcnow() - entered_ts).total_seconds() / 3600.0
                             if hours >= max_hours_in_trade:
                                 q = abs(float(qty))
                                 q, _ = self.ex.quantize(sym, q, None)
@@ -564,14 +566,13 @@ def run_live(cfg: AppConfig, dry: bool):
                 log.info(f"=== Cycle end (concat error) {utcnow().isoformat()} ===")
                 continue
 
-            # Regime filter (UPDATED: pass use_abs)
+            # Regime filter
             try:
                 if cfg.strategy.regime_filter.enabled:
                     ok = regime_ok(
                         closes.mean(axis=1),
                         cfg.strategy.regime_filter.ema_len,
                         cfg.strategy.regime_filter.slope_min_bps_per_day,
-                        use_abs=bool(getattr(cfg.strategy.regime_filter, "use_abs", False)),
                     )
                     if not ok:
                         log.info("Regime filter blocking new entries this cycle.")

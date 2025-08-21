@@ -19,11 +19,6 @@ def setup_logging(level: str, logs_dir: str, file_max_mb: int, file_backups: int
     Files created:
       logs/xsmom.log              (current file)
       logs/xsmom.log.YYYYMMDD     (previous days, rotated automatically)
-
-    Notes:
-      * We keep `file_backups` days of history.
-      * We still accept `file_max_mb` param for backward-compat, but
-        rotation is now time-based (daily) instead of size-based.
     """
     os.makedirs(logs_dir, exist_ok=True)
     root = logging.getLogger()
@@ -34,14 +29,12 @@ def setup_logging(level: str, logs_dir: str, file_max_mb: int, file_backups: int
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
 
-    # --- Console handler (stdout) ---
+    # Console
     sh = logging.StreamHandler()
     sh.setLevel(level.upper())
     sh.setFormatter(fmt)
 
-    # --- Daily rotating file handler (UTC midnight rollover) ---
-    # Base filename stays 'xsmom.log' while rotated files are suffixed with date:
-    #   xsmom.log.20250820, xsmom.log.20250821, ...
+    # Daily rotating file (UTC)
     file_path = os.path.join(logs_dir, "xsmom.log")
     fh = TimedRotatingFileHandler(
         file_path,
@@ -50,13 +43,10 @@ def setup_logging(level: str, logs_dir: str, file_max_mb: int, file_backups: int
         backupCount=file_backups,
         utc=True,
     )
-    # Add YYYYMMDD suffix to the rotated filenames
-    # Result: xsmom.log.20250820
     fh.suffix = "%Y%m%d"
     fh.setLevel(level.upper())
     fh.setFormatter(fmt)
 
-    # Replace existing handlers (avoid duplicates when re-running in same process)
     root.handlers = []
     root.addHandler(sh)
     root.addHandler(fh)
@@ -75,7 +65,8 @@ def write_json(path: str, data):
     if d:
         os.makedirs(d, exist_ok=True)
     with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+        # default=str turns non-JSON-native objects (e.g., pd.Timestamp) into strings
+        json.dump(data, f, indent=2, default=str)
 
 
 def load_env_file_if_present():
@@ -83,12 +74,8 @@ def load_env_file_if_present():
     Minimal .env loader for manual runs.
     Loads key=value pairs from <repo_root>/.env if present, but DOES NOT override
     any environment variables that are already set in the process.
-
-    This makes `python -m src.main ...` behave like run_local.sh/systemd, which
-    already export BYBIT_API_KEY/SECRET.
     """
     try:
-        # repo root is parent directory of this file's directory
         root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         env_path = os.path.join(root, ".env")
         if not os.path.isfile(env_path):
@@ -105,5 +92,4 @@ def load_env_file_if_present():
                 if k not in os.environ:
                     os.environ[k] = v
     except Exception:
-        # Never fail app boot because of .env parsing
         pass
