@@ -1,6 +1,8 @@
-import os
+# v1.2.0 – 2025-08-21
+from __future__ import annotations
 import logging
-from typing import Dict, List, Optional, Tuple, Any
+import os
+from typing import Dict, List, Optional, Tuple
 
 import ccxt
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -9,21 +11,19 @@ from .config import ExchangeCfg
 
 log = logging.getLogger("exchange")
 
-
 class ExchangeWrapper:
     def __init__(self, cfg: ExchangeCfg):
         self.cfg = cfg
-        api_key = os.getenv("BYBIT_API_KEY", "")
-        secret = os.getenv("BYBIT_API_SECRET", "")
+        api_key = os.getenv("BYBIT_API_KEY") or os.getenv("API_KEY")
+        secret = os.getenv("BYBIT_API_SECRET") or os.getenv("API_SECRET")
+
         if not api_key or not secret:
             log.warning(
-                "BYBIT_API_KEY/SECRET not found in environment. "
-                "Private endpoints (balances, orders) will fail; equity will appear as 0. "
+                "API keys missing. Private endpoints (balances, orders) will fail; equity will appear as 0. "
                 "Set them in .env or export them before running."
             )
 
         klass = getattr(ccxt, cfg.id)
-
         self.x = klass(
             {
                 "apiKey": api_key,
@@ -36,7 +36,7 @@ class ExchangeWrapper:
             }
         )
 
-        # Unified Trading Account (UTA) setup for Bybit
+        # Bybit Unified Trading Account (UTA)
         self.unified_margin = bool(getattr(cfg, "unified_margin", False))
         if self.x.id == "bybit" and self.unified_margin:
             opts = getattr(self.x, "options", {}) or {}
@@ -44,13 +44,12 @@ class ExchangeWrapper:
                 {
                     "defaultType": "swap",
                     "accountType": "UNIFIED",
-                    # ensure CCXT uses these params when it builds balance requests internally
                     "fetchBalance": {"accountType": "UNIFIED", "coin": self.cfg.quote},
                 }
             )
             self.x.options = opts
 
-        # Testnet toggle
+        # testnet toggle
         if cfg.testnet and hasattr(self.x, "set_sandbox_mode"):
             self.x.set_sandbox_mode(True)
 
@@ -82,7 +81,6 @@ class ExchangeWrapper:
                 continue
 
             if self.cfg.only_perps:
-                # USDT linear perps (swap)
                 if (m.get("swap") is True) and m.get("quote") == self.cfg.quote:
                     if m.get("type") == "swap" or m.get("contract", False):
                         if m.get("settle") in (self.cfg.quote, None) and m.get("linear", True):
@@ -95,7 +93,7 @@ class ExchangeWrapper:
             log.warning("No symbols after basic market filters.")
             return symbols
 
-        # Liquidity filter via tickers (24h quote volume)
+        # Liquidity filter via 24h quote volume
         try:
             ticks = self.x.fetch_tickers(symbols)
         except Exception as e:
@@ -122,7 +120,7 @@ class ExchangeWrapper:
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int):
         return self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
-    def fetch_tickers(self, symbols: List[str]):
+    def fetch_tickers(self, symbols: List[str]) -> Dict[str, dict]:
         try:
             return self.x.fetch_tickers(symbols)
         except Exception as e:
@@ -139,311 +137,99 @@ class ExchangeWrapper:
             return None
 
     def fetch_funding_rates(self, symbols: List[str]) -> Dict[str, float]:
-        """
-        Best-effort map: symbol -> fundingRate (as float per funding interval).
-        Not fatal if unsupported or fails; returns {}.
-        """
         out: Dict[str, float] = {}
         try:
             if hasattr(self.x, "fetch_funding_rates"):
                 data = self.x.fetch_funding_rates(symbols)
-            elif hasattr(self.x, "fetchFundingRates"):  # some ccxt drivers
-                data = getattr(self.x, "fetchFundingRates")(symbols)
+            elif hasattr(self.x, "fetch_funding_rate"):
+                data = [self.x.fetch_funding_rate(s) for s in symbols]
             else:
                 return out
-
-            # ccxt returns dict keyed by symbol or a list of dicts
-            if isinstance(data, dict):
-                # {'BTC/USDT:USDT': {'symbol':..., 'fundingRate': ...}, ...}
-                for k, v in data.items():
-                    fr = (v or {}).get("fundingRate")
-                    if fr is None:
-                        fr = (v or {}).get("info", {}).get("fundingRate")
-                    if fr is not None:
-                        try:
-                            out[k] = float(fr)
-                        except Exception:
-                            pass
-            elif isinstance(data, list):
-                for v in data:
-                    sym = (v or {}).get("symbol")
-                    fr = (v or {}).get("fundingRate")
-                    if fr is None:
-                        fr = (v or {}).get("info", {}).get("fundingRate")
-                    if sym and fr is not None:
-                        try:
-                            out[sym] = float(fr)
-                        except Exception:
-                            pass
-        except Exception as e:
-            log.debug(f"fetch_funding_rates error: {e}")
-        return out
-
-    # -------- Positions --------
-
-    def fetch_positions_map(self) -> Dict[str, dict]:
-        """
-        Map of symbol -> position dict.
-        Under UTA, pass accountType='UNIFIED' (and settle='USDT' defensively).
-        """
-        try:
-            params = {}
-            if self.x.id == "bybit" and self.unified_margin:
-                params = {"accountType": "UNIFIED", "settle": self.cfg.quote}
-            pos = self.x.fetch_positions(params=params)
-        except Exception as e:
-            log.debug(f"fetch_positions failed: {e}")
-            pos = []
-        out: Dict[str, dict] = {}
-        for p in pos:
-            sym = p.get("symbol")
-            if sym:
-                out[sym] = p
-        return out
-
-    def parse_position(self, p: dict) -> dict:
-        """
-        Normalize a raw ccxt position dict into:
-          {'symbol': str|None, 'qty': float, 'entry': float|None, 'side': str|None}
-        qty is signed (+ long, - short). Works across common ccxt field variants.
-        """
-        if not p:
-            return {"symbol": None, "qty": 0.0, "entry": None, "side": None}
-
-        sym = p.get("symbol")
-
-        # Quantity (try several common keys)
-        qty = (
-            p.get("contracts")
-            or p.get("positionAmt")
-            or p.get("size")
-            or p.get("contractsSize")
-            or p.get("amount")
-            or 0.0
-        )
-        try:
-            qty = float(qty)
-        except Exception:
-            qty = 0.0
-
-        side = p.get("side")
-        # Normalize sign: ccxt often reports positive with side; make shorts negative
-        if side in ("short", "sell") and qty > 0:
-            qty = -qty
-
-        # Entry price (try several common keys)
-        entry = (
-            p.get("entryPrice")
-            or p.get("averagePrice")
-            or p.get("avgPrice")
-            or ((p.get("info") or {}).get("avgPrice"))
-        )
-        try:
-            entry = float(entry) if entry not in (None, "", "0", "0.0") else None
-        except Exception:
-            entry = None
-
-        return {"symbol": sym, "qty": qty, "entry": entry, "side": side}
-
-    # -------- Balance (robust UTA support) --------
-
-    def _parse_unified_equity_from_info(self, info: dict) -> Optional[float]:
-        """
-        Parse Bybit v5 wallet response (privateGetV5AccountWalletBalance).
-        Typical shape:
-          {'retCode':0,'result':{'list':[{'totalAvailableBalance':'...','totalEquity':'...'}]}}
-        """
-        try:
-            res = (info or {}).get("result") or {}
-            lst = res.get("list") or []
-            if lst:
-                row = lst[0]
-                for key in ("totalAvailableBalance", "availableBalance", "totalEquity"):
-                    v = row.get(key)
-                    if v is not None:
-                        return float(v)
-        except Exception:
-            pass
-        return None
-
-    def _bybit_raw_wallet_balance(self) -> Optional[float]:
-        """
-        Fallback: call Bybit v5 wallet balance endpoint directly via ccxt's raw method
-        when fetch_balance() does not surface UTA equity.
-        """
-        if self.x.id != "bybit":
-            return None
-        method_name = "privateGetV5AccountWalletBalance"
-        if not hasattr(self.x, method_name):
-            return None
-        try:
-            method = getattr(self.x, method_name)
-            params = {"accountType": "UNIFIED", "coin": self.cfg.quote}
-            data = method(params)
-            val = self._parse_unified_equity_from_info(data)
-            if val is not None:
-                return float(val)
-        except Exception as e:
-            log.debug(f"raw bybit wallet balance call failed: {e}")
-        return None
-
-    def fetch_balance_usdt(self) -> float:
-        """
-        Fetch equity in USDT terms.
-        For Bybit UTA, send params and include a direct v5 fallback if needed.
-        """
-        try:
-            params = {}
-            if self.x.id == "bybit" and self.unified_margin:
-                params = {"accountType": "UNIFIED", "coin": self.cfg.quote}
-
-            bal = self.x.fetch_balance(params)
-
-            # 1) Try explicit quote bucket (classic accounts or when CCXT fills it)
-            try:
-                usdt_bucket = bal.get(self.cfg.quote, {}) or {}
-                usdt_direct = usdt_bucket.get("total") or usdt_bucket.get("free")
-                if usdt_direct is not None:
-                    v = float(usdt_direct)
-                    if v > 0:
-                        return v
-            except Exception:
-                pass
-
-            # 2) Unified-friendly totals exposed via CCXT mapping
-            if self.x.id == "bybit" and self.unified_margin:
+            for d in data or []:
                 try:
-                    total = bal.get("total") or {}
-                    if self.cfg.quote in total and total[self.cfg.quote] is not None:
-                        v = float(total[self.cfg.quote])
-                        if v >= 0:
-                            return v
-                    if "USD" in total and total["USD"] is not None:
-                        v = float(total["USD"])
-                        if v >= 0:
-                            return v
+                    sym = d.get("symbol")
+                    rate = float(d.get("fundingRate") or 0.0)
+                    if sym:
+                        out[sym] = rate
                 except Exception:
                     pass
-
-                # 3) Parse raw info blob
-                uni = self._parse_unified_equity_from_info(bal.get("info") or {})
-                if uni is not None:
-                    return float(uni)
-
-                # 4) FINAL FALLBACK: call raw v5 wallet endpoint directly
-                raw = self._bybit_raw_wallet_balance()
-                if raw is not None:
-                    return float(raw)
-
-            # Non-unified or no data
-            try:
-                total = bal.get("total") or {}
-                if self.cfg.quote in total and total[self.cfg.quote] is not None:
-                    return float(total[self.cfg.quote])
-                if "USD" in total and total["USD"] is not None:
-                    return float(total["USD"])
-            except Exception:
-                pass
-
-            return 0.0
         except Exception as e:
-            log.warning(
-                "fetch_balance_usdt failed (returning 0.0). "
-                "This usually means missing BYBIT_API_KEY/SECRET or a Bybit permission problem: %s", e
-            )
+            log.debug(f"fetch_funding_rates failed: {e}")
+        return out
+
+    # -------- Account / Positions --------
+
+    def get_equity_usdt(self) -> float:
+        """Returns total account equity denominated in USDT (best-effort)."""
+        try:
+            bal = self.x.fetch_balance(params={"accountType": "UNIFIED"} if self.unified_margin else {})
+            total = bal.get("total", {})
+            usdt_equity = float(total.get("USDT", 0.0))
+            if usdt_equity == 0.0:
+                # fallback for some ccxt versions
+                usdt_equity = float(bal.get("info", {}).get("result", {}).get("list", [{}])[0].get("totalEquity", 0.0))
+            return max(0.0, usdt_equity)
+        except Exception as e:
+            log.warning(f"fetch_balance failed: {e}")
             return 0.0
 
-    # -------- Precision / Limits / Orders / Leverage --------
-
-    def get_precision(self, symbol: str) -> Tuple[float, float]:
-        m = self.x.market(symbol)
-        amt = m.get("precision", {}).get("amount", None)
-        price = m.get("precision", {}).get("price", None)
-        return amt or 0.0001, price or 0.0001
-
-    def get_trade_limits(self, symbol: str) -> Tuple[float, float, float]:
-        """
-        Returns (min_amount, min_cost, min_price) from the exchange market metadata.
-        Missing fields are returned as 0.0.
-        """
+    def fetch_positions(self) -> Dict[str, dict]:
+        """Return a map symbol -> position dict with 'contracts' and 'entryPrice' best-effort."""
+        out: Dict[str, dict] = {}
         try:
-            m = self.x.market(symbol)
-            limits = m.get("limits", {}) or {}
-            min_amt = (limits.get("amount", {}) or {}).get("min") or 0.0
-            min_cost = (limits.get("cost", {}) or {}).get("min") or 0.0
-            min_price = (limits.get("price", {}) or {}).get("min") or 0.0
-            return float(min_amt or 0.0), float(min_cost or 0.0), float(min_price or 0.0)
+            raw = self.x.fetch_positions() or []
+            for p in raw:
+                s = p.get("symbol")
+                if not s:
+                    continue
+                out[s] = p
+            return out
         except Exception as e:
-            log.debug(f"get_trade_limits error for {symbol}: {e}")
-            return 0.0, 0.0, 0.0
+            log.debug(f"fetch_positions error: {e}")
+            return out
 
-    def quantize(self, symbol: str, amount: float, price: Optional[float]):
-        """
-        Quantize amount/price to exchange precision AND drop orders that violate min
-        amount or min notional (cost) constraints. If the order is too small, return 0.
-        """
+    # -------- Trading --------
+
+    def set_leverage(self, symbol: str, lev: int):
         try:
-            q_amount = float(self.x.amount_to_precision(symbol, amount))
-            q_price = None if price is None else float(self.x.price_to_precision(symbol, price))
-
-            # Enforce minimums
-            min_amt, min_cost, _ = self.get_trade_limits(symbol)
-            if abs(q_amount) < (min_amt or 0.0):
-                return 0.0, q_price
-
-            # If we have a usable price, check min notional/cost
-            px_for_cost = q_price if (q_price is not None) else price
-            if (min_cost or 0.0) > 0.0 and px_for_cost:
-                notional = abs(q_amount) * float(px_for_cost)
-                if notional < min_cost:
-                    return 0.0, q_price
-
-            return q_amount, q_price
+            if hasattr(self.x, "set_leverage"):
+                self.x.set_leverage(lev, symbol, params={"buyLeverage": lev, "sellLeverage": lev})
         except Exception as e:
-            log.debug(f"quantize error for {symbol}: {e}")
-            return 0.0, None
+            log.debug(f"set_leverage({symbol},{lev}) failed: {e}")
+
+    def _limit_price_from_side(self, side: str, mid: float, bps: int) -> float:
+        off = (bps / 10_000.0) * mid
+        return (mid - off) if side.lower() == "buy" else (mid + off)
 
     def create_order_safe(
         self,
         symbol: str,
         side: str,
-        amount: float,
+        size: float,
         price: Optional[float],
-        post_only: bool,
-        reduce_only: bool,
+        *,
+        post_only: bool = False,
+        reduce_only: bool = False,
     ):
-        """
-        Create orders with sensible defaults per order type.
+        """Wraps CCXT order APIs sanely across modes."""
+        side = side.lower()
+        if abs(size) <= 0:
+            return None
 
-        IMPORTANT: use keyword args for `params` so we don't accidentally pass the
-        dict as the positional `price` argument (ccxt signature is
-        create_market_order(symbol, side, amount, price=None, params={})).
-        Passing the dict positionally will trigger Decimal.ConversionSyntax in ccxt.
-        """
-        params = {}
-        # Bybit linear perps hint (no harm on other ids that ignore it)
-        if self.x.id == "bybit" and self.cfg.account_type == "swap":
-            params["category"] = "linear"
-
-        if reduce_only:
-            params["reduceOnly"] = True
-
-        if price is None:
-            # MARKET ORDER: never set PostOnly here
-            return self.x.create_market_order(symbol, side, abs(amount), params=params)
+        params = {"reduceOnly": reduce_only}
+        if self.cfg.account_type == "swap":
+            # ensure futures/swap createOrder
+            if price is None:
+                # market
+                return self.x.create_order(symbol, "market", side, abs(size), None, params)
+            else:
+                # limit
+                params["postOnly"] = post_only
+                return self.x.create_order(symbol, "limit", side, abs(size), float(price), params)
         else:
-            # LIMIT ORDER: allow PostOnly if requested
-            if post_only:
-                params["timeInForce"] = "PostOnly"
-            return self.x.create_limit_order(symbol, side, abs(amount), price, params=params)
-
-    def try_set_leverage(self, symbol: str, leverage: int):
-        try:
-            if hasattr(self.x, "setLeverage"):
-                self.x.setLeverage(leverage, symbol, params={"buyLeverage": leverage, "sellLeverage": leverage})
-                log.info(f"Set leverage {leverage}x for {symbol}")
-            elif hasattr(self.x, "set_leverage"):
-                self.x.set_leverage(leverage, symbol, params={"buyLeverage": leverage, "sellLeverage": leverage})
-                log.info(f"Set leverage {leverage}x for {symbol}")
-        except Exception as e:
-            log.debug(f"setLeverage not supported or failed for {symbol}: {e}")
+            # spot fallback
+            if price is None:
+                return self.x.create_market_order(symbol, side, abs(size), params=params)
+            else:
+                params["postOnly"] = post_only
+                return self.x.create_limit_order(symbol, side, abs(size), float(price), params)

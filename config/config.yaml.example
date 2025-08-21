@@ -6,8 +6,8 @@ exchange:
   unified_margin: true
   testnet: false
 
-  max_symbols: 36                # allow a few more candidates so K can fill
-  min_usd_volume_24h: 30000000   # $30m+ vol is still safe
+  max_symbols: 36
+  min_usd_volume_24h: 30000000
   min_price: 0.03
   timeframe: "1h"
   candles_limit: 1500
@@ -17,7 +17,6 @@ strategy:
   lookback_weights: [1.0, 1.0, 1.0]
   vol_lookback: 72
 
-  # give the selector some room to pick both sides
   k_min: 4
   k_max: 10
 
@@ -25,24 +24,21 @@ strategy:
   gross_leverage: 1.25
   max_weight_per_asset: 0.16
 
-  # UNBLOCK: let entries through even if EMA is flatish
   regime_filter:
     enabled: true
     ema_len: 200
-    slope_min_bps_per_day: 0      # was 3
+    slope_min_bps_per_day: 0     # UNBLOCK
 
   funding_tilt:
     enabled: true
     weight: 0.15
 
-  # UNBLOCK: make quality threshold gentle
-  entry_zscore_min: 0.2           # was 0.5
+  entry_zscore_min: 0.2
 
-  # Keep diversification, but ease the cap slightly
   diversify:
     enabled: true
     corr_lookback: 96
-    max_pair_corr: 0.75           # was 0.6 (too restrictive with small K)
+    max_pair_corr: 0.75
 
   vol_target:
     enabled: true
@@ -55,24 +51,19 @@ liquidity:
   notional_cap_usdt: 80
 
 execution:
-  # TEMP UNBLOCK: use market for one cycle to confirm entries flow,
-  # then you can revert to limit/post_only once confirmed.
-  order_type: market              # was limit
+  order_type: market          # First run as market to confirm entries happen
   post_only: false
   price_offset_bps: 0
   slippage_bps_guard: 25
-
   set_leverage: 3
 
-  # Avoid long deferrals; let us trade right away after funding
   rebalance_minute: 0
   poll_seconds: 15
-  align_after_funding_minutes: 0  # was 5 (can delay entries)
+  align_after_funding_minutes: 0
   funding_hours_utc: [0, 8, 16]
 
-  # UNBLOCK: allow smaller deltas for your equity size
-  min_notional_per_order_usdt: 10  # was 20
-  min_rebalance_delta_bps: 40      # was 100 (1%); now 0.40%
+  min_notional_per_order_usdt: 10
+  min_rebalance_delta_bps: 40
 
 risk:
   atr_len: 28
@@ -95,6 +86,8 @@ risk:
   max_daily_loss_pct: 3.5
   trade_disable_minutes: 180
   min_close_pnl_pct: 2.0
+
+  max_hours_in_trade: 48
 
 costs:
   taker_fee_bps: 6.0

@@ -1,75 +1,22 @@
+# v1.2.0 – 2025-08-21
+from __future__ import annotations
 import logging
 import threading
 import time
 from time import perf_counter
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
 from .config import AppConfig
 from .exchange import ExchangeWrapper
-from .signals import regime_ok, compute_atr, dynamic_k
+from .signals import compute_atr, regime_ok, dynamic_k
 from .sizing import build_targets, apply_liquidity_caps
+from .risk import per_symbol_stops, kill_switch_should_trigger, resume_time_after_kill
 from .utils import utcnow, read_json, write_json
 
 log = logging.getLogger("live")
-
-
-def wait_until_minute(minute, poll_seconds: int):
-    while True:
-        now = utcnow()
-        log.debug(f"Heartbeat: waiting for rebalance minute={minute}, now={now.isoformat()}")
-        if isinstance(minute, str) and minute == "*":
-            if now.second < poll_seconds:
-                return
-        else:
-            if now.minute == int(minute) and now.second < poll_seconds:
-                return
-        time.sleep(poll_seconds)
-
-
-def compute_qtys(targets, prices: Dict[str, float], equity_usdt: float):
-    out = {}
-    items = targets.items() if isinstance(targets, dict) else targets.to_dict().items()
-    for s, w in items:
-        try:
-            px = prices.get(s, None)
-            if px is None or float(px) <= 0:
-                continue
-            out[s] = (float(w) * float(equity_usdt)) / float(px)
-        except Exception as e:
-            log.debug(f"Qty calc skipped for {s}: {e}")
-            continue
-    return out
-
-
-def next_rebalance_at(minute):
-    now = utcnow().replace(second=0, microsecond=0)
-    if isinstance(minute, str) and minute == "*":
-        return now + timedelta(minutes=1)
-    try:
-        m = int(minute)
-    except Exception:
-        m = 0
-    candidate = now.replace(minute=m)
-    if candidate <= now:
-        candidate += timedelta(hours=1)
-    return candidate
-
-
-def refresh_universe(ex: ExchangeWrapper, state: dict, state_path: str):
-    try:
-        syms = ex.fetch_markets_filtered()
-        state["universe"] = syms
-        state["last_universe_refresh"] = utcnow().date().isoformat()
-        write_json(state_path, state)
-        preview = ", ".join(syms)
-        log.info(f"Universe refreshed: {len(syms)} symbols: {preview}")
-    except Exception as e:
-        log.error(f"Universe refresh failed: {e}")
-
 
 # -------------------- FAST EVENT-DRIVEN SL/TP THREAD --------------------
 
@@ -77,7 +24,7 @@ class FastSLTPThread(threading.Thread):
     """
     Poll-based 'event-driven' SL/TP enforcement:
       - Every fast_check_seconds: read open positions, last price, compare to stop levels.
-      - Every ~60s (per symbol): refresh 1m/3m/5m OHLCV to recompute ATR & trailing anchors.
+      - Every ~60s (per symbol): refresh lower-tf OHLCV to recompute ATR & trailing anchors.
 
     Maintains state["perpos"][sym] = {sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done}
     Also uses state["enter_bar_time"][sym] (ISO string) for time-based exits.
@@ -133,643 +80,337 @@ class FastSLTPThread(threading.Thread):
                 "trail_ll": float(low_v),
                 "partial_done": False,
             }
-            # Store ISO string for JSON safety
             self.state.setdefault("enter_bar_time", {})[symbol] = pd.Timestamp.utcnow().isoformat()
         else:
             # update trails
             if sign > 0:
-                pinfo["trail_hh"] = float(max(self._to_float(pinfo.get("trail_hh"), high_v), float(high_v)))
+                pinfo["trail_hh"] = float(max(self._to_float(pinfo.get("trail_hh"), high_v), high_v))
             else:
-                pinfo["trail_ll"] = float(min(self._to_float(pinfo.get("trail_ll"), low_v), float(low_v)))
-            perpos[symbol] = pinfo
+                pinfo["trail_ll"] = float(min(self._to_float(pinfo.get("trail_ll"), low_v), low_v))
 
-    def _compute_stop_px(self, symbol: str, lr: pd.Series) -> Optional[float]:
-        cfg = self.cfg
-        pinfo = self.state.get("perpos", {}).get(symbol)
-        if not isinstance(pinfo, dict):
-            return None
-
-        sign = int(pinfo.get("sign", 0) or 0)
-        entry_price = self._to_float(pinfo.get("entry_price"), default=None)
-        entry_atr   = self._to_float(pinfo.get("entry_atr"), default=None)
-        if entry_price is None or entry_atr is None or entry_atr <= 0:
-            return None
-
-        atr_mult_sl = float(cfg.risk.atr_mult_sl)
-        trail_enabled = bool(cfg.risk.trailing_enabled)
-        trail_k = float(cfg.risk.trail_atr_mult)
-
-        # initial stop from entry
-        init_sl = float(entry_price - atr_mult_sl * entry_atr) if sign > 0 else float(entry_price + atr_mult_sl * entry_atr)
-
-        # ATR from last refresh
-        cur_atr = self._to_float(lr.get("_atr"), default=None)
-        if cur_atr is None or cur_atr <= 0:
-            return float(init_sl)
-
-        # trail anchors
-        hh = self._to_float(pinfo.get("trail_hh"), default=self._to_float(lr.get("high"), default=None))
-        ll = self._to_float(pinfo.get("trail_ll"), default=self._to_float(lr.get("low"), default=None))
-
-        if trail_enabled:
-            if sign > 0:
-                trail_sl = float(hh - trail_k * cur_atr)
-                stop_price = max(init_sl, trail_sl)
-            else:
-                trail_sl = float(ll + trail_k * cur_atr)
-                stop_price = min(init_sl, trail_sl)
-        else:
-            stop_price = init_sl
-
-        # Breakeven bump after +R
-        R = float(entry_atr * atr_mult_sl)
-        be_after = float(cfg.risk.breakeven_after_r)
-        if be_after > 0.0:
-            high_v = self._to_float(lr.get("high"), default=None)
-            low_v  = self._to_float(lr.get("low"), default=None)
-            if sign > 0:
-                be_trigger = float(entry_price + be_after * R)
-                if high_v is not None and high_v >= be_trigger:
-                    stop_price = max(stop_price, float(entry_price))
-            else:
-                be_trigger = float(entry_price - be_after * R)
-                if low_v is not None and low_v <= be_trigger:
-                    stop_price = min(stop_price, float(entry_price))
-
-        return float(stop_price)
-
-    def _maybe_partial_tp(self, symbol: str, cur_qty: float, lr: pd.Series):
-        cfg = self.cfg
-        if not bool(cfg.risk.partial_tp_enabled):
+    def _maybe_partial_tp(self, symbol: str, qty: float, rr_now: float) -> None:
+        if not self.cfg.risk.partial_tp_enabled:
             return
         perpos = self.state.get("perpos", {})
-        pinfo = perpos.get(symbol)
-        if not isinstance(pinfo, dict) or pinfo.get("partial_done", False):
+        pinfo = perpos.get(symbol) or {}
+        if pinfo.get("partial_done"):
             return
-
-        sign = int(pinfo.get("sign", 0) or 0)
-        entry_price = self._to_float(pinfo.get("entry_price"), default=None)
-        entry_atr   = self._to_float(pinfo.get("entry_atr"), default=None)
-        last_px     = self._to_float(lr.get("last"), default=self._to_float(lr.get("close"), default=None))
-        if entry_price is None or entry_atr is None or last_px is None:
-            return
-
-        R = float(entry_atr * float(cfg.risk.atr_mult_sl))
-        ptp_r = float(cfg.risk.partial_tp_r)
-        ptp_px = float(entry_price + (ptp_r * R if sign > 0 else -ptp_r * R))
-        hit = (last_px >= ptp_px) if sign > 0 else (last_px <= ptp_px)
-        if bool(hit):
-            size_frac = float(cfg.risk.partial_tp_size)
-            q = abs(float(cur_qty)) * size_frac
-            q, _ = self.ex.quantize(symbol, q, None)
-            if q > 0:
+        if rr_now >= float(getattr(self.cfg.risk, "partial_tp_r", 2.0)):
+            take = float(getattr(self.cfg.risk, "partial_tp_size", 0.5))
+            side = "sell" if qty > 0 else "buy"
+            q = abs(qty) * take
+            try:
                 if self.dry:
-                    log.info(f"[DRY-PARTIAL] {symbol}: {'sell' if sign>0 else 'buy'} {q} @ mkt")
+                    log.info(f"[DRY] Partial TP {symbol} {side} {q}")
                 else:
-                    self.ex.create_order_safe(symbol, "sell" if sign > 0 else "buy", q, None, post_only=False, reduce_only=True)
-                    log.info(f"[LIVE-PARTIAL] {symbol}: {'sell' if sign>0 else 'buy'} {q} @ mkt")
-            pinfo["partial_done"] = True
-            perpos[symbol] = pinfo
-            self.state["perpos"] = perpos
+                    self.ex.create_order_safe(symbol, side, q, None, post_only=False, reduce_only=True)
+                pinfo["partial_done"] = True
+            except Exception as e:
+                log.warning(f"Partial TP error {symbol}: {e}")
 
     def run(self):
-        cfg = self.cfg
-        fast_s = int(getattr(cfg.risk, "fast_check_seconds", 0))
-        if fast_s <= 0:
-            log.info("Fast SL/TP loop disabled (fast_check_seconds <= 0).")
+        if self.cfg.risk.fast_check_seconds <= 0:
             return
 
-        log.info(f"Fast SL/TP loop starting: check every {fast_s}s on timeframe={cfg.risk.stop_timeframe}")
-        stop_tf = getattr(cfg.risk, "stop_timeframe", cfg.exchange.timeframe) or cfg.exchange.timeframe
-        atr_len = int(cfg.risk.atr_len)
+        # per-symbol small cache for ATR TF bars (5m default)
+        tf = getattr(self.cfg.risk, "stop_timeframe", "5m")
 
         while not self.stop_event.is_set():
             try:
-                # 1) fetch positions
-                pos_map = self.ex.fetch_positions_map() or {}
-                if not pos_map:
-                    # Clear all perpos & timers if nothing is open
-                    if self.state.get("perpos"):
-                        self.state["perpos"] = {}
-                    if self.state.get("enter_bar_time"):
-                        self.state["enter_bar_time"] = {}
-                    time.sleep(fast_s)
+                time.sleep(max(1, int(self.cfg.risk.fast_check_seconds)))
+
+                pos = self.ex.fetch_positions()
+                if not pos:
                     continue
 
-                # 2) iterate open positions
-                for sym, p in list(pos_map.items()):
-                    # derive signed qty (long +, short -)
-                    try:
-                        qty_raw = p.get("contracts") or p.get("positionAmt") or p.get("contractsSize") or 0.0
-                        qty = self._to_float(qty_raw, default=0.0)
-                        side = p.get("side")
-                        if side == "short" and qty > 0:
-                            qty = -qty
-                    except Exception:
-                        qty = 0.0
-                    if float(qty) == 0.0:
-                        # clear state if any
-                        if self.state.get("perpos", {}).get(sym):
-                            self.state["perpos"].pop(sym, None)
-                        if self.state.get("enter_bar_time", {}).get(sym):
-                            self.state["enter_bar_time"].pop(sym, None)
+                for sym, pdct in pos.items():
+                    qty = float(pdct.get("contracts") or pdct.get("contractSize") or pdct.get("positionAmt") or 0.0)
+                    if qty == 0.0:
+                        continue
+                    side = "long" if qty > 0 else "short"
+
+                    # Periodically refresh lower-tf bars for better ATR
+                    nowts = self._now_ts()
+                    if nowts - float(self._last_ohlcv_ts.get(sym, 0.0)) > 55.0:
+                        try:
+                            bars = self.ex.fetch_ohlcv(sym, tf, limit=max(50, self.cfg.risk.atr_len + 5))
+                            df = pd.DataFrame(bars, columns=["ts","open","high","low","close","volume"])
+                            df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+                            df.set_index("dt", inplace=True)
+                            self._last_bar_cache[sym] = df.iloc[-1]
+                            atr = compute_atr(df, n=self.cfg.risk.atr_len, method="rma").iloc[-1]
+                            self._last_ohlcv_ts[sym] = nowts
+                        except Exception as e:
+                            log.debug(f"fast fetch_ohlcv {sym} failed: {e}")
+                            continue
+                    lr = self._last_bar_cache.get(sym)
+                    if lr is None:
                         continue
 
-                    # 3) refresh OHLCV/ATR for this symbol at most once per ~60s
-                    last_ts = float(self._last_ohlcv_ts.get(sym, 0.0) or 0.0)
-                    need_ohlcv = (self._now_ts() - last_ts) > 55.0
-                    if need_ohlcv:
-                        raw = self.ex.fetch_ohlcv(sym, timeframe=stop_tf, limit=max(60, atr_len * 5))
-                        if not raw:
-                            continue
-                        df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
-                        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-                        df.set_index("dt", inplace=True)
-                        if len(df) < max(20, atr_len + 5):
-                            continue
-                        atr_series = compute_atr(df, n=atr_len, method="rma")
-                        last_bar = df.iloc[-1].copy()
-                        last_bar["_atr"] = float(self._to_float(atr_series.iloc[-1], default=np.nan))
-                        self._last_ohlcv_ts[sym] = self._now_ts()
-                        self._last_bar_cache[sym] = last_bar
-                    else:
-                        last_bar = self._last_bar_cache.get(sym)
-                        if last_bar is None:
-                            # force refresh if cache empty
-                            self._last_ohlcv_ts[sym] = 0.0
-                            continue
+                    # initialize/update trails + read entry price
+                    entry_price = float(pdct.get("entryPrice") or 0.0) or float(lr["close"])
+                    atr_val = compute_atr(
+                        pd.DataFrame([lr]).rename_axis("dt"),
+                        n=self.cfg.risk.atr_len,
+                        method="rma",
+                    ).iloc[-1]
+                    self._init_or_update_perpos(sym, qty, lr, atr_val, entry_price)
 
-                    # 4) embed latest last price (fetch_ticker)
-                    try:
-                        t = self.ex.x.fetch_ticker(sym)
-                        last_px = self._to_float(t.get("last") or t.get("close"), default=None)
-                    except Exception:
-                        last_px = None
-                    if last_px is None:
-                        last_px = self._to_float(last_bar.get("close"), default=None)
-                    if last_px is None:
-                        # cannot evaluate stops w/o a price
-                        continue
+                    # trailing and BE logic
+                    pinfo = self.state["perpos"].get(sym, {})
+                    ep = float(pinfo.get("entry_price") or entry_price)
+                    atr = float(pinfo.get("entry_atr") or atr_val)
+                    last = float(lr["close"])
+                    R = abs(last - ep) / (atr if atr > 1e-12 else 1.0)
 
-                    lr = last_bar.copy()
-                    lr["last"] = float(last_px)
+                    # Breakeven shift
+                    if self.cfg.risk.breakeven_after_r > 0 and R >= self.cfg.risk.breakeven_after_r:
+                        if side == "long" and last > ep:
+                            ep = max(ep, ep)  # keep ep; soft BE handled by stop buffer
+                        elif side == "short" and last < ep:
+                            ep = min(ep, ep)
 
-                    # entry price
-                    try:
-                        entry_px = p.get("entryPrice") or p.get("averagePrice") or p.get("avgPrice")
-                        entry_px = self._to_float(entry_px, default=None)
-                    except Exception:
-                        entry_px = None
+                    # Partial TP
+                    self._maybe_partial_tp(sym, qty, R)
 
-                    # 5) ensure perpos exists/updated
-                    self._init_or_update_perpos(sym, float(qty), lr, float(lr.get("_atr", np.nan)), entry_px)
-
-                    # 6) compute stop price, then check live price cross
-                    stop_px = self._compute_stop_px(sym, lr)
-                    if stop_px is not None:
-                        long_pos = float(qty) > 0.0
-                        hit = (float(last_px) <= float(stop_px)) if long_pos else (float(last_px) >= float(stop_px))
-                        if bool(hit):
-                            q = abs(float(qty))
-                            q, _ = self.ex.quantize(sym, q, None)
-                            if q > 0:
-                                if self.dry:
-                                    log.info(f"[DRY-FAST-STOP] {sym}: {'sell' if long_pos else 'buy'} {q} @ mkt (SL {stop_px:.6g})")
-                                else:
-                                    self.ex.create_order_safe(sym, "sell" if long_pos else "buy", q, None, post_only=False, reduce_only=True)
-                                    log.info(f"[LIVE-FAST-STOP] {sym}: {'sell' if long_pos else 'buy'} {q} @ mkt (SL {stop_px:.6g})")
-                            # clear perpos after exit
-                            self.state.get("perpos", {}).pop(sym, None)
-                            self.state.get("enter_bar_time", {}).pop(sym, None)
-                            # move on to next position
-                            continue
-
-                    # 7) partial take profit check
-                    self._maybe_partial_tp(sym, float(qty), lr)
-
-                    # 8) time-based exit
-                    try:
-                        max_hours_in_trade = int(getattr(self.cfg.risk, "max_hours_in_trade", 0))
-                        entered = self.state.get("enter_bar_time", {}).get(sym, None)
-                        if max_hours_in_trade > 0 and entered is not None:
-                            # Parse stored ISO string to Timestamp
-                            entered_ts = pd.Timestamp(entered)
-                            hours = (pd.Timestamp.utcnow() - entered_ts).total_seconds() / 3600.0
-                            if hours >= max_hours_in_trade:
-                                q = abs(float(qty))
-                                q, _ = self.ex.quantize(sym, q, None)
-                                if q > 0:
+                    # Time-based exit
+                    max_hours = int(getattr(self.cfg.risk, "max_hours_in_trade", 0) or 0)
+                    if max_hours > 0:
+                        enter_iso = self.state.get("enter_bar_time", {}).get(sym)
+                        if enter_iso:
+                            age_h = (pd.Timestamp.utcnow() - pd.Timestamp(enter_iso)).total_seconds() / 3600.0
+                            if age_h >= max_hours:
+                                side_close = "sell" if qty > 0 else "buy"
+                                try:
                                     if self.dry:
-                                        log.info(f"[DRY-TIME-EXIT] {sym}: close {q} @ mkt after {hours:.1f}h")
+                                        log.info(f"[DRY] Time exit {sym} {side_close} {abs(qty)}")
                                     else:
-                                        self.ex.create_order_safe(sym, "sell" if qty > 0 else "buy", q, None, post_only=False, reduce_only=True)
-                                        log.info(f"[LIVE-TIME-EXIT] {sym}: close {q} @ mkt after {hours:.1f}h")
-                                self.state.get("perpos", {}).pop(sym, None)
-                                self.state.get("enter_bar_time", {}).pop(sym, None)
-                                continue
-                    except Exception:
-                        pass
+                                        self.ex.create_order_safe(sym, side_close, abs(qty), None, post_only=False, reduce_only=True)
+                                    # reset perpos so it re-inits if re-entered
+                                    self.state["perpos"].pop(sym, None)
+                                    self.state["enter_bar_time"].pop(sym, None)
+                                    continue
+                                except Exception as e:
+                                    log.warning(f"Time exit error {sym}: {e}")
 
-                time.sleep(fast_s)
-            except Exception:
-                log.exception("Fast SL/TP loop error")
-                time.sleep(max(1, fast_s))
+                    # ATR-based trailing stop (close-only if configured)
+                    trail_mult = float(getattr(self.cfg.risk, "trail_atr_mult", 0.0) or 0.0)
+                    if self.cfg.risk.trailing_enabled and trail_mult > 0 and atr > 0:
+                        if side == "long":
+                            trail = float(max(pinfo.get("trail_hh", last), last)) - trail_mult * atr
+                            trigger = (last <= trail) if not self.cfg.risk.stop_on_close_only else (lr["close"] <= trail)
+                        else:
+                            trail = float(min(pinfo.get("trail_ll", last), last)) + trail_mult * atr
+                            trigger = (last >= trail) if not self.cfg.risk.stop_on_close_only else (lr["close"] >= trail)
 
+                        if trigger:
+                            side_close = "sell" if qty > 0 else "buy"
+                            try:
+                                if self.dry:
+                                    log.info(f"[DRY] Trail stop {sym} {side_close} {abs(qty)} @ ~{last}")
+                                else:
+                                    self.ex.create_order_safe(sym, side_close, abs(qty), None, post_only=False, reduce_only=True)
+                                self.state["perpos"].pop(sym, None)
+                                self.state["enter_bar_time"].pop(sym, None)
+                            except Exception as e:
+                                log.warning(f"Trail stop error {sym}: {e}")
 
-# -------------------- MAIN LIVE LOOP --------------------
-
-def run_live(cfg: AppConfig, dry: bool):
-    ex = ExchangeWrapper(cfg.exchange)
-    state_path = cfg.paths.state_path
-    state = read_json(
-        state_path,
-        default={
-            "last_targets": {},
-            "day_start_equity": None,
-            "trading_paused_until": None,
-            "universe": [],
-            "last_universe_refresh": None,
-            "perpos": {},
-            "cooldowns": {},
-            "enter_bar_time": {},
-        },
-    )
-    # Ensure buckets exist even if state file was older
-    state.setdefault("perpos", {})
-    state.setdefault("cooldowns", {})
-    state.setdefault("enter_bar_time", {})
-
-    # start fast SL/TP thread if enabled
-    stop_evt = threading.Event()
-    fast_thread: Optional[FastSLTPThread] = None
-    try:
-        if int(getattr(cfg.risk, "fast_check_seconds", 0)) > 0:
-            fast_thread = FastSLTPThread(ex, cfg, state, dry, stop_evt)
-            fast_thread.start()
-
-        # Bootstrap universe at startup
-        refresh_universe(ex, state, state_path)
-        log.info(f"Initial universe: {len(state.get('universe', []))} symbols")
-
-        first_cycle = True
-        # Keep original gross leverage for auto-delever reference
-        orig_gl = float(cfg.strategy.gross_leverage)
-
-        while True:
-            if first_cycle:
-                log.info("First cycle running immediately; subsequent cycles align to rebalance_minute.")
-                first_cycle = False
-                now = utcnow()
-            else:
-                target = next_rebalance_at(cfg.execution.rebalance_minute)
-                log.info(f"Waiting until {target.isoformat()} to rebalance...")
-                wait_until_minute(cfg.execution.rebalance_minute, cfg.execution.poll_seconds)
-                now = utcnow()
-
-            # Optional funding-window deferral
-            try:
-                align_min = int(getattr(cfg.execution, "align_after_funding_minutes", 0))
-                funding_hours = set(getattr(cfg.execution, "funding_hours_utc", [0, 8, 16]) or [])
-                if align_min > 0 and now.hour in funding_hours and now.minute < align_min:
-                    log.info(f"Funding window deferral: waiting until minute {align_min:02d} this hour...")
-                    wait_until_minute(align_min, cfg.execution.poll_seconds)
-                    now = utcnow()
             except Exception as e:
-                log.debug(f"Funding alignment skipped: {e}")
+                log.debug(f"Fast thread loop error: {e}")
 
-            cycle_started_at = now
+# -------------------- REBALANCE / MAIN LOOP --------------------
+
+def _minute_aligned(minute: int) -> bool:
+    if minute <= 0:
+        return True
+    now = utcnow()
+    return (now.minute % minute) == 0
+
+def run_live(cfg: AppConfig, dry: bool = False):
+    """
+    Main loop:
+      1) Build universe (liquidity filters)
+      2) Fetch bars, compute targets
+      3) Convert weights -> desired qty, apply min notional & delta bps guards
+      4) Place orders, spawn Fast SL/TP watcher
+    """
+    log.info(f"Fast SL/TP loop starting: check every {cfg.risk.fast_check_seconds}s on timeframe={cfg.risk.stop_timeframe}")
+
+    state_path = cfg.paths.state_path
+    state = read_json(state_path, default={}) or {}
+    perpos = state.setdefault("perpos", {})
+    cooldowns = state.setdefault("cooldowns", {})
+    day_start_equity = float(state.get("day_start_equity", 0.0))
+    disable_until_ts = float(state.get("disable_until_ts", 0.0))
+
+    ex = ExchangeWrapper(cfg.exchange)
+    fast_thread: Optional[FastSLTPThread] = None
+    stop_evt: Optional[threading.Event] = None
+
+    try:
+        syms = ex.fetch_markets_filtered()
+        if not syms:
+            log.error("Empty universe; exiting.")
+            return
+
+        # set leverage once at start
+        for s in syms:
+            ex.set_leverage(s, int(cfg.execution.set_leverage))
+
+        # start fast SL/TP thread
+        stop_evt = threading.Event()
+        fast_thread = FastSLTPThread(ex, cfg, state, dry, stop_evt)
+        fast_thread.start()
+
+        # Day-equity anchor
+        eq_now = ex.get_equity_usdt()
+        if day_start_equity <= 0 and eq_now > 0:
+            day_start_equity = eq_now
+            state["day_start_equity"] = day_start_equity
+            write_json(state_path, state)
+
+        # main loop
+        while True:
+            if disable_until_ts and time.time() < disable_until_ts:
+                time.sleep(2)
+                continue
+
+            if not _minute_aligned(cfg.execution.rebalance_minute):
+                time.sleep(1.0)
+                continue
+
+            cycle_started_at = utcnow()
             log.info(f"=== Cycle start {cycle_started_at.isoformat()} ===")
 
-            # Daily universe refresh
-            try:
-                last_ref = state.get("last_universe_refresh")
-                if last_ref is None or now.date().isoformat() > last_ref:
-                    refresh_universe(ex, state, state_path)
-            except Exception as e:
-                log.warning(f"Daily universe refresh check failed: {e}")
-
-            # Pause gate
-            try:
-                paused_until_iso = state.get("trading_paused_until")
-                if paused_until_iso:
-                    try:
-                        until = datetime.fromisoformat(paused_until_iso)
-                    except Exception:
-                        until = None
-                    if until is not None and now.replace(tzinfo=timezone.utc) < until.replace(tzinfo=timezone.utc):
-                        log.warning(f"Trading paused until {until.isoformat()}")
-                        log.info(f"=== Cycle end (paused) {utcnow().isoformat()} ===")
-                        continue
-                    else:
-                        state["trading_paused_until"] = None
-                        write_json(state_path, state)
-            except Exception as e:
-                log.warning(f"Pause gate check failed: {e}")
-
-            # Equity & kill switch + auto-delever
-            try:
-                equity = ex.fetch_balance_usdt()
-                log.info(
-                    f"Equity snapshot: {equity:.2f} USDT | "
-                    f"config.gross_leverage={cfg.strategy.gross_leverage} | "
-                    f"config.set_leverage={cfg.execution.set_leverage}"
-                )
-
-                if state.get("day_start_equity") is None or (now.hour == 0 and now.minute < 10):
-                    state["day_start_equity"] = equity
+            # Kill-switch check
+            eq = ex.get_equity_usdt()
+            if eq > 0 and day_start_equity > 0:
+                if kill_switch_should_trigger(day_start_equity, eq, cfg.risk.max_daily_loss_pct):
+                    resume = resume_time_after_kill(utcnow(), cfg.risk.trade_disable_minutes)
+                    state["disable_until_ts"] = resume.timestamp()
                     write_json(state_path, state)
-
-                from .risk import kill_switch_should_trigger, resume_time_after_kill
-                if kill_switch_should_trigger(state.get("day_start_equity") or 0.0, equity, cfg.risk.max_daily_loss_pct):
-                    pause_until = resume_time_after_kill(now, cfg.risk.trade_disable_minutes)
-                    state["trading_paused_until"] = pause_until.isoformat()
-                    write_json(state_path, state)
-                    log.error(f"Kill switch triggered. Pausing until {pause_until.isoformat()}")
-                    log.info(f"=== Cycle end (kill switch) {utcnow().isoformat()} ===")
+                    log.error(f"KILL SWITCH: pausing trading until {resume.isoformat()}")
+                    time.sleep(5)
                     continue
 
-                # Auto-delever based on intraday drawdown vs day_start_equity
+            # 1) Pull bars for all symbols
+            bars: Dict[str, pd.DataFrame] = {}
+            for s in syms:
                 try:
-                    day_start = float(state.get("day_start_equity") or equity)
-                    dd_pct = 100.0 * max(0.0, (day_start - equity) / max(1e-9, day_start))
-                    scale = 1.0
-                    if dd_pct >= 1.0:
-                        scale = 0.85
-                    if dd_pct >= 2.0:
-                        scale = 0.7
-                    if dd_pct >= 3.0:
-                        scale = 0.5
-                    new_gl = max(0.8, float(orig_gl) * float(scale))
-                    if abs(new_gl - float(cfg.strategy.gross_leverage)) > 1e-9:
-                        cfg.strategy.gross_leverage = new_gl
-                        log.info(f"Auto-delever: intraday DD {dd_pct:.2f}% → gross_leverage={cfg.strategy.gross_leverage:.2f}")
+                    raw = ex.fetch_ohlcv(s, cfg.exchange.timeframe, limit=cfg.exchange.candles_limit)
+                    df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+                    df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+                    df.set_index("dt", inplace=True)
+                    if len(df) > 0:
+                        bars[s] = df
                 except Exception as e:
-                    log.debug(f"auto-delever skipped: {e}")
+                    log.warning(f"OHLCV {s} failed: {e}")
 
-            except Exception as e:
-                log.error(f"Equity/kill-switch step failed: {e}")
-                log.info(f"=== Cycle end (error) {utcnow().isoformat()} ===")
+            if not bars:
+                log.error("No bars fetched this cycle; sleeping.")
+                time.sleep(cfg.execution.poll_seconds)
                 continue
 
-            # OHLCV & closes
-            t_ohlcv_start = perf_counter()
-            closes = {}
-            latest_bars = {}
-            skipped_short = 0
-            try:
-                universe = list(state.get("universe", []))
-                if not universe:
-                    refresh_universe(ex, state, state_path)
-                    universe = list(state.get("universe", []))
+            closes = pd.concat({s: bars[s]["close"] for s in bars}, axis=1).dropna(how="all")
+            mean_close = closes.mean(axis=1)
 
-                pause_ms = getattr(cfg.exchange, "ohlcv_pause_ms", None)
-                need = max(max(cfg.strategy.lookbacks), cfg.strategy.vol_lookback) + 10
+            # 2) Optional regime gating
+            if cfg.strategy.regime_filter.enabled:
+                ok = regime_ok(
+                    mean_close,
+                    cfg.strategy.regime_filter.ema_len,
+                    cfg.strategy.regime_filter.slope_min_bps_per_day,
+                    use_abs=bool(getattr(cfg.strategy.regime_filter, "use_abs", False)),
+                )
+                if not ok:
+                    log.info("Regime gate blocked this cycle; staying flat.")
+                    time.sleep(cfg.execution.poll_seconds)
+                    continue
 
-                for s in universe:
-                    try:
-                        raw = ex.fetch_ohlcv(
-                            s,
-                            timeframe=cfg.exchange.timeframe,
-                            limit=max(cfg.exchange.candles_limit, cfg.strategy.vol_lookback + 50),
-                        )
-                        if not raw:
-                            continue
-                        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
-                        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-                        df.set_index("dt", inplace=True)
-                        if len(df) < need:
-                            skipped_short += 1
-                            continue
-                        closes[s] = df["close"]
-                        latest_bars[s] = df.iloc[-1]
-                    finally:
-                        if pause_ms and pause_ms > 0:
-                            time.sleep(pause_ms / 1000.0)
-            except Exception as e:
-                log.error(f"OHLCV aggregation failed: {e}")
+            # 3) Build momentum targets
+            funding_map: Dict[str, float] = {}
+            if getattr(cfg.strategy.funding_tilt, "enabled", False):
+                try:
+                    funding_map = ex.fetch_funding_rates(list(bars.keys())) or {}
+                except Exception as e:
+                    log.debug(f"funding rates fetch failed: {e}")
 
-            t_ohlcv = perf_counter() - t_ohlcv_start
-            log.info(
-                f"OHLCV: fetched {len(closes)}/{len(state.get('universe', []))} symbols "
-                f"(skipped_short={skipped_short}) in {t_ohlcv:.2f}s; limit={cfg.exchange.candles_limit}"
+            targets = build_targets(
+                closes,
+                cfg.strategy.lookbacks,
+                cfg.strategy.lookback_weights,
+                cfg.strategy.vol_lookback,
+                cfg.strategy.k_min,
+                cfg.strategy.k_max,
+                cfg.strategy.market_neutral,
+                cfg.strategy.gross_leverage,
+                cfg.strategy.max_weight_per_asset,
+                dynamic_k_fn=dynamic_k,
+                funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, "enabled", False) else None,
+                funding_weight=float(getattr(cfg.strategy.funding_tilt, "weight", 0.0)) if getattr(cfg.strategy.funding_tilt, "enabled", False) else 0.0,
+                entry_zscore_min=float(getattr(cfg.strategy, "entry_zscore_min", 0.0)),
+                diversify_enabled=bool(getattr(cfg.strategy.diversify, "enabled", False)),
+                corr_lookback=int(getattr(cfg.strategy.diversify, "corr_lookback", 48)),
+                max_pair_corr=float(getattr(cfg.strategy.diversify, "max_pair_corr", 0.9)),
+                vol_target_enabled=bool(getattr(cfg.strategy.vol_target, "enabled", False)),
+                target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, "target_daily_vol_bps", 0.0)),
+                vol_target_min_scale=float(getattr(cfg.strategy.vol_target, "min_scale", 0.5)),
+                vol_target_max_scale=float(getattr(cfg.strategy.vol_target, "max_scale", 2.0)),
             )
 
-            if not closes:
-                log.warning("No closes collected this cycle; skipping signal build.")
-                log.info(f"=== Cycle end (no data) {utcnow().isoformat()} ===")
-                continue
+            # 4) Liquidity caps
+            tickers = ex.fetch_tickers(list(targets.index))
+            eq = ex.get_equity_usdt()
+            targets = apply_liquidity_caps(
+                targets,
+                equity_usdt=eq,
+                tickers=tickers or {},
+                adv_cap_pct=cfg.liquidity.adv_cap_pct,
+                notional_cap_usdt=cfg.liquidity.notional_cap_usdt,
+            )
 
-            try:
-                closes = pd.concat(closes, axis=1)
-            except Exception as e:
-                log.error(f"Failed to concat closes: {e}")
-                log.info(f"=== Cycle end (concat error) {utcnow().isoformat()} ===")
-                continue
+            # 5) Convert to desired position sizes and create order list
+            positions = ex.fetch_positions()
+            last_targets = pd.Series(state.get("last_targets", {}))
+            min_notional = float(cfg.execution.min_notional_per_order_usdt)
+            min_delta_bps = float(cfg.execution.min_rebalance_delta_bps)
 
-            # Regime filter
-            try:
-                if cfg.strategy.regime_filter.enabled:
-                    ok = regime_ok(
-                        closes.mean(axis=1),
-                        cfg.strategy.regime_filter.ema_len,
-                        cfg.strategy.regime_filter.slope_min_bps_per_day,
-                    )
-                    if not ok:
-                        log.info("Regime filter blocking new entries this cycle.")
-                        log.info(f"=== Cycle end (regime) {utcnow().isoformat()} ===")
-                        continue
-            except Exception as e:
-                log.warning(f"Regime filter calc failed (not blocking): {e}")
+            orders: List[Dict] = []
+            for s, w in targets.items():
+                px = (tickers.get(s, {}) or {}).get("last") or (tickers.get(s, {}) or {}).get("close")
+                if px is None:
+                    continue
+                px = float(px)
+                target_notional = w * eq
+                # current position notional sign via contracts * price (best-effort)
+                cur = positions.get(s, {}) or {}
+                cur_qty = float(cur.get("contracts") or cur.get("contractSize") or cur.get("positionAmt") or 0.0)
+                cur_notional = float(cur_qty) * px
+                delta_notional = target_notional - cur_notional
 
-            # Targets (now using dynamic_k and advanced knobs)
-            try:
-                t_targets_start = perf_counter()
+                # skip tiny rebalances by notional and by equity bps
+                if abs(delta_notional) < min_notional:
+                    continue
+                if eq > 0 and (abs(delta_notional) / eq * 10_000.0) < min_delta_bps:
+                    continue
 
-                # Optional: funding tilt snapshot (live)
-                if getattr(cfg.strategy.funding_tilt, "enabled", False):
-                    try:
-                        funding_map = ex.fetch_funding_rates(list(closes.columns)) or {}
-                    except Exception:
-                        funding_map = {}
-                else:
-                    funding_map = None
+                side = "buy" if delta_notional > 0 else "sell"
+                # approximate contract size as notional/price for linear USDT perp
+                size = abs(delta_notional) / px
 
-                targets = build_targets(
-                    closes,
-                    cfg.strategy.lookbacks,
-                    cfg.strategy.lookback_weights,
-                    cfg.strategy.vol_lookback,
-                    cfg.strategy.k_min,
-                    cfg.strategy.k_max,
-                    cfg.strategy.market_neutral,
-                    cfg.strategy.gross_leverage,
-                    cfg.strategy.max_weight_per_asset,
-                    dynamic_k_fn=dynamic_k,
-                    funding_tilt=funding_map,
-                    funding_weight=float(getattr(cfg.strategy.funding_tilt, "weight", 0.0))
-                        if getattr(cfg.strategy.funding_tilt, "enabled", False) else 0.0,
-                    entry_zscore_min=float(getattr(cfg.strategy, "entry_zscore_min", 0.0)),
-                    diversify_enabled=bool(getattr(cfg.strategy.diversify, "enabled", False)),
-                    corr_lookback=int(getattr(cfg.strategy.diversify, "corr_lookback", 48)),
-                    max_pair_corr=float(getattr(cfg.strategy.diversify, "max_pair_corr", 0.9)),
-                    vol_target_enabled=bool(getattr(cfg.strategy.vol_target, "enabled", False)),
-                    target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, "target_daily_vol_bps", 0.0)),
-                    vol_target_min_scale=float(getattr(cfg.strategy.vol_target, "min_scale", 0.5)),
-                    vol_target_max_scale=float(getattr(cfg.strategy.vol_target, "max_scale", 2.0)),
-                )
-                t_targets = perf_counter() - t_targets_start
-                log.info(f"Targets built for {len(targets)} symbols in {t_targets:.2f}s")
-            except Exception as e:
-                log.error(f"Target build failed: {e}")
-                log.info(f"=== Cycle end (target error) {utcnow().isoformat()} ===")
-                continue
+                price = None
+                if cfg.execution.order_type.lower() == "limit":
+                    mid = px
+                    price = ex._limit_price_from_side(side, mid, cfg.execution.price_offset_bps)
 
-            # Liquidity caps
-            try:
-                t_liq_start = perf_counter()
-                ticks = ex.fetch_tickers(list(targets.index))
-                targets = apply_liquidity_caps(
-                    targets,
-                    equity,
-                    ticks,
-                    cfg.liquidity.adv_cap_pct,
-                    cfg.liquidity.notional_cap_usdt,
-                )
-                t_liq = perf_counter() - t_liq_start
-                log.info(f"Liquidity caps applied in {t_liq:.2f}s")
-            except Exception as e:
-                log.warning(f"Liquidity capping failed; using raw targets: {e}")
+                orders.append({"symbol": s, "side": side, "qty": size, "price": price})
 
-            # Prices & qtys
-            try:
-                t_px_start = perf_counter()
-                prices = {s: ex.fetch_price(s) for s in targets.index}
-                qtys = compute_qtys(targets, prices, equity)
-                t_px = perf_counter() - t_px_start
-                log.info(f"Prices/qtys computed for {len(prices)} symbols in {t_px:.2f}s")
-
-                try:
-                    tdf = targets.to_frame(name="w").assign(px=pd.Series(prices)).assign(qty=pd.Series(qtys))
-                    tdf["absw"] = tdf["w"].abs()
-                    top = tdf.sort_values("absw", ascending=False).head(5)[["w", "px", "qty"]]
-                    log.info("Top targets (w, px, qty):\n" + top.to_string())
-                except Exception as e:
-                    log.debug(f"Target preview failed: {e}")
-
-                try:
-                    gross_notional = 0.0
-                    for s, q in qtys.items():
-                        px = prices.get(s)
-                        if px and q:
-                            gross_notional += abs(float(q)) * float(px)
-                    if equity and equity > 0:
-                        eff_lev = gross_notional / equity
-                        log.info(
-                            f"Intended gross notional: {gross_notional:.2f} USDT | "
-                            f"effective_leverage≈{eff_lev:.3f}"
-                        )
-                    else:
-                        log.info("Intended gross notional computed but equity <= 0; effective leverage N/A")
-                except Exception as e:
-                    log.debug(f"Effective leverage calc failed: {e}")
-            except Exception as e:
-                log.error(f"Price/qty computation failed: {e}")
-                log.info(f"=== Cycle end (pricing error) {utcnow().isoformat()} ===")
-                continue
-
-            # Current positions snapshot
-            current_qtys = {}
-            try:
-                pos_map = ex.fetch_positions_map()
-            except Exception as e:
-                log.error(f"Positions fetch failed: {e}")
-                pos_map = {}
-
-            for s in targets.index:
-                cur = 0.0
-                try:
-                    p = pos_map.get(s)
-                    if p:
-                        qty = float(p.get("contracts") or p.get("positionAmt") or p.get("contractsSize") or 0.0)
-                        side = p.get("side")
-                        if side == "short" and qty > 0:
-                            qty = -qty
-                        cur = qty
-                except Exception:
-                    cur = 0.0
-                current_qtys[s] = cur
-
-            # Per-symbol leverage setting
-            try:
-                lev = cfg.execution.set_leverage
-                if lev and lev > 0:
-                    for s in targets.index:
-                        try:
-                            ex.try_set_leverage(s, lev)
-                        except Exception as ie:
-                            log.debug(f"Leverage set failed for {s}: {ie}")
-            except Exception as e:
-                log.debug(f"Leverage loop failed (ignored): {e}")
-
-            # Orders for rebalance (respect PnL gate + skip dust/tiny rebalances)
+            # 6) Place orders
             t_ord_start = perf_counter()
-            orders = []
-            try:
-                for s in targets.index:
-                    tgt = float(qtys.get(s, 0.0))
-                    cur = float(current_qtys.get(s, 0.0))
-                    diff = tgt - cur
-                    if abs(diff) < 1e-8:
-                        continue
-                    side = "buy" if diff > 0 else "sell"
-                    px = prices.get(s)
-                    order_px = None
-                    if isinstance(px, (int, float)) and cfg.execution.order_type.lower() == "limit":
-                        sign = 1 if side == "buy" else -1
-                        order_px = px * (1.0 + sign * (cfg.execution.price_offset_bps / 10_000))
-
-                    # Skip tiny rebalances and dust orders for small accounts
-                    try:
-                        min_delta = float(cfg.execution.min_rebalance_delta_bps) / 10_000.0 * float(equity)
-                        est_notional = abs(diff) * float(prices.get(s, 0.0) or 0.0)
-                        if est_notional < max(min_delta, float(cfg.execution.min_notional_per_order_usdt)):
-                            continue
-                    except Exception:
-                        pass
-
-                    # PnL gate for reductions/flips
-                    try:
-                        pnl_gate = float(getattr(cfg.risk, "min_close_pnl_pct", 0.0))
-                        if pnl_gate > 0 and cur != 0.0:
-                            reducing = (abs(tgt) < abs(cur))
-                            flipping = (np.sign(tgt) != np.sign(cur)) and (tgt != 0.0)
-                            if reducing or flipping:
-                                pinfo = pos_map.get(s, {}) or {}
-                                entry = pinfo.get("entryPrice") or pinfo.get("averagePrice") or pinfo.get("avgPrice")
-                                px_now = prices.get(s)
-                                if entry and entry not in (0, "0", "0.0") and px_now:
-                                    entry = float(entry)
-                                    px_now = float(px_now)
-                                    sign_pos = 1.0 if cur > 0 else -1.0
-                                    pnl_pct = (px_now - entry) / entry * sign_pos * 100.0
-                                    if abs(pnl_pct) < pnl_gate:
-                                        continue
-                    except Exception as e:
-                        log.debug(f"PnL gate check failed for {s}: {e}")
-
-                    raw_diff = diff
-                    q_diff, q_px = ex.quantize(s, diff, order_px)
-                    if abs(raw_diff) > 0 and q_diff == 0.0:
-                        log.info(f"Rounded to 0 by quantize: {s} raw_diff={raw_diff} order_px={order_px}")
-                    if q_diff != 0.0:
-                        orders.append((s, side, q_diff, q_px))
-            except Exception as e:
-                log.error(f"Order diff construction failed: {e}")
-
-            for (s, side, q, px) in orders:
+            for od in orders:
+                s, side, q, px = od["symbol"], od["side"], float(od["qty"]), od["price"]
+                notional = q * (tickers.get(s, {}) or {}).get("last", 0.0)
                 try:
-                    px_eff = px if px is not None else prices.get(s)
-                    notional = (abs(float(q)) * float(px_eff)) if (px_eff and q) else 0.0
                     if dry:
                         log.info(f"[DRY] {s}: {side} {q} @ {px or 'mkt'} (~{notional:.2f} USDT)")
                     else:
@@ -790,6 +431,8 @@ def run_live(cfg: AppConfig, dry: bool):
             cycle_time = (utcnow() - cycle_started_at).total_seconds()
             log.info(f"Cycle complete in {cycle_time:.2f}s")
             log.info(f"=== Cycle end {utcnow().isoformat()} ===")
+
+            time.sleep(max(1, int(cfg.execution.poll_seconds)))
 
     finally:
         try:
