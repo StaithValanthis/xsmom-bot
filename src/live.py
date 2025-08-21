@@ -1,4 +1,4 @@
-# v1.2.0 – 2025-08-21
+# v1.2.2 – 2025-08-21
 from __future__ import annotations
 import logging
 import threading
@@ -124,7 +124,7 @@ class FastSLTPThread(threading.Thread):
                     continue
 
                 for sym, pdct in pos.items():
-                    qty = float(pdct.get("contracts") or pdct.get("contractSize") or pdct.get("positionAmt") or 0.0)
+                    qty = float(pdct.get("net_qty") or 0.0)  # use NET qty
                     if qty == 0.0:
                         continue
                     side = "long" if qty > 0 else "short"
@@ -232,7 +232,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
       1) Build universe (liquidity filters)
       2) Fetch bars, compute targets
       3) Convert weights -> desired qty, apply min notional & delta bps guards
-      4) Place orders, spawn Fast SL/TP watcher
+      4) Place orders (reduce opposite side first), spawn Fast SL/TP watcher
     """
     log.info(f"Fast SL/TP loop starting: check every {cfg.risk.fast_check_seconds}s on timeframe={cfg.risk.stop_timeframe}")
 
@@ -314,14 +314,23 @@ def run_live(cfg: AppConfig, dry: bool = False):
             closes = pd.concat({s: bars[s]["close"] for s in bars}, axis=1).dropna(how="all")
             mean_close = closes.mean(axis=1)
 
-            # 2) Optional regime gating
+            # 2) Optional regime gating (with diagnostics + fail-open behavior inside regime_ok)
             if cfg.strategy.regime_filter.enabled:
-                ok = regime_ok(
-                    mean_close,
-                    cfg.strategy.regime_filter.ema_len,
-                    cfg.strategy.regime_filter.slope_min_bps_per_day,
-                    use_abs=bool(getattr(cfg.strategy.regime_filter, "use_abs", False)),
-                )
+                ema_len = cfg.strategy.regime_filter.ema_len
+                thr = cfg.strategy.regime_filter.slope_min_bps_per_day
+                use_abs = bool(getattr(cfg.strategy.regime_filter, "use_abs", False))
+
+                # Diagnostic block
+                try:
+                    ema_dbg = mean_close.ewm(span=ema_len, adjust=False).mean()
+                    slope_dbg = ema_dbg.diff().tail(ema_len).mean()
+                    last_close_dbg = float(mean_close.iloc[-1]) if len(mean_close) else float("nan")
+                    slope_bps_dbg = 10_000 * float(slope_dbg) / last_close_dbg if last_close_dbg > 0 else float("nan")
+                    log.debug(f"Regime gate diag: ema_len={ema_len}, slope_min_bps={thr}, use_abs={use_abs}, slope_bps_now={slope_bps_dbg:.3f}")
+                except Exception:
+                    pass
+
+                ok = regime_ok(mean_close, ema_len, thr, use_abs=use_abs)
                 if not ok:
                     log.info("Regime gate blocked this cycle; staying flat.")
                     time.sleep(cfg.execution.poll_seconds)
@@ -370,22 +379,25 @@ def run_live(cfg: AppConfig, dry: bool = False):
             )
 
             # 5) Convert to desired position sizes and create order list
-            positions = ex.fetch_positions()
-            last_targets = pd.Series(state.get("last_targets", {}))
+            positions = ex.fetch_positions()  # now consolidated with net_qty, long_qty, short_qty
             min_notional = float(cfg.execution.min_notional_per_order_usdt)
             min_delta_bps = float(cfg.execution.min_rebalance_delta_bps)
 
+            # Build per-symbol order legs: (flatten_opposite_first, then expand_same_side)
             orders: List[Dict] = []
             for s, w in targets.items():
-                px = (tickers.get(s, {}) or {}).get("last") or (tickers.get(s, {}) or {}).get("close")
+                t = (tickers.get(s, {}) or {})
+                px = t.get("last") or t.get("close")
                 if px is None:
                     continue
                 px = float(px)
                 target_notional = w * eq
-                # current position notional sign via contracts * price (best-effort)
-                cur = positions.get(s, {}) or {}
-                cur_qty = float(cur.get("contracts") or cur.get("contractSize") or cur.get("positionAmt") or 0.0)
-                cur_notional = float(cur_qty) * px
+
+                pos = positions.get(s, {}) or {}
+                long_qty = float(pos.get("long_qty") or 0.0)
+                short_qty = float(pos.get("short_qty") or 0.0)
+                net_qty = float(pos.get("net_qty") or 0.0)
+                cur_notional = net_qty * px
                 delta_notional = target_notional - cur_notional
 
                 # skip tiny rebalances by notional and by equity bps
@@ -394,28 +406,49 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 if eq > 0 and (abs(delta_notional) / eq * 10_000.0) < min_delta_bps:
                     continue
 
-                side = "buy" if delta_notional > 0 else "sell"
-                # approximate contract size as notional/price for linear USDT perp
-                size = abs(delta_notional) / px
+                want_buy = delta_notional > 0
+                want_sell = delta_notional < 0
 
-                price = None
-                if cfg.execution.order_type.lower() == "limit":
-                    mid = px
-                    price = ex._limit_price_from_side(side, mid, cfg.execution.price_offset_bps)
+                # First: flatten opposite side with reduceOnly
+                if want_buy and short_qty > 0:
+                    qty_to_close = min(abs(delta_notional) / px, short_qty)
+                    if qty_to_close > 0:
+                        orders.append({"symbol": s, "side": "buy", "qty": qty_to_close, "price": None, "reduceOnly": True})
+                    # Reduce remaining desired delta_notional
+                    delta_notional -= min(abs(delta_notional), qty_to_close * px)
 
-                orders.append({"symbol": s, "side": side, "qty": size, "price": price})
+                if want_sell and long_qty > 0:
+                    qty_to_close = min(abs(delta_notional) / px, long_qty)
+                    if qty_to_close > 0:
+                        orders.append({"symbol": s, "side": "sell", "qty": qty_to_close, "price": None, "reduceOnly": True})
+                    delta_notional -= min(abs(delta_notional), qty_to_close * px) * (-1 if want_sell else 1)
 
-            # 6) Place orders
+                # Then: open/expand same-side position for any remaining delta
+                if abs(delta_notional) >= min_notional:
+                    side = "buy" if delta_notional > 0 else "sell"
+                    size = abs(delta_notional) / px
+                    price = None
+                    if cfg.execution.order_type.lower() == "limit":
+                        price = ex._limit_price_from_side(side, px, cfg.execution.price_offset_bps)
+                    orders.append({"symbol": s, "side": side, "qty": size, "price": price, "reduceOnly": False})
+
+            # 6) Place orders (reduceOnly legs first)
             t_ord_start = perf_counter()
             for od in orders:
-                s, side, q, px = od["symbol"], od["side"], float(od["qty"]), od["price"]
+                s = od["symbol"]
+                side = od["side"]
+                q = float(od["qty"])
+                px = od["price"]
+                ro = bool(od.get("reduceOnly", False))
                 notional = q * (tickers.get(s, {}) or {}).get("last", 0.0)
                 try:
                     if dry:
-                        log.info(f"[DRY] {s}: {side} {q} @ {px or 'mkt'} (~{notional:.2f} USDT)")
+                        tag = "REDUCE" if ro else "OPEN"
+                        log.info(f"[DRY] {tag} {s}: {side} {q} @ {px or 'mkt'} (~{notional:.2f} USDT)")
                     else:
-                        ex.create_order_safe(s, side, q, px, post_only=cfg.execution.post_only, reduce_only=False)
-                        log.info(f"[LIVE] {s}: {side} {q} @ {px or 'mkt'} (~{notional:.2f} USDT)")
+                        ex.create_order_safe(s, side, q, px, post_only=cfg.execution.post_only and not ro, reduce_only=ro)
+                        tag = "REDUCE" if ro else "OPEN"
+                        log.info(f"[LIVE] {tag} {s}: {side} {q} @ {px or 'mkt'} (~{notional:.2f} USDT)")
                 except Exception as e:
                     log.error(f"Order error {s} {side} {q}: {e}")
             t_ord = perf_counter() - t_ord_start
@@ -423,7 +456,8 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
             # Persist state
             try:
-                state["last_targets"] = targets.to_dict()
+                # Keep last_targets for visibility/debug if needed later
+                state["last_targets"] = {k: float(v) for k, v in targets.items()}
                 write_json(state_path, state)
             except Exception as e:
                 log.warning(f"State persist failed: {e}")

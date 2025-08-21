@@ -1,4 +1,4 @@
-# v1.2.0 – 2025-08-21
+# v1.2.2 – 2025-08-21
 from __future__ import annotations
 import logging
 import os
@@ -174,19 +174,73 @@ class ExchangeWrapper:
             return 0.0
 
     def fetch_positions(self) -> Dict[str, dict]:
-        """Return a map symbol -> position dict with 'contracts' and 'entryPrice' best-effort."""
-        out: Dict[str, dict] = {}
+        """
+        Consolidate per-symbol long/short into a single net position:
+          result[symbol] = {
+            'long_qty', 'short_qty', 'net_qty',
+            'entryPrice_long', 'entryPrice_short', 'entryPrice' (dominant side)
+          }
+        Works around exchanges (e.g., Bybit UTA) that return two rows per symbol.
+        """
+        consolidated: Dict[str, dict] = {}
         try:
             raw = self.x.fetch_positions() or []
             for p in raw:
                 s = p.get("symbol")
                 if not s:
                     continue
-                out[s] = p
-            return out
+                side = (p.get("side") or "").lower()  # 'long' / 'short' / maybe ''
+                qty = float(p.get("contracts") or p.get("contractSize") or p.get("positionAmt") or 0.0)
+                if qty == 0:
+                    # some adapters put signed qty in 'contracts' with side="long", keep positive
+                    # still record entry price if needed
+                    pass
+                ep = None
+                try:
+                    ep = float(p.get("entryPrice") or 0.0) or None
+                except Exception:
+                    ep = None
+
+                c = consolidated.setdefault(
+                    s,
+                    {
+                        "long_qty": 0.0,
+                        "short_qty": 0.0,
+                        "net_qty": 0.0,
+                        "entryPrice_long": None,
+                        "entryPrice_short": None,
+                        "entryPrice": None,
+                    },
+                )
+
+                if side == "long":
+                    c["long_qty"] += abs(qty)
+                    if ep:
+                        c["entryPrice_long"] = ep
+                elif side == "short":
+                    c["short_qty"] += abs(qty)
+                    if ep:
+                        c["entryPrice_short"] = ep
+                else:
+                    # Some brokers provide signed qty without side
+                    if qty > 0:
+                        c["long_qty"] += abs(qty)
+                        if ep:
+                            c["entryPrice_long"] = ep
+                    elif qty < 0:
+                        c["short_qty"] += abs(qty)
+                        if ep:
+                            c["entryPrice_short"] = ep
+
+            # finalize
+            for s, c in consolidated.items():
+                c["net_qty"] = float(c["long_qty"]) - float(c["short_qty"])
+                c["entryPrice"] = c["entryPrice_long"] if c["net_qty"] > 0 else (c["entryPrice_short"] if c["net_qty"] < 0 else None)
+
+            return consolidated
         except Exception as e:
             log.debug(f"fetch_positions error: {e}")
-            return out
+            return consolidated
 
     # -------- Trading --------
 

@@ -1,4 +1,4 @@
-# v1.2.0 – 2025-08-21
+# v1.2.1 – 2025-08-21
 from __future__ import annotations
 import logging
 from typing import List, Tuple, Literal
@@ -60,10 +60,30 @@ def regime_ok(
 ) -> bool:
     """
     EMA slope gating.
-    - use_abs=False → only allow if slope >= threshold (uptrend gate)
+    - use_abs=False → allow only if slope >= threshold (uptrend gate)
     - use_abs=True  → allow if |slope| >= threshold (trend/noise gate)
+    Fail-open when threshold <= 0 or insufficient/invalid data.
     """
-    ema = close.ewm(span=ema_len, adjust=False).mean()
-    slope = ema.diff().tail(ema_len).mean()
-    slope_bps = 10_000 * float(slope) / float(close.iloc[-1])
-    return abs(slope_bps) >= slope_min_bps_per_day if use_abs else (slope_bps >= slope_min_bps_per_day)
+    try:
+        # Fail-open if threshold is non-positive
+        if slope_min_bps_per_day is None or slope_min_bps_per_day <= 0:
+            return True
+
+        # Not enough data → don't block
+        if len(close.dropna()) < (ema_len + 5):
+            return True
+
+        ema = close.ewm(span=ema_len, adjust=False).mean()
+        slope = ema.diff().tail(ema_len).mean()
+        if slope is None or not np.isfinite(float(slope)):
+            return True  # fail-open if slope cannot be computed
+
+        last_close = float(close.iloc[-1])
+        if last_close <= 0 or not np.isfinite(last_close):
+            return True  # fail-open
+
+        slope_bps = 10_000 * float(slope) / last_close
+        return abs(slope_bps) >= slope_min_bps_per_day if use_abs else (slope_bps >= slope_min_bps_per_day)
+    except Exception:
+        # Any calc error → don't block trading
+        return True
