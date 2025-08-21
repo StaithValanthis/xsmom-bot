@@ -23,6 +23,18 @@ class FundingTiltCfg(BaseModel):
     enabled: bool = False
     weight: float = 0.2
 
+# NEW: optional sub-configs for diversification & volatility targeting
+class DiversifyCfg(BaseModel):
+    enabled: bool = False
+    corr_lookback: int = 48
+    max_pair_corr: float = 0.9
+
+class VolTargetCfg(BaseModel):
+    enabled: bool = False
+    target_daily_vol_bps: float = 0.0
+    min_scale: float = 0.5
+    max_scale: float = 2.0
+
 class StrategyCfg(BaseModel):
     lookbacks: List[int] = Field(default_factory=lambda: [1, 6, 24])
     lookback_weights: List[float] = Field(default_factory=lambda: [1.0, 1.0, 1.0])
@@ -35,6 +47,11 @@ class StrategyCfg(BaseModel):
     regime_filter: RegimeFilterCfg = RegimeFilterCfg()
     funding_tilt: FundingTiltCfg = FundingTiltCfg()
 
+    # NEW: quality & shaping
+    entry_zscore_min: float = 0.0
+    diversify: DiversifyCfg = DiversifyCfg()
+    vol_target: VolTargetCfg = VolTargetCfg()
+
 class LiquidityCfg(BaseModel):
     adv_cap_pct: float = 0.004
     notional_cap_usdt: float = 50_000.0
@@ -45,13 +62,17 @@ class ExecutionCfg(BaseModel):
     price_offset_bps: int = 5
     slippage_bps_guard: int = 25
     set_leverage: int = 3
-    rebalance_minute: int = 15    # calmer default vs 5
+    rebalance_minute: int = 15
     poll_seconds: int = 15
     align_after_funding_minutes: int = 0
     funding_hours_utc: List[int] = Field(default_factory=lambda: [0, 8, 16])
 
+    # NEW: small-account churn guards
+    min_notional_per_order_usdt: float = 5.0
+    min_rebalance_delta_bps: float = 25.0  # 0.25% of equity
+
 class RiskCfg(BaseModel):
-    # Stop/TP sizing (calmer)
+    # Stop/TP sizing
     atr_len: int = 21
     atr_mult_sl: float = 2.2
     atr_mult_tp: float = 3.8
@@ -64,7 +85,7 @@ class RiskCfg(BaseModel):
     trail_atr_mult: float = 2.2
     breakeven_after_r: float = 1.5
 
-    # Wick resistance (NEW)
+    # Wick resistance
     stop_on_close_only: bool = True
     stop_buffer_bps: float = 8.0
     cooldown_minutes_after_stop: int = 30
@@ -74,10 +95,13 @@ class RiskCfg(BaseModel):
     partial_tp_r: float = 2.0
     partial_tp_size: float = 0.5
 
-    # Kill switch & churn gate
+    # Governance
     max_daily_loss_pct: float = 5.0
     trade_disable_minutes: int = 120
     min_close_pnl_pct: float = 1.0
+
+    # NEW: time-based exit
+    max_hours_in_trade: int = 48
 
 class CostsCfg(BaseModel):
     taker_fee_bps: float = 7.0

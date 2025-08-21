@@ -10,7 +10,7 @@ import pandas as pd
 
 from .config import AppConfig
 from .exchange import ExchangeWrapper
-from .signals import regime_ok, compute_atr
+from .signals import regime_ok, compute_atr, dynamic_k
 from .sizing import build_targets, apply_liquidity_caps
 from .utils import utcnow, read_json, write_json
 
@@ -77,9 +77,10 @@ class FastSLTPThread(threading.Thread):
     """
     Poll-based 'event-driven' SL/TP enforcement:
       - Every fast_check_seconds: read open positions, last price, compare to stop levels.
-      - Every ~60s (per symbol): refresh 1m OHLCV to recompute ATR & trailing anchors.
-    Uses and maintains `state["perpos"]`:
-      perpos[sym] = {sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done}
+      - Every ~60s (per symbol): refresh 1m/3m OHLCV to recompute ATR & trailing anchors.
+
+    Maintains state["perpos"][sym] = {sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done}
+    Also uses state["enter_bar_time"][sym] for time-based exits.
     """
     def __init__(self, ex: ExchangeWrapper, cfg: AppConfig, state: dict, dry: bool, stop_event: threading.Event):
         super().__init__(daemon=True)
@@ -93,8 +94,8 @@ class FastSLTPThread(threading.Thread):
 
         # ensure required state buckets exist
         self.state.setdefault("perpos", {})
-        # optional: cooldowns (not required for this fix, but harmless if present)
         self.state.setdefault("cooldowns", {})
+        self.state.setdefault("enter_bar_time", {})
 
     def _now_ts(self) -> float:
         return float(time.time())
@@ -102,7 +103,6 @@ class FastSLTPThread(threading.Thread):
     @staticmethod
     def _to_float(x, default: float = None) -> Optional[float]:
         try:
-            # If a pandas/scalar array sneaks in, grab a scalar
             if isinstance(x, (pd.Series, pd.Index, np.ndarray)) and hasattr(x, "item"):
                 return float(np.asarray(x).astype("float64").ravel()[-1])
             return float(x)
@@ -123,6 +123,7 @@ class FastSLTPThread(threading.Thread):
         if entry_v is None:
             entry_v = close_v
 
+        # new position or side flip → (re)init trails and start timer
         if (not isinstance(pinfo, dict)) or (int(pinfo.get("sign", 0) or 0) != sign):
             perpos[symbol] = {
                 "sign": sign,
@@ -132,6 +133,7 @@ class FastSLTPThread(threading.Thread):
                 "trail_ll": float(low_v),
                 "partial_done": False,
             }
+            self.state.setdefault("enter_bar_time", {})[symbol] = pd.Timestamp.utcnow()
         else:
             # update trails
             if sign > 0:
@@ -245,9 +247,11 @@ class FastSLTPThread(threading.Thread):
                 # 1) fetch positions
                 pos_map = self.ex.fetch_positions_map() or {}
                 if not pos_map:
-                    # Clear all perpos if nothing is open
+                    # Clear all perpos & timers if nothing is open
                     if self.state.get("perpos"):
                         self.state["perpos"] = {}
+                    if self.state.get("enter_bar_time"):
+                        self.state["enter_bar_time"] = {}
                     time.sleep(fast_s)
                     continue
 
@@ -266,6 +270,8 @@ class FastSLTPThread(threading.Thread):
                         # clear state if any
                         if self.state.get("perpos", {}).get(sym):
                             self.state["perpos"].pop(sym, None)
+                        if self.state.get("enter_bar_time", {}).get(sym):
+                            self.state["enter_bar_time"].pop(sym, None)
                         continue
 
                     # 3) refresh OHLCV/ATR for this symbol at most once per ~60s
@@ -333,15 +339,36 @@ class FastSLTPThread(threading.Thread):
                                     log.info(f"[LIVE-FAST-STOP] {sym}: {'sell' if long_pos else 'buy'} {q} @ mkt (SL {stop_px:.6g})")
                             # clear perpos after exit
                             self.state.get("perpos", {}).pop(sym, None)
+                            self.state.get("enter_bar_time", {}).pop(sym, None)
                             # move on to next position
                             continue
 
                     # 7) partial take profit check
                     self._maybe_partial_tp(sym, float(qty), lr)
 
+                    # 8) time-based exit
+                    try:
+                        max_hours_in_trade = int(getattr(self.cfg.risk, "max_hours_in_trade", 0))
+                        entered = self.state.get("enter_bar_time", {}).get(sym, None)
+                        if max_hours_in_trade > 0 and entered is not None:
+                            hours = (pd.Timestamp.utcnow() - pd.Timestamp(entered)).total_seconds() / 3600.0
+                            if hours >= max_hours_in_trade:
+                                q = abs(float(qty))
+                                q, _ = self.ex.quantize(sym, q, None)
+                                if q > 0:
+                                    if self.dry:
+                                        log.info(f"[DRY-TIME-EXIT] {sym}: close {q} @ mkt after {hours:.1f}h")
+                                    else:
+                                        self.ex.create_order_safe(sym, "sell" if qty > 0 else "buy", q, None, post_only=False, reduce_only=True)
+                                        log.info(f"[LIVE-TIME-EXIT] {sym}: close {q} @ mkt after {hours:.1f}h")
+                                self.state.get("perpos", {}).pop(sym, None)
+                                self.state.get("enter_bar_time", {}).pop(sym, None)
+                                continue
+                    except Exception:
+                        pass
+
                 time.sleep(fast_s)
             except Exception:
-                # Full traceback for diagnosis (instead of a truncated error message)
                 log.exception("Fast SL/TP loop error")
                 time.sleep(max(1, fast_s))
 
@@ -359,13 +386,15 @@ def run_live(cfg: AppConfig, dry: bool):
             "trading_paused_until": None,
             "universe": [],
             "last_universe_refresh": None,
-            "perpos": {},       # {sym: {sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done}}
-            "cooldowns": {},    # optional: symbol -> ISO end time
+            "perpos": {},
+            "cooldowns": {},
+            "enter_bar_time": {},
         },
     )
     # Ensure buckets exist even if state file was older
     state.setdefault("perpos", {})
     state.setdefault("cooldowns", {})
+    state.setdefault("enter_bar_time", {})
 
     # start fast SL/TP thread if enabled
     stop_evt = threading.Event()
@@ -380,6 +409,8 @@ def run_live(cfg: AppConfig, dry: bool):
         log.info(f"Initial universe: {len(state.get('universe', []))} symbols")
 
         first_cycle = True
+        # Keep original gross leverage for auto-delever reference
+        orig_gl = float(cfg.strategy.gross_leverage)
 
         while True:
             if first_cycle:
@@ -432,7 +463,7 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.warning(f"Pause gate check failed: {e}")
 
-            # Equity & kill switch
+            # Equity & kill switch + auto-delever
             try:
                 equity = ex.fetch_balance_usdt()
                 log.info(
@@ -444,6 +475,7 @@ def run_live(cfg: AppConfig, dry: bool):
                 if state.get("day_start_equity") is None or (now.hour == 0 and now.minute < 10):
                     state["day_start_equity"] = equity
                     write_json(state_path, state)
+
                 from .risk import kill_switch_should_trigger, resume_time_after_kill
                 if kill_switch_should_trigger(state.get("day_start_equity") or 0.0, equity, cfg.risk.max_daily_loss_pct):
                     pause_until = resume_time_after_kill(now, cfg.risk.trade_disable_minutes)
@@ -452,6 +484,25 @@ def run_live(cfg: AppConfig, dry: bool):
                     log.error(f"Kill switch triggered. Pausing until {pause_until.isoformat()}")
                     log.info(f"=== Cycle end (kill switch) {utcnow().isoformat()} ===")
                     continue
+
+                # Auto-delever based on intraday drawdown vs day_start_equity
+                try:
+                    day_start = float(state.get("day_start_equity") or equity)
+                    dd_pct = 100.0 * max(0.0, (day_start - equity) / max(1e-9, day_start))
+                    scale = 1.0
+                    if dd_pct >= 1.0:
+                        scale = 0.85
+                    if dd_pct >= 2.0:
+                        scale = 0.7
+                    if dd_pct >= 3.0:
+                        scale = 0.5
+                    new_gl = max(0.8, float(orig_gl) * float(scale))
+                    if abs(new_gl - float(cfg.strategy.gross_leverage)) > 1e-9:
+                        cfg.strategy.gross_leverage = new_gl
+                        log.info(f"Auto-delever: intraday DD {dd_pct:.2f}% → gross_leverage={cfg.strategy.gross_leverage:.2f}")
+                except Exception as e:
+                    log.debug(f"auto-delever skipped: {e}")
+
             except Exception as e:
                 log.error(f"Equity/kill-switch step failed: {e}")
                 log.info(f"=== Cycle end (error) {utcnow().isoformat()} ===")
@@ -527,9 +578,19 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.warning(f"Regime filter calc failed (not blocking): {e}")
 
-            # Targets
+            # Targets (now using dynamic_k and advanced knobs)
             try:
                 t_targets_start = perf_counter()
+
+                # Optional: funding tilt snapshot (live)
+                if getattr(cfg.strategy.funding_tilt, "enabled", False):
+                    try:
+                        funding_map = ex.fetch_funding_rates(list(closes.columns)) or {}
+                    except Exception:
+                        funding_map = {}
+                else:
+                    funding_map = None
+
                 targets = build_targets(
                     closes,
                     cfg.strategy.lookbacks,
@@ -540,7 +601,18 @@ def run_live(cfg: AppConfig, dry: bool):
                     cfg.strategy.market_neutral,
                     cfg.strategy.gross_leverage,
                     cfg.strategy.max_weight_per_asset,
-                    dynamic_k_fn=lambda sc, kmin, kmax: (kmin, kmax),
+                    dynamic_k_fn=dynamic_k,
+                    funding_tilt=funding_map,
+                    funding_weight=float(getattr(cfg.strategy.funding_tilt, "weight", 0.0))
+                        if getattr(cfg.strategy.funding_tilt, "enabled", False) else 0.0,
+                    entry_zscore_min=float(getattr(cfg.strategy, "entry_zscore_min", 0.0)),
+                    diversify_enabled=bool(getattr(cfg.strategy.diversify, "enabled", False)),
+                    corr_lookback=int(getattr(cfg.strategy.diversify, "corr_lookback", 48)),
+                    max_pair_corr=float(getattr(cfg.strategy.diversify, "max_pair_corr", 0.9)),
+                    vol_target_enabled=bool(getattr(cfg.strategy.vol_target, "enabled", False)),
+                    target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, "target_daily_vol_bps", 0.0)),
+                    vol_target_min_scale=float(getattr(cfg.strategy.vol_target, "min_scale", 0.5)),
+                    vol_target_max_scale=float(getattr(cfg.strategy.vol_target, "max_scale", 2.0)),
                 )
                 t_targets = perf_counter() - t_targets_start
                 log.info(f"Targets built for {len(targets)} symbols in {t_targets:.2f}s")
@@ -636,7 +708,7 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.debug(f"Leverage loop failed (ignored): {e}")
 
-            # Orders for rebalance (respect PnL gate)
+            # Orders for rebalance (respect PnL gate + skip dust/tiny rebalances)
             t_ord_start = perf_counter()
             orders = []
             try:
@@ -652,6 +724,15 @@ def run_live(cfg: AppConfig, dry: bool):
                     if isinstance(px, (int, float)) and cfg.execution.order_type.lower() == "limit":
                         sign = 1 if side == "buy" else -1
                         order_px = px * (1.0 + sign * (cfg.execution.price_offset_bps / 10_000))
+
+                    # Skip tiny rebalances and dust orders for small accounts
+                    try:
+                        min_delta = float(cfg.execution.min_rebalance_delta_bps) / 10_000.0 * float(equity)
+                        est_notional = abs(diff) * float(prices.get(s, 0.0) or 0.0)
+                        if est_notional < max(min_delta, float(cfg.execution.min_notional_per_order_usdt)):
+                            continue
+                    except Exception:
+                        pass
 
                     # PnL gate for reductions/flips
                     try:
