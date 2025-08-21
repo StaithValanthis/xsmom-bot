@@ -75,8 +75,12 @@ def refresh_universe(ex: ExchangeWrapper, state: dict, state_path: str):
 
 class FastSLTPThread(threading.Thread):
     """
-    Poll-based 'event-driven' SL/TP enforcement.
-    Maintains state['perpos'] per symbol (sign, entry_price, entry_atr, trail_hh/ll, partial_done).
+    Poll-based 'event-driven' SL/TP enforcement:
+      - Every fast_check_seconds: read open positions, last price, compare to stop levels.
+      - Every ~60s (per symbol): refresh small-timeframe OHLCV to recompute ATR & trailing anchors.
+    Uses and maintains `state["perpos"]`:
+      perpos[sym] = {sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done}
+    Also manages per-symbol cooldown via `state["cooldowns"][sym] = ISO8601 until`.
     """
     def __init__(self, ex: ExchangeWrapper, cfg: AppConfig, state: dict, dry: bool, stop_event: threading.Event):
         super().__init__(daemon=True)
@@ -85,10 +89,36 @@ class FastSLTPThread(threading.Thread):
         self.state = state
         self.dry = dry
         self.stop_event = stop_event
-        self._last_ohlcv_ts: Dict[str, float] = {}
+        self._last_ohlcv_ts: Dict[str, float] = {}  # symbol -> unix ts of last ATR refresh
+        self._last_bar_cache: Dict[str, pd.Series] = {}
+        self._last_closed_cache: Dict[str, pd.Series] = {}
+
+        # Ensure state maps exist
+        self.state.setdefault("perpos", {})
+        self.state.setdefault("cooldowns", {})
 
     def _now_ts(self) -> float:
         return time.time()
+
+    def _cooldown_active(self, symbol: str) -> bool:
+        try:
+            iso = (self.state.get("cooldowns") or {}).get(symbol)
+            if not iso:
+                return False
+            until = datetime.fromisoformat(iso)
+            return utcnow() < until.replace(tzinfo=timezone.utc)
+        except Exception:
+            return False
+
+    def _set_cooldown(self, symbol: str):
+        mins = int(getattr(self.cfg.risk, "cooldown_minutes_after_stop", 0))
+        if mins <= 0:
+            return
+        until = utcnow() + timedelta(minutes=mins)
+        cd = self.state.setdefault("cooldowns", {})
+        cd[symbol] = until.isoformat()
+        self.state["cooldowns"] = cd
+        log.info(f"Cooldown set: {symbol} until {until.isoformat()}")
 
     def _init_or_update_perpos(self, symbol: str, cur_qty: float, lr: pd.Series, atr_val: float, entry_price: Optional[float]):
         sign = 1 if cur_qty > 0 else -1
@@ -105,13 +135,14 @@ class FastSLTPThread(threading.Thread):
                 "partial_done": False,
             }
         else:
+            # update trails
             if sign > 0:
                 pinfo["trail_hh"] = float(max(pinfo.get("trail_hh", lr["high"]), float(lr["high"])))
             else:
                 pinfo["trail_ll"] = float(min(pinfo.get("trail_ll", lr["low"]), float(lr["low"])))
             perpos[symbol] = pinfo
 
-    def _compute_stop_px(self, symbol: str, lr: pd.Series):
+    def _compute_stop_px(self, symbol: str, lr_like: pd.Series):
         cfg = self.cfg
         pinfo = self.state.get("perpos", {}).get(symbol)
         if not pinfo:
@@ -123,8 +154,11 @@ class FastSLTPThread(threading.Thread):
         trail_enabled = bool(cfg.risk.trailing_enabled)
         trail_k = float(cfg.risk.trail_atr_mult)
 
+        # initial stop from entry
         init_sl = entry_price - atr_mult_sl * entry_atr if sign > 0 else entry_price + atr_mult_sl * entry_atr
-        cur_atr = float(lr["_atr"])
+
+        # ATR for trailing uses latest injected atr value on lr_like
+        cur_atr = float(lr_like["_atr"])
 
         if trail_enabled:
             if sign > 0:
@@ -136,21 +170,22 @@ class FastSLTPThread(threading.Thread):
         else:
             stop_price = init_sl
 
+        # Breakeven bump after +R
         R = entry_atr * atr_mult_sl
         be_after = float(cfg.risk.breakeven_after_r)
         if be_after > 0.0:
             if sign > 0:
                 be_trigger = entry_price + be_after * R
-                if float(lr["high"]) >= be_trigger:
+                if float(lr_like["high"]) >= be_trigger:
                     stop_price = max(stop_price, entry_price)
             else:
                 be_trigger = entry_price - be_after * R
-                if float(lr["low"]) <= be_trigger:
+                if float(lr_like["low"]) <= be_trigger:
                     stop_price = min(stop_price, entry_price)
 
         return float(stop_price)
 
-    def _maybe_partial_tp(self, symbol: str, cur_qty: float, lr: pd.Series):
+    def _maybe_partial_tp(self, symbol: str, cur_qty: float, last_px: float, lr_like: pd.Series):
         cfg = self.cfg
         if not bool(cfg.risk.partial_tp_enabled):
             return
@@ -165,7 +200,7 @@ class FastSLTPThread(threading.Thread):
         R = entry_atr * float(cfg.risk.atr_mult_sl)
         ptp_r = float(cfg.risk.partial_tp_r)
         ptp_px = entry_price + (ptp_r * R if sign > 0 else -ptp_r * R)
-        hit = (float(lr["last"]) >= ptp_px) if sign > 0 else (float(lr["last"]) <= ptp_px)
+        hit = (float(last_px) >= ptp_px) if sign > 0 else (float(last_px) <= ptp_px)
         if hit:
             size_frac = float(cfg.risk.partial_tp_size)
             q = abs(cur_qty) * size_frac
@@ -190,17 +225,24 @@ class FastSLTPThread(threading.Thread):
         log.info(f"Fast SL/TP loop starting: check every {fast_s}s on timeframe={cfg.risk.stop_timeframe}")
         stop_tf = getattr(cfg.risk, "stop_timeframe", cfg.exchange.timeframe) or cfg.exchange.timeframe
         atr_len = int(cfg.risk.atr_len)
+        close_only = bool(getattr(cfg.risk, "stop_on_close_only", False))
+        buf_bps = float(getattr(cfg.risk, "stop_buffer_bps", 0.0))
+        buf_mult = 1.0 - (buf_bps / 10_000.0)
 
         while not self.stop_event.is_set():
             try:
+                # 1) fetch positions
                 pos_map = self.ex.fetch_positions_map() or {}
                 if not pos_map:
+                    # Clear perpos if nothing is open
                     if self.state.get("perpos"):
                         self.state["perpos"] = {}
                     time.sleep(fast_s)
                     continue
 
+                # 2) iterate open positions
                 for sym, p in list(pos_map.items()):
+                    # skip logic is not needed here for cooldown (cooldown only blocks re-entries)
                     try:
                         qty = float(p.get("contracts") or p.get("positionAmt") or p.get("contractsSize") or 0.0)
                         side = p.get("side")
@@ -209,53 +251,78 @@ class FastSLTPThread(threading.Thread):
                     except Exception:
                         qty = 0.0
                     if qty == 0.0:
+                        # clear state if any
                         if self.state.get("perpos", {}).get(sym):
                             self.state["perpos"].pop(sym, None)
                         continue
 
+                    # 3) refresh OHLCV/ATR for this symbol at most once per ~60s
                     need_ohlcv = (self._now_ts() - self._last_ohlcv_ts.get(sym, 0)) > 55
                     if need_ohlcv:
-                        raw = self.ex.fetch_ohlcv(sym, timeframe=stop_tf, limit=max(60, atr_len * 5))
-                        if not raw:
+                        raw = self.ex.fetch_ohlcv(sym, timeframe=stop_tf, limit=max(120, atr_len * 6))
+                        if not raw or len(raw) < max(20, atr_len + 5):
                             continue
                         df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
                         df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
                         df.set_index("dt", inplace=True)
-                        if len(df) < max(20, atr_len + 5):
-                            continue
                         atr_series = compute_atr(df, n=atr_len, method="rma")
+                        # cache current last (may be forming) and the last CLOSED bar
                         last_bar = df.iloc[-1].copy()
+                        closed_bar = df.iloc[-2].copy() if len(df) >= 2 else last_bar.copy()
                         last_bar["_atr"] = float(atr_series.iloc[-1])
+                        closed_bar["_atr"] = float(atr_series.iloc[-2]) if len(atr_series) >= 2 else float(atr_series.iloc[-1])
                         self._last_ohlcv_ts[sym] = self._now_ts()
-                        self._last_bar_cache = getattr(self, "_last_bar_cache", {})
                         self._last_bar_cache[sym] = last_bar
+                        self._last_closed_cache[sym] = closed_bar
                     else:
-                        last_bar = getattr(self, "_last_bar_cache", {}).get(sym)
+                        last_bar = self._last_bar_cache.get(sym)
+                        closed_bar = self._last_closed_cache.get(sym) or last_bar
                         if last_bar is None:
+                            # force refresh if cache empty
                             self._last_ohlcv_ts[sym] = 0
                             continue
 
+                    # 4) latest last price
                     try:
                         t = self.ex.x.fetch_ticker(sym)
                         last_px = float(t.get("last") or t.get("close"))
                     except Exception:
                         last_px = float(last_bar["close"])
-                    lr = last_bar.copy()
-                    lr["last"] = last_px
 
+                    # entry price
                     try:
                         entry_px = p.get("entryPrice") or p.get("averagePrice") or p.get("avgPrice")
                         entry_px = float(entry_px) if entry_px else None
                     except Exception:
                         entry_px = None
 
-                    self._init_or_update_perpos(sym, qty, lr, lr["_atr"], entry_px)
+                    # 5) ensure perpos exists/updated (trail uses *closed* bar if close-only)
+                    lr_for_trail = closed_bar if close_only else last_bar
+                    self._init_or_update_perpos(sym, qty, lr_for_trail, lr_for_trail["_atr"], entry_px)
 
-                    stop_px = self._compute_stop_px(sym, lr)
+                    # 6) compute stop price, then check cross
+                    #    - if close_only: evaluate using CLOSED bar close/high/low
+                    #    - else: evaluate using last tick vs stop
+                    stop_ref_bar = closed_bar if close_only else last_bar
+                    stop_px = self._compute_stop_px(sym, stop_ref_bar)
                     if stop_px is not None:
                         long_pos = qty > 0
-                        stop_hit = (last_px <= stop_px) if long_pos else (last_px >= stop_px)
-                        if stop_hit:
+                        if close_only:
+                            # Use closed bar close with buffer
+                            px_close = float(stop_ref_bar["close"])
+                            if long_pos:
+                                trigger = px_close <= stop_px * buf_mult
+                            else:
+                                # buffer for shorts: require close >= stop * (1 + buf)
+                                trigger = px_close >= stop_px / buf_mult
+                        else:
+                            # Tick-based with buffer
+                            if long_pos:
+                                trigger = float(last_px) <= stop_px * buf_mult
+                            else:
+                                trigger = float(last_px) >= stop_px / buf_mult
+
+                        if trigger:
                             q = abs(qty)
                             q, _ = self.ex.quantize(sym, q, None)
                             if q > 0:
@@ -264,10 +331,14 @@ class FastSLTPThread(threading.Thread):
                                 else:
                                     self.ex.create_order_safe(sym, "sell" if long_pos else "buy", q, None, post_only=False, reduce_only=True)
                                     log.info(f"[LIVE-FAST-STOP] {sym}: {'sell' if long_pos else 'buy'} {q} @ mkt (SL {stop_px:.6g})")
+                            # clear perpos after exit and set cooldown
                             self.state.get("perpos", {}).pop(sym, None)
+                            self._set_cooldown(sym)
+                            # move on to next position
                             continue
 
-                    self._maybe_partial_tp(sym, qty, lr)
+                    # 7) partial take profit (always uses last_px)
+                    self._maybe_partial_tp(sym, qty, last_px, stop_ref_bar)
 
                 time.sleep(fast_s)
             except Exception as e:
@@ -288,10 +359,15 @@ def run_live(cfg: AppConfig, dry: bool):
             "trading_paused_until": None,
             "universe": [],
             "last_universe_refresh": None,
-            "perpos": {},
+            "perpos": {},    # {sym: {sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done}}
+            "cooldowns": {}, # {sym: ISO8601 until}
         },
     )
+    # Ensure keys exist for older state files
+    state.setdefault("perpos", {})
+    state.setdefault("cooldowns", {})
 
+    # start fast SL/TP thread if enabled
     stop_evt = threading.Event()
     fast_thread: Optional[FastSLTPThread] = None
     try:
@@ -299,6 +375,7 @@ def run_live(cfg: AppConfig, dry: bool):
             fast_thread = FastSLTPThread(ex, cfg, state, dry, stop_evt)
             fast_thread.start()
 
+        # Bootstrap universe at startup
         refresh_universe(ex, state, state_path)
         log.info(f"Initial universe: {len(state.get('universe', []))} symbols")
 
@@ -450,16 +527,6 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.warning(f"Regime filter calc failed (not blocking): {e}")
 
-            # Funding tilt fetch (optional)
-            funding_map: Dict[str, float] = {}
-            try:
-                if getattr(cfg.strategy.funding_tilt, "enabled", False):
-                    symbols_for_funding = list(closes.columns)
-                    funding_map = ex.fetch_funding_rates(symbols_for_funding) or {}
-            except Exception as e:
-                log.debug(f"Funding rates fetch failed: {e}")
-                funding_map = {}
-
             # Targets
             try:
                 t_targets_start = perf_counter()
@@ -474,16 +541,6 @@ def run_live(cfg: AppConfig, dry: bool):
                     cfg.strategy.gross_leverage,
                     cfg.strategy.max_weight_per_asset,
                     dynamic_k_fn=lambda sc, kmin, kmax: (kmin, kmax),
-                    funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, "enabled", False) else None,
-                    funding_weight=float(getattr(cfg.strategy.funding_tilt, "weight", 0.0)) if getattr(cfg.strategy.funding_tilt, "enabled", False) else 0.0,
-                    entry_zscore_min=float(getattr(cfg.strategy, "entry_zscore_min", 0.0)),
-                    diversify_enabled=bool(getattr(cfg.strategy.diversify, "enabled", False)),
-                    corr_lookback=int(getattr(cfg.strategy.diversify, "corr_lookback", 48)),
-                    max_pair_corr=float(getattr(cfg.strategy.diversify, "max_pair_corr", 0.9)),
-                    vol_target_enabled=bool(getattr(cfg.strategy.vol_target, "enabled", False)),
-                    target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, "target_daily_vol_bps", 0.0)),
-                    vol_target_min_scale=float(getattr(cfg.strategy.vol_target, "min_scale", 0.5)),
-                    vol_target_max_scale=float(getattr(cfg.strategy.vol_target, "max_scale", 2.0)),
                 )
                 t_targets = perf_counter() - t_targets_start
                 log.info(f"Targets built for {len(targets)} symbols in {t_targets:.2f}s")
@@ -579,25 +636,35 @@ def run_live(cfg: AppConfig, dry: bool):
             except Exception as e:
                 log.debug(f"Leverage loop failed (ignored): {e}")
 
-            # Orders for rebalance (respect PnL gate + dust)
+            # Orders for rebalance (respect PnL gate & cooldown)
             t_ord_start = perf_counter()
             orders = []
             try:
-                min_notional = float(getattr(cfg.execution, "min_order_notional_usdt", 0.0) or 0.0)
+                cooldowns = state.get("cooldowns", {}) or {}
                 for s in targets.index:
+                    # Skip opening new exposure during cooldown (reductions allowed)
+                    try:
+                        cd_iso = cooldowns.get(s)
+                        in_cooldown = False
+                        if cd_iso:
+                            until = datetime.fromisoformat(cd_iso).replace(tzinfo=timezone.utc)
+                            in_cooldown = utcnow() < until
+                    except Exception:
+                        in_cooldown = False
+
                     tgt = float(qtys.get(s, 0.0))
                     cur = float(current_qtys.get(s, 0.0))
+
+                    # If cooldown and trying to go from flat to non-flat or flip, block
+                    if in_cooldown and ((cur == 0.0 and tgt != 0.0) or (np.sign(tgt) != np.sign(cur) and tgt != 0.0)):
+                        log.info(f"Cooldown active for {s}; skipping new/open/flip. Until={cooldowns.get(s)}")
+                        continue
+
                     diff = tgt - cur
                     if abs(diff) < 1e-8:
                         continue
                     side = "buy" if diff > 0 else "sell"
                     px = prices.get(s)
-                    if px:
-                        notional_try = abs(diff) * float(px)
-                        if min_notional > 0 and notional_try < min_notional:
-                            log.info(f"Skip dust rebalance {s}: notional {notional_try:.2f} < {min_notional:.2f}")
-                            continue
-
                     order_px = None
                     if isinstance(px, (int, float)) and cfg.execution.order_type.lower() == "limit":
                         sign = 1 if side == "buy" else -1

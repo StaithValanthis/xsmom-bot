@@ -1,6 +1,5 @@
 from typing import List, Optional
 from pydantic import BaseModel, Field
-import yaml
 
 class ExchangeCfg(BaseModel):
     id: str = "bybit"
@@ -14,7 +13,6 @@ class ExchangeCfg(BaseModel):
     min_price: float = 0.005
     timeframe: str = "1h"
     candles_limit: int = 1200
-    ohlcv_pause_ms: int = 0
 
 class RegimeFilterCfg(BaseModel):
     enabled: bool = False
@@ -25,17 +23,6 @@ class FundingTiltCfg(BaseModel):
     enabled: bool = False
     weight: float = 0.2
 
-class DiversifyCfg(BaseModel):
-    enabled: bool = False
-    corr_lookback: int = 48
-    max_pair_corr: float = 0.9
-
-class VolTargetCfg(BaseModel):
-    enabled: bool = False
-    target_daily_vol_bps: float = 0.0   # e.g. 80 bps/day
-    min_scale: float = 0.5
-    max_scale: float = 2.0
-
 class StrategyCfg(BaseModel):
     lookbacks: List[int] = Field(default_factory=lambda: [1, 6, 24])
     lookback_weights: List[float] = Field(default_factory=lambda: [1.0, 1.0, 1.0])
@@ -45,11 +32,8 @@ class StrategyCfg(BaseModel):
     market_neutral: bool = True
     gross_leverage: float = 2.0
     max_weight_per_asset: float = 0.10
-    entry_zscore_min: float = 0.0
     regime_filter: RegimeFilterCfg = RegimeFilterCfg()
     funding_tilt: FundingTiltCfg = FundingTiltCfg()
-    diversify: DiversifyCfg = DiversifyCfg()
-    vol_target: VolTargetCfg = VolTargetCfg()
 
 class LiquidityCfg(BaseModel):
     adv_cap_pct: float = 0.004
@@ -61,33 +45,39 @@ class ExecutionCfg(BaseModel):
     price_offset_bps: int = 5
     slippage_bps_guard: int = 25
     set_leverage: int = 3
-    rebalance_minute: int = 5
+    rebalance_minute: int = 15    # calmer default vs 5
     poll_seconds: int = 15
     align_after_funding_minutes: int = 0
     funding_hours_utc: List[int] = Field(default_factory=lambda: [0, 8, 16])
-    min_order_notional_usdt: float = 5.0
 
 class RiskCfg(BaseModel):
-    # Stop/TP sizing
-    atr_len: int = 14
-    atr_mult_sl: float = 2.5
-    atr_mult_tp: float = 4.0
-    use_tp: bool = False
+    # Stop/TP sizing (calmer)
+    atr_len: int = 21
+    atr_mult_sl: float = 2.2
+    atr_mult_tp: float = 3.8
+    use_tp: bool = True
 
     # Fast loop controls
-    fast_check_seconds: int = 0        # 0 disables fast loop
-    stop_timeframe: str = "1m"
+    fast_check_seconds: int = 2
+    stop_timeframe: str = "3m"
     trailing_enabled: bool = True
-    trail_atr_mult: float = 2.5
-    breakeven_after_r: float = 0.0
+    trail_atr_mult: float = 2.2
+    breakeven_after_r: float = 1.5
+
+    # Wick resistance (NEW)
+    stop_on_close_only: bool = True
+    stop_buffer_bps: float = 8.0
+    cooldown_minutes_after_stop: int = 30
+
+    # Partials
     partial_tp_enabled: bool = True
-    partial_tp_r: float = 1.5
+    partial_tp_r: float = 2.0
     partial_tp_size: float = 0.5
 
     # Kill switch & churn gate
-    max_daily_loss_pct: float = 3.0
-    trade_disable_minutes: int = 1440
-    min_close_pnl_pct: float = 0.0
+    max_daily_loss_pct: float = 5.0
+    trade_disable_minutes: int = 120
+    min_close_pnl_pct: float = 1.0
 
 class CostsCfg(BaseModel):
     taker_fee_bps: float = 7.0
@@ -114,8 +104,8 @@ class AppConfig(BaseModel):
     paths: PathsCfg = PathsCfg()
     logging: LoggingCfg = LoggingCfg()
 
-def load_config(path: str) -> AppConfig:
+def load_config(path: str) -> "AppConfig":
     import yaml
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
-    return AppConfig(**raw or {})
+    return AppConfig(**(raw or {}))
