@@ -1,14 +1,12 @@
-# v1.2.0 – 2025-08-21
+# v1.4.1 – 2025-08-22
 from __future__ import annotations
-from typing import List, Optional
+from typing import List
 from pydantic import BaseModel, Field
 import yaml
 
-# ===== Sub-configs =====
-
 class ExchangeCfg(BaseModel):
     id: str = "bybit"
-    account_type: str = "swap"      # "swap" or "spot"
+    account_type: str = "swap"
     quote: str = "USDT"
     only_perps: bool = True
     unified_margin: bool = True
@@ -23,8 +21,8 @@ class ExchangeCfg(BaseModel):
 class RegimeFilterCfg(BaseModel):
     enabled: bool = True
     ema_len: int = 200
-    slope_min_bps_per_day: float = 0.0  # UNBLOCK: allow flat slope
-    use_abs: bool = False               # if True, gate on |slope|
+    slope_min_bps_per_day: float = 2.0
+    use_abs: bool = True
 
 class FundingTiltCfg(BaseModel):
     enabled: bool = True
@@ -33,81 +31,95 @@ class FundingTiltCfg(BaseModel):
 class DiversifyCfg(BaseModel):
     enabled: bool = True
     corr_lookback: int = 96
-    max_pair_corr: float = 0.75
+    max_pair_corr: float = 0.60
 
 class VolTargetCfg(BaseModel):
     enabled: bool = True
-    target_daily_vol_bps: float = 80.0
+    target_daily_vol_bps: float = 60.0
     min_scale: float = 0.6
-    max_scale: float = 1.3
+    max_scale: float = 1.2
+
+class EntryThrottleCfg(BaseModel):
+    max_new_positions_per_cycle: int = 2
+    max_open_positions: int = 8
+    per_symbol_trade_cooldown_min: int = 60
+    min_entry_zscore: float = 0.6
+
+class SoftKillCfg(BaseModel):
+    enabled: bool = True
+    soft_daily_loss_pct: float = 1.5
+    resume_after_minutes: int = 240
 
 class StrategyCfg(BaseModel):
     lookbacks: List[int] = Field(default_factory=lambda: [1, 6, 24])
     lookback_weights: List[float] = Field(default_factory=lambda: [1.0, 1.0, 1.0])
     vol_lookback: int = 72
 
-    k_min: int = 4       # UNBLOCK: smaller K bounds for small equity
-    k_max: int = 10
+    k_min: int = 2
+    k_max: int = 6
 
     market_neutral: bool = True
-    gross_leverage: float = 1.25
-    max_weight_per_asset: float = 0.16
+    gross_leverage: float = 1.10
+    max_weight_per_asset: float = 0.14
 
     regime_filter: RegimeFilterCfg = RegimeFilterCfg()
     funding_tilt: FundingTiltCfg = FundingTiltCfg()
 
-    # Entry quality gating
-    entry_zscore_min: float = 0.20
-
+    entry_zscore_min: float = 0.4
     diversify: DiversifyCfg = DiversifyCfg()
     vol_target: VolTargetCfg = VolTargetCfg()
 
+    entry_throttle: EntryThrottleCfg = EntryThrottleCfg()
+    soft_kill: SoftKillCfg = SoftKillCfg()
+
 class LiquidityCfg(BaseModel):
     adv_cap_pct: float = 0.002
-    notional_cap_usdt: float = 80.0  # small acct cap
+    notional_cap_usdt: float = 70.0
 
 class ExecutionCfg(BaseModel):
-    order_type: str = "market"      # "market" (initially to verify flow), later you can switch to "limit"
-    post_only: bool = False
-    price_offset_bps: int = 0       # for limit mode; 0 when market
+    order_type: str = "limit"
+    post_only: bool = True
+    price_offset_bps: int = 3
     slippage_bps_guard: int = 25
     set_leverage: int = 3
 
-    rebalance_minute: int = 0       # UNBLOCK: don’t delay after funding, trade right away
+    rebalance_minute: int = 5
     poll_seconds: int = 15
     align_after_funding_minutes: int = 0
     funding_hours_utc: List[int] = Field(default_factory=lambda: [0, 8, 16])
 
-    # small-account churn guards
-    min_notional_per_order_usdt: float = 10.0
-    min_rebalance_delta_bps: float = 40.0   # 0.40% equity delta
+    min_notional_per_order_usdt: float = 15.0
+    min_rebalance_delta_bps: float = 60.0
+
+    # NEW: documented, but the bot now reconciles regardless (safety first)
+    reload_positions_on_start: bool = True
 
 class RiskCfg(BaseModel):
-    # Stop/TP sizing (use Wilder ATR; see signals.compute_atr(method="rma"))
     atr_len: int = 28
-    atr_mult_sl: float = 2.8
-    atr_mult_tp: float = 4.0
+    atr_mult_sl: float = 3.2
+    atr_mult_tp: float = 4.2
     use_tp: bool = True
 
-    # Fast SL/TP loop
     fast_check_seconds: int = 2
     stop_timeframe: str = "5m"
     trailing_enabled: bool = True
-    trail_atr_mult: float = 2.6
+    trail_atr_mult: float = 3.0
     breakeven_after_r: float = 2.0
 
     stop_on_close_only: bool = True
     stop_buffer_bps: float = 10.0
-    cooldown_minutes_after_stop: int = 45
+    cooldown_minutes_after_stop: int = 90
 
-    partial_tp_enabled: bool = False
+    partial_tp_enabled: bool = True
+    partial_tp_r: float = 2.5
+    partial_tp_size: float = 0.5
 
-    # Governance
-    max_daily_loss_pct: float = 3.5
-    trade_disable_minutes: int = 180
+    # HARD kill-switch (can trail from intraday high)
+    max_daily_loss_pct: float = 3.0
+    trade_disable_minutes: int = 360
+    use_trailing_killswitch: bool = True  # measure DD from day_high_equity
+
     min_close_pnl_pct: float = 2.0
-
-    # Time-based exit
     max_hours_in_trade: int = 48
 
 class CostsCfg(BaseModel):

@@ -17,83 +17,93 @@ strategy:
   lookback_weights: [1.0, 1.0, 1.0]
   vol_lookback: 72
 
-  k_min: 4
-  k_max: 10
+  k_min: 2
+  k_max: 6
 
   market_neutral: true
-  gross_leverage: 1.25
-  max_weight_per_asset: 0.16
+  gross_leverage: 1.10
+  max_weight_per_asset: 0.14
 
   regime_filter:
     enabled: true
     ema_len: 200
-    slope_min_bps_per_day: 0     # UNBLOCK
+    slope_min_bps_per_day: 2.0
+    use_abs: true
 
   funding_tilt:
     enabled: true
     weight: 0.15
 
-  entry_zscore_min: 0.2
+  entry_zscore_min: 0.4
 
   diversify:
     enabled: true
     corr_lookback: 96
-    max_pair_corr: 0.75
+    max_pair_corr: 0.60
 
   vol_target:
     enabled: true
-    target_daily_vol_bps: 80
+    target_daily_vol_bps: 60
     min_scale: 0.6
-    max_scale: 1.3
+    max_scale: 1.2
+
+  entry_throttle:
+    max_new_positions_per_cycle: 2
+    max_open_positions: 8
+    per_symbol_trade_cooldown_min: 60
+    min_entry_zscore: 0.6
+
+  soft_kill:
+    enabled: true
+    soft_daily_loss_pct: 1.5
+    resume_after_minutes: 240
 
 liquidity:
   adv_cap_pct: 0.002
-  notional_cap_usdt: 80
+  notional_cap_usdt: 70
 
 execution:
-  order_type: market          # First run as market to confirm entries happen
-  post_only: false
-  price_offset_bps: 0
+  reload_positions_on_start: true
+  order_type: limit
+  post_only: true
+  price_offset_bps: 3
   slippage_bps_guard: 25
   set_leverage: 3
 
-  rebalance_minute: 0
+  rebalance_minute: 5
   poll_seconds: 15
   align_after_funding_minutes: 0
   funding_hours_utc: [0, 8, 16]
 
-  min_notional_per_order_usdt: 10
-  min_rebalance_delta_bps: 40
+  min_notional_per_order_usdt: 15
+  min_rebalance_delta_bps: 60
 
 risk:
   atr_len: 28
-  atr_mult_sl: 2.8
-  atr_mult_tp: 4.0
+  atr_mult_sl: 3.2
+  atr_mult_tp: 4.2
   use_tp: true
 
   fast_check_seconds: 2
   stop_timeframe: "5m"
   trailing_enabled: true
-  trail_atr_mult: 2.6
+  trail_atr_mult: 3.0
   breakeven_after_r: 2.0
 
   stop_on_close_only: true
   stop_buffer_bps: 10
-  cooldown_minutes_after_stop: 45
+  cooldown_minutes_after_stop: 90
 
-  partial_tp_enabled: false
+  partial_tp_enabled: true
+  partial_tp_r: 2.5
+  partial_tp_size: 0.5
 
-  max_daily_loss_pct: 3.5
-  trade_disable_minutes: 180
+  max_daily_loss_pct: 3.0
+  trade_disable_minutes: 360
+  use_trailing_killswitch: true  
   min_close_pnl_pct: 2.0
 
   max_hours_in_trade: 48
-
-costs:
-  taker_fee_bps: 6.0
-  maker_fee_bps: 0.0
-  slippage_bps: 6.0
-  funding_bps_per_day: 1.0
 
 paths:
   state_path: "state/state.json"
