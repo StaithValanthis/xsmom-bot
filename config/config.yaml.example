@@ -4,7 +4,7 @@ exchange:
   quote: USDT
   only_perps: true
   unified_margin: true
-  testnet: false
+  testnet: false  
 
   max_symbols: 36
   min_usd_volume_24h: 30000000
@@ -77,6 +77,8 @@ execution:
 
   min_notional_per_order_usdt: 15
   min_rebalance_delta_bps: 60
+
+  cancel_open_orders_on_start: true
 
 risk:
   atr_len: 28

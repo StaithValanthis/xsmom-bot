@@ -1,72 +1,70 @@
-# v1.2.2 – 2025-08-21
+# v1.6.2 – 2025-08-22 (CCXT-only; cleaned; startup-safe helpers kept)
 from __future__ import annotations
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import ccxt
 from tenacity import retry, stop_after_attempt, wait_exponential
-
 from .config import ExchangeCfg
 
 log = logging.getLogger("exchange")
 
+
 class ExchangeWrapper:
+    """
+    CCXT-only unified wrapper for Bybit USDT-perp.
+    Public methods stable for live.py/backtester.
+    """
+
     def __init__(self, cfg: ExchangeCfg):
         self.cfg = cfg
+
+        # ---- API keys from env (unchanged) ----
         api_key = os.getenv("BYBIT_API_KEY") or os.getenv("API_KEY")
         secret = os.getenv("BYBIT_API_SECRET") or os.getenv("API_SECRET")
-
         if not api_key or not secret:
-            log.warning(
-                "API keys missing. Private endpoints (balances, orders) will fail; equity will appear as 0. "
-                "Set them in .env or export them before running."
-            )
+            log.warning("API keys missing. Private endpoints may fail; equity may appear as 0.")
 
         klass = getattr(ccxt, cfg.id)
-        self.x = klass(
-            {
-                "apiKey": api_key,
-                "secret": secret,
-                "enableRateLimit": True,
-                "timeout": 20000,
-                "options": {
-                    "defaultType": "swap" if cfg.account_type == "swap" else "spot",
-                },
-            }
-        )
-
-        # Bybit Unified Trading Account (UTA)
-        self.unified_margin = bool(getattr(cfg, "unified_margin", False))
-        if self.x.id == "bybit" and self.unified_margin:
-            opts = getattr(self.x, "options", {}) or {}
-            opts.update(
-                {
-                    "defaultType": "swap",
-                    "accountType": "UNIFIED",
-                    "fetchBalance": {"accountType": "UNIFIED", "coin": self.cfg.quote},
-                }
-            )
-            self.x.options = opts
-
-        # testnet toggle
+        self.x = klass({
+            "apiKey": api_key,
+            "secret": secret,
+            "enableRateLimit": True,
+            "timeout": 20000,
+            "options": {
+                "defaultType": "swap" if cfg.account_type == "swap" else "spot",
+            },
+        })
         if cfg.testnet and hasattr(self.x, "set_sandbox_mode"):
             self.x.set_sandbox_mode(True)
 
+        # Bybit UTA hints
+        self.unified_margin = bool(getattr(cfg, "unified_margin", False))
+        if self.x.id == "bybit" and self.unified_margin:
+            opts = getattr(self.x, "options", {}) or {}
+            opts.update({
+                "defaultType": "swap",
+                "accountType": "UNIFIED",
+                "fetchBalance": {"accountType": "UNIFIED", "coin": self.cfg.quote},
+            })
+            self.x.options = opts
+
+        try:
+            self.x.load_markets()
+        except Exception as e:
+            log.warning(f"load_markets failed: {e}")
+
         log.info(
-            f"CCXT init: id={self.x.id}, testnet={getattr(self.x, 'sandbox', False)}, "
-            f"defaultType={getattr(self.x, 'options', {}).get('defaultType')}, "
-            f"accountType={getattr(self.x, 'options', {}).get('accountType')}, "
-            f"unified_margin={self.unified_margin}"
+            "CCXT init: id=%s, testnet=%s, defaultType=%s, accountType=%s, unified_margin=%s",
+            self.x.id,
+            bool(getattr(self.x, 'sandbox', False)),
+            getattr(self.x, 'options', {}).get('defaultType'),
+            getattr(self.x, 'options', {}).get('accountType'),
+            self.unified_margin,
         )
 
-    def close(self):
-        try:
-            self.x.close()
-        except Exception:
-            pass
-
-    # -------- Markets / Universe --------
+    # ------------------------ Markets / Universe ------------------------
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
     def load_markets(self):
@@ -79,7 +77,6 @@ class ExchangeWrapper:
         for sym, m in markets.items():
             if m.get("active") is not True:
                 continue
-
             if self.cfg.only_perps:
                 if (m.get("swap") is True) and m.get("quote") == self.cfg.quote:
                     if m.get("type") == "swap" or m.get("contract", False):
@@ -93,7 +90,6 @@ class ExchangeWrapper:
             log.warning("No symbols after basic market filters.")
             return symbols
 
-        # Liquidity filter via 24h quote volume
         try:
             ticks = self.x.fetch_tickers(symbols)
         except Exception as e:
@@ -114,59 +110,47 @@ class ExchangeWrapper:
         log.info(f"Universe after filters: {len(keep)} symbols")
         return keep
 
-    # -------- Market Data --------
+    # ------------------------ Market Data ------------------------
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int):
         return self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
-    def fetch_tickers(self, symbols: List[str]) -> Dict[str, dict]:
+    def fetch_tickers(self, symbols: Iterable[str]) -> Dict[str, dict]:
+        syms = list(symbols)
         try:
-            return self.x.fetch_tickers(symbols)
+            return self.x.fetch_tickers(syms)
         except Exception as e:
             log.debug(f"fetch_tickers error: {e}")
             return {}
-
-    def fetch_price(self, symbol: str) -> Optional[float]:
-        try:
-            t = self.x.fetch_ticker(symbol)
-            px = t.get("last") or t.get("close")
-            return float(px) if px is not None else None
-        except Exception as e:
-            log.debug(f"fetch_price error {symbol}: {e}")
-            return None
 
     def fetch_funding_rates(self, symbols: List[str]) -> Dict[str, float]:
         out: Dict[str, float] = {}
         try:
             if hasattr(self.x, "fetch_funding_rates"):
                 data = self.x.fetch_funding_rates(symbols)
-            elif hasattr(self.x, "fetch_funding_rate"):
-                data = [self.x.fetch_funding_rate(s) for s in symbols]
-            else:
-                return out
-            for d in data or []:
-                try:
+                for d in data or []:
                     sym = d.get("symbol")
                     rate = float(d.get("fundingRate") or 0.0)
                     if sym:
                         out[sym] = rate
-                except Exception:
-                    pass
+            elif hasattr(self.x, "fetch_funding_rate"):
+                for s in symbols:
+                    d = self.x.fetch_funding_rate(s)
+                    out[s] = float(d.get("fundingRate") or 0.0)
         except Exception as e:
             log.debug(f"fetch_funding_rates failed: {e}")
         return out
 
-    # -------- Account / Positions --------
+    # ------------------------ Account / Positions ------------------------
 
     def get_equity_usdt(self) -> float:
-        """Returns total account equity denominated in USDT (best-effort)."""
         try:
             bal = self.x.fetch_balance(params={"accountType": "UNIFIED"} if self.unified_margin else {})
             total = bal.get("total", {})
             usdt_equity = float(total.get("USDT", 0.0))
             if usdt_equity == 0.0:
-                # fallback for some ccxt versions
+                # Try Bybit unified balance path structure
                 usdt_equity = float(bal.get("info", {}).get("result", {}).get("list", [{}])[0].get("totalEquity", 0.0))
             return max(0.0, usdt_equity)
         except Exception as e:
@@ -174,14 +158,6 @@ class ExchangeWrapper:
             return 0.0
 
     def fetch_positions(self) -> Dict[str, dict]:
-        """
-        Consolidate per-symbol long/short into a single net position:
-          result[symbol] = {
-            'long_qty', 'short_qty', 'net_qty',
-            'entryPrice_long', 'entryPrice_short', 'entryPrice' (dominant side)
-          }
-        Works around exchanges (e.g., Bybit UTA) that return two rows per symbol.
-        """
         consolidated: Dict[str, dict] = {}
         try:
             raw = self.x.fetch_positions() or []
@@ -189,60 +165,38 @@ class ExchangeWrapper:
                 s = p.get("symbol")
                 if not s:
                     continue
-                side = (p.get("side") or "").lower()  # 'long' / 'short' / maybe ''
+                side = (p.get("side") or "").lower()
                 qty = float(p.get("contracts") or p.get("contractSize") or p.get("positionAmt") or 0.0)
-                if qty == 0:
-                    # some adapters put signed qty in 'contracts' with side="long", keep positive
-                    # still record entry price if needed
-                    pass
                 ep = None
                 try:
                     ep = float(p.get("entryPrice") or 0.0) or None
                 except Exception:
                     ep = None
-
                 c = consolidated.setdefault(
                     s,
-                    {
-                        "long_qty": 0.0,
-                        "short_qty": 0.0,
-                        "net_qty": 0.0,
-                        "entryPrice_long": None,
-                        "entryPrice_short": None,
-                        "entryPrice": None,
-                    },
+                    {"long_qty": 0.0, "short_qty": 0.0, "net_qty": 0.0, "entryPrice": None},
                 )
-
                 if side == "long":
                     c["long_qty"] += abs(qty)
-                    if ep:
-                        c["entryPrice_long"] = ep
                 elif side == "short":
                     c["short_qty"] += abs(qty)
-                    if ep:
-                        c["entryPrice_short"] = ep
                 else:
-                    # Some brokers provide signed qty without side
                     if qty > 0:
                         c["long_qty"] += abs(qty)
-                        if ep:
-                            c["entryPrice_long"] = ep
                     elif qty < 0:
                         c["short_qty"] += abs(qty)
-                        if ep:
-                            c["entryPrice_short"] = ep
-
-            # finalize
+                if ep:
+                    c["entryPrice"] = ep
             for s, c in consolidated.items():
                 c["net_qty"] = float(c["long_qty"]) - float(c["short_qty"])
-                c["entryPrice"] = c["entryPrice_long"] if c["net_qty"] > 0 else (c["entryPrice_short"] if c["net_qty"] < 0 else None)
-
+                if c["entryPrice"] is None:
+                    c["entryPrice"] = 0.0
             return consolidated
         except Exception as e:
             log.debug(f"fetch_positions error: {e}")
             return consolidated
 
-    # -------- Trading --------
+    # ------------------------ Trading ------------------------
 
     def set_leverage(self, symbol: str, lev: int):
         try:
@@ -265,25 +219,54 @@ class ExchangeWrapper:
         post_only: bool = False,
         reduce_only: bool = False,
     ):
-        """Wraps CCXT order APIs sanely across modes."""
-        side = side.lower()
         if abs(size) <= 0:
             return None
 
-        params = {"reduceOnly": reduce_only}
-        if self.cfg.account_type == "swap":
-            # ensure futures/swap createOrder
-            if price is None:
-                # market
-                return self.x.create_order(symbol, "market", side, abs(size), None, params)
+        params: Dict[str, Any] = {"reduceOnly": reduce_only}
+        try:
+            if self.cfg.account_type == "swap":
+                if price is None:
+                    return self.x.create_order(symbol, "market", side.lower(), abs(size), None, params)
+                else:
+                    params["postOnly"] = post_only
+                    return self.x.create_order(symbol, "limit", side.lower(), abs(size), float(price), params)
             else:
-                # limit
-                params["postOnly"] = post_only
-                return self.x.create_order(symbol, "limit", side, abs(size), float(price), params)
-        else:
-            # spot fallback
-            if price is None:
-                return self.x.create_market_order(symbol, side, abs(size), params=params)
-            else:
-                params["postOnly"] = post_only
-                return self.x.create_limit_order(symbol, side, abs(size), float(price), params)
+                if price is None:
+                    return self.x.create_market_order(symbol, side.lower(), abs(size), params=params)
+                else:
+                    params["postOnly"] = post_only
+                    return self.x.create_limit_order(symbol, side.lower(), abs(size), float(price), params)
+        except Exception as e:
+            log.debug(f"create_order failed: {e}")
+            raise
+
+    # ---- Open Orders helpers (used by startup cancel and ops) ----
+
+    def fetch_open_orders(self, symbol: Optional[str] = None) -> List[dict]:
+        try:
+            return self.x.fetch_open_orders(symbol)
+        except Exception as e:
+            log.debug(f"fetch_open_orders failed: {e}")
+            return []
+
+    def cancel_order_safe(self, order_id: str, symbol: str) -> None:
+        try:
+            self.x.cancel_order(order_id, symbol)
+        except Exception as e:
+            log.debug(f"cancel_order_safe({order_id}, {symbol}) failed: {e}")
+            raise
+
+    def cancel_all_orders(self, symbol: Optional[str] = None) -> Any:
+        try:
+            return self.x.cancel_all_orders(symbol)
+        except Exception as e:
+            log.debug(f"cancel_all_orders failed: {e}")
+            raise
+
+    # ------------------------ Cleanup ------------------------
+
+    def close(self):
+        try:
+            self.x.close()
+        except Exception:
+            pass

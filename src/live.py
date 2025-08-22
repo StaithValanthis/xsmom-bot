@@ -1,4 +1,4 @@
-# v1.4.1 – 2025-08-22
+# v1.4.2 – 2025-08-22 (startup cancel-all hook behind a flag; CCXT-only backend)
 from __future__ import annotations
 import logging
 import threading
@@ -21,14 +21,6 @@ log = logging.getLogger("live")
 # -------------------- FAST EVENT-DRIVEN SL/TP THREAD --------------------
 
 class FastSLTPThread(threading.Thread):
-    """
-    Poll-based 'event-driven' SL/TP enforcement:
-      - Every fast_check_seconds: read open positions, last price, compare to stop levels.
-      - Every ~60s (per symbol): refresh lower-tf OHLCV to recompute ATR & trailing anchors.
-
-    Maintains state["perpos"][sym] = {sign, entry_price, entry_atr, trail_hh, trail_ll, partial_done}
-    Also uses state["enter_bar_time"][sym] (ISO string) for time-based exits.
-    """
     def __init__(self, ex: ExchangeWrapper, cfg: AppConfig, state: dict, dry: bool, stop_event: threading.Event):
         super().__init__(daemon=True)
         self.ex = ex
@@ -105,13 +97,11 @@ class FastSLTPThread(threading.Thread):
     def run(self):
         if self.cfg.risk.fast_check_seconds <= 0:
             return
-
         tf = getattr(self.cfg.risk, "stop_timeframe", "5m")
 
         while not self.stop_event.is_set():
             try:
                 time.sleep(max(1, int(self.cfg.risk.fast_check_seconds)))
-
                 pos = self.ex.fetch_positions()
                 if not pos:
                     continue
@@ -122,7 +112,7 @@ class FastSLTPThread(threading.Thread):
                         continue
                     side = "long" if qty > 0 else "short"
 
-                    nowts = self._now_ts()
+                    nowts = float(time.time())
                     if nowts - float(self._last_ohlcv_ts.get(sym, 0.0)) > 55.0:
                         try:
                             bars = self.ex.fetch_ohlcv(sym, tf, limit=max(50, self.cfg.risk.atr_len + 5))
@@ -154,7 +144,7 @@ class FastSLTPThread(threading.Thread):
                     R = abs(last - ep) / (atr if atr > 1e-12 else 1.0)
 
                     if self.cfg.risk.breakeven_after_r > 0 and R >= self.cfg.risk.breakeven_after_r:
-                        pass  # handled by trail buffer
+                        pass
 
                     self._maybe_partial_tp(sym, qty, R)
 
@@ -200,14 +190,9 @@ class FastSLTPThread(threading.Thread):
             except Exception as e:
                 log.debug(f"Fast thread loop error: {e}")
 
-# -------------------- STARTUP RECONCILIATION --------------------
+# -------------------- STARTUP RECONCILE --------------------
 
 def _reconcile_positions_on_start(ex: ExchangeWrapper, cfg: AppConfig, state: dict) -> None:
-    """
-    Always reconcile exchange positions into state:
-      - Adds/updates entries in state['perpos'] for any live exchange position.
-      - Removes stale perpos entries for symbols now flat.
-    """
     try:
         positions = ex.fetch_positions() or {}
     except Exception as e:
@@ -222,7 +207,6 @@ def _reconcile_positions_on_start(ex: ExchangeWrapper, cfg: AppConfig, state: di
         net_qty = float(pdct.get("net_qty") or 0.0)
         if abs(net_qty) <= 0.0:
             continue
-        # Pull a small bar window to seed entry_atr and trails
         try:
             bars = ex.fetch_ohlcv(sym, tf, limit=max(50, atr_len + 5))
             if not bars:
@@ -232,7 +216,6 @@ def _reconcile_positions_on_start(ex: ExchangeWrapper, cfg: AppConfig, state: di
             df.set_index("dt", inplace=True)
             lr = df.iloc[-1]
             atr_val = compute_atr(df, n=atr_len, method="rma").iloc[-1]
-            # Populate perpos
             sign = 1 if net_qty > 0 else -1
             entry_price = float(pdct.get("entryPrice") or lr["close"])
             state.setdefault("perpos", {})[sym] = {
@@ -248,7 +231,7 @@ def _reconcile_positions_on_start(ex: ExchangeWrapper, cfg: AppConfig, state: di
         except Exception as e:
             log.warning(f"Startup reconcile: OHLCV/ATR failed for {sym}: {e}")
 
-    # Remove stale entries for symbols that are now flat
+    # prune stale
     stale = []
     for sym in list(state.get("perpos", {}).keys()):
         if sym not in positions or float(positions.get(sym, {}).get("net_qty") or 0.0) == 0.0:
@@ -257,14 +240,13 @@ def _reconcile_positions_on_start(ex: ExchangeWrapper, cfg: AppConfig, state: di
         state["perpos"].pop(sym, None)
         state.get("enter_bar_time", {}).pop(sym, None)
 
-    # Persist and report
     write_json(getattr(cfg.paths, "state_path", "state/state.json"), state)
     if live_syms:
         log.info(f"Startup reconcile: attached to {len(live_syms)} live positions: {', '.join(sorted(live_syms))}")
     else:
         log.info("Startup reconcile: no live positions found on exchange.")
 
-# -------------------- REBALANCE / MAIN LOOP --------------------
+# -------------------- MAIN LOOP --------------------
 
 def _minute_aligned(minute: int) -> bool:
     if minute <= 0:
@@ -281,13 +263,6 @@ def _is_new_position(pos: dict) -> bool:
     return abs(float(pos.get("net_qty") or 0.0)) < 1e-9
 
 def run_live(cfg: AppConfig, dry: bool = False):
-    """
-    Main loop with:
-      - ALWAYS-on startup reconciliation with the exchange (safe restarts)
-      - Trailing HARD kill-switch from intraday equity high
-      - Soft kill (blocks new entries)
-      - ReduceOnly first, then open/expand orders
-    """
     log.info(f"Fast SL/TP loop starting: check every {cfg.risk.fast_check_seconds}s on timeframe={cfg.risk.stop_timeframe}")
 
     state_path = cfg.paths.state_path
@@ -306,7 +281,15 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
     ex = ExchangeWrapper(cfg.exchange)
 
-    # --- ALWAYS reconcile with exchange on startup (ignores possibly stale state) ---
+    # --- ONE-LINER STARTUP CANCEL (behind flag) ---
+    if getattr(cfg.execution, "cancel_open_orders_on_start", False):
+        try:
+            ex.cancel_all_orders(None)
+            log.info("Startup safety: cancel_all_orders executed (per config flag).")
+        except Exception as e:
+            log.warning(f"Startup safety: cancel_all_orders failed (continuing): {e}")
+
+    # Reconcile with live positions
     try:
         _reconcile_positions_on_start(ex, cfg, state)
     except Exception as e:
@@ -323,7 +306,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
             return
 
         for s in syms:
-            ex.set_leverage(s, int(cfg.execution.set_leverage))
+            ex.set_leverage(s, int(getattr(cfg.execution, "set_leverage", 1)))
 
         eq_now = ex.get_equity_usdt()
         cur_day = utcnow().date().isoformat()
@@ -359,7 +342,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 write_json(state_path, state)
                 log.info("Kill-switch pause expired; trading re-enabled.")
 
-            if did_first_cycle and not _minute_aligned(cfg.execution.rebalance_minute):
+            if did_first_cycle and not _minute_aligned(getattr(cfg.execution, "rebalance_minute", 1)):
                 if time.time() - last_align_log > 15:
                     log.debug("Waiting for minute alignment...")
                     last_align_log = time.time()
@@ -370,7 +353,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
             log.info(f"=== Cycle start {cycle_started_at.isoformat()} ===")
             did_first_cycle = True
 
-            # Day rollover reset (UTC)
+            # Day rollover (UTC)
             eq = ex.get_equity_usdt()
             cur_day = utcnow().date().isoformat()
             if state.get("day_date") != cur_day and eq > 0:
@@ -383,13 +366,12 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 log.info(f"New UTC day: reset day_start_equity and day_high_equity to {eq:.2f}")
 
             # Update intraday equity high
-            if eq > 0:
-                if eq > day_high_equity:
-                    day_high_equity = eq
-                    state["day_high_equity"] = day_high_equity
-                    write_json(state_path, state)
+            if eq > 0 and eq > day_high_equity:
+                day_high_equity = eq
+                state["day_high_equity"] = day_high_equity
+                write_json(state_path, state)
 
-            # HARD kill-switch (trailing from intraday high if enabled)
+            # Kill switch (supports trailing from config)
             use_trailing = bool(getattr(cfg.risk, "use_trailing_killswitch", True))
             if eq > 0 and (day_start_equity > 0 or day_high_equity > 0):
                 if kill_switch_should_trigger(day_start_equity, day_high_equity, eq, cfg.risk.max_daily_loss_pct, use_trailing=use_trailing):
@@ -403,7 +385,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     time.sleep(5)
                     continue
 
-            # SOFT kill (from day start equity)
+            # SOFT kill (optional; blocks new entries only)
             allow_new_entries = True
             if getattr(cfg.strategy, "soft_kill", None) and cfg.strategy.soft_kill.enabled and eq > 0 and day_start_equity > 0:
                 dd_start = _dd_pct(day_start_equity, eq)
@@ -423,7 +405,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
             # 1) OHLCV
             bars: Dict[str, pd.DataFrame] = {}
-            syms = ex.fetch_markets_filtered()  # refresh allowed universe
+            syms = ex.fetch_markets_filtered()
             for s in syms:
                 try:
                     raw = ex.fetch_ohlcv(s, cfg.exchange.timeframe, limit=cfg.exchange.candles_limit)
@@ -437,7 +419,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
             if not bars:
                 log.error("No bars fetched this cycle; sleeping.")
-                time.sleep(max(1, int(cfg.execution.poll_seconds)))
+                time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                 continue
 
             closes = pd.concat({s: bars[s]["close"] for s in bars}, axis=1).dropna(how="all")
@@ -460,7 +442,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 ok = regime_ok(mean_close, ema_len, thr, use_abs=use_abs)
                 if not ok:
                     log.info("Regime gate blocked this cycle; staying flat.")
-                    time.sleep(max(1, int(cfg.execution.poll_seconds)))
+                    time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                     continue
 
             # 3) Targets
@@ -507,8 +489,8 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
             # 5) Orders
             positions = ex.fetch_positions()
-            min_notional = float(cfg.execution.min_notional_per_order_usdt)
-            min_delta_bps = float(cfg.execution.min_rebalance_delta_bps)
+            min_notional = float(getattr(cfg.execution, "min_notional_per_order_usdt", 5.0))
+            min_delta_bps = float(getattr(cfg.execution, "min_rebalance_delta_bps", 1.0))
 
             open_symbols = [s for s, p in positions.items() if not _is_new_position(p)]
             remaining_slots = max(0, getattr(cfg.strategy.entry_throttle, "max_open_positions", 999) - len(open_symbols))
@@ -578,13 +560,12 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     side = "buy" if delta_notional > 0 else "sell"
                     size = abs(delta_notional) / px
                     price = None
-                    if cfg.execution.order_type.lower() == "limit":
+                    if getattr(cfg.execution, "order_type", "market").lower() == "limit":
                         off_bps = getattr(cfg.execution, "price_offset_bps", 0)
                         off = (off_bps / 10_000.0) * px
                         price = (px - off) if side == "buy" else (px + off)
                     orders.append({"symbol": s, "side": side, "qty": size, "price": price, "reduceOnly": False})
 
-            # 6) Send
             t_ord_start = perf_counter()
             for od in orders:
                 s = od["symbol"]; side = od["side"]; q = float(od["qty"]); px = od["price"]; ro = bool(od.get("reduceOnly", False))
@@ -603,7 +584,6 @@ def run_live(cfg: AppConfig, dry: bool = False):
             t_ord = perf_counter() - t_ord_start
             log.info(f"Orders processed (n={len(orders)}) in {t_ord:.2f}s")
 
-            # Persist state
             try:
                 state["last_targets"] = {k: float(v) for k, v in targets.items()}
                 write_json(state_path, state)
@@ -614,7 +594,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
             log.info(f"Cycle complete in {cycle_time:.2f}s")
             log.info(f"=== Cycle end {utcnow().isoformat()} ===")
 
-            time.sleep(max(1, int(cfg.execution.poll_seconds)))
+            time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
 
     finally:
         try:

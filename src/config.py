@@ -1,4 +1,4 @@
-# v1.4.1 – 2025-08-22
+# v1.4.4 – 2025-08-22 (CCXT-only; remove use_pybit; keep cancel_open_orders_on_start)
 from __future__ import annotations
 from typing import List
 from pydantic import BaseModel, Field
@@ -91,8 +91,10 @@ class ExecutionCfg(BaseModel):
     min_notional_per_order_usdt: float = 15.0
     min_rebalance_delta_bps: float = 60.0
 
-    # NEW: documented, but the bot now reconciles regardless (safety first)
     reload_positions_on_start: bool = True
+
+    # startup safety hook
+    cancel_open_orders_on_start: bool = False
 
 class RiskCfg(BaseModel):
     atr_len: int = 28
@@ -114,10 +116,9 @@ class RiskCfg(BaseModel):
     partial_tp_r: float = 2.5
     partial_tp_size: float = 0.5
 
-    # HARD kill-switch (can trail from intraday high)
     max_daily_loss_pct: float = 3.0
     trade_disable_minutes: int = 360
-    use_trailing_killswitch: bool = True  # measure DD from day_high_equity
+    use_trailing_killswitch: bool = True
 
     min_close_pnl_pct: float = 2.0
     max_hours_in_trade: int = 48
