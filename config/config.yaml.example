@@ -4,7 +4,7 @@ exchange:
   quote: USDT
   only_perps: true
   unified_margin: true
-  testnet: false  
+  testnet: false
 
   max_symbols: 36
   min_usd_volume_24h: 30000000
@@ -48,8 +48,8 @@ strategy:
     max_scale: 1.2
 
   entry_throttle:
-    max_new_positions_per_cycle: 2
-    max_open_positions: 8
+    max_new_positions_per_cycle: 36
+    max_open_positions: 36
     per_symbol_trade_cooldown_min: 60
     min_entry_zscore: 0.6
 
@@ -57,6 +57,12 @@ strategy:
     enabled: true
     soft_daily_loss_pct: 1.5
     resume_after_minutes: 240
+
+  # NEW: Green-day soft win lock (blocks new entries after daily gain target)
+  soft_win_lock:
+    enabled: true
+    daily_gain_pct: 2.0      # block new entries once daily gain >= 2.0%
+    resume_after_minutes: 0  # 0 = wait until UTC day rollover
 
 liquidity:
   adv_cap_pct: 0.002
@@ -90,19 +96,39 @@ risk:
   stop_timeframe: "5m"
   trailing_enabled: true
   trail_atr_mult: 3.0
-  breakeven_after_r: 2.0
+  breakeven_after_r: 1.5          # tightened to secure profits sooner
 
   stop_on_close_only: true
-  stop_buffer_bps: 10
+  stop_confirm_bars: 1            # require N closed bars to confirm a stop breach
+  min_hold_minutes: 12            # arm “normal” stop only after this hold time
+  catastrophic_atr_mult: 3.5      # catastrophic stop always live
+
+  # Profit securing & robustness
+  breakeven_extra_bps: 6          # nudges BE stop above/below entry to cover fees
+  stop_buffer_bps: 12             # extra buffer on all stops to reduce wick-outs
   cooldown_minutes_after_stop: 90
 
   partial_tp_enabled: true
-  partial_tp_r: 2.5
+  partial_tp_r: 1.8               # earlier partial to bank gains
   partial_tp_size: 0.5
+
+  # NEW: Configurable profit-lock ladder (R → locked R)
+  profit_lock_steps:
+    - [1.0, 0.0]                  # at +1.0R, move to BE (0.0R locked)
+    - [1.8, 0.8]                  # at +1.8R, lock +0.8R
+    - [3.0, 1.8]                  # at +3.0R, lock +1.8R
+
+  # NEW: tighten trailing once partial TP has executed
+  trail_after_partial_mult: 2.4
+
+  # NEW: age-based tightening
+  age_tighten:
+    hours: 12
+    trail_atr_mult: 2.0
 
   max_daily_loss_pct: 3.0
   trade_disable_minutes: 360
-  use_trailing_killswitch: true  
+  use_trailing_killswitch: true
   min_close_pnl_pct: 2.0
 
   max_hours_in_trade: 48

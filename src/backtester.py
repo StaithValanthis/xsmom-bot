@@ -14,8 +14,9 @@ log = logging.getLogger("backtest")
 
 def _costs(turnover_notional: float, maker_ratio: float, cfg: AppConfig) -> float:
     fee_bps = maker_ratio * cfg.costs.maker_fee_bps + (1 - maker_ratio) * cfg.costs.taker_fee_bps
-    slip_bps = cfg.costs.slippage_bps
-    total_bps = fee_bps + slip_bps
+    slip_bps = float(getattr(cfg.costs, "slippage_bps", 0.0))
+    borrow_bps = float(getattr(cfg.costs, "borrow_bps", 0.0))
+    total_bps = fee_bps + slip_bps + borrow_bps
     return -(total_bps / 10_000.0) * turnover_notional
 
 def _perf_stats(eq: pd.Series) -> Dict[str, float]:
@@ -38,6 +39,9 @@ def _perf_stats(eq: pd.Series) -> Dict[str, float]:
     }
 
 def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
+    log.info("=== BACKTEST (cost-aware) ===")
+    log.info(f"Start: {utcnow().isoformat()} | timeframe={cfg.exchange.timeframe}")
+
     ex = ExchangeWrapper(cfg.exchange)
     bars = {}
     for s in symbols:
@@ -68,10 +72,13 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
 
     closes = pd.concat({s: bars[s]["close"] for s in bars}, axis=1).dropna(how="all")
     idx = closes.index
+
+    # Return series per symbol
     rets = closes.pct_change().fillna(0.0)
 
+    maker_ratio = float(getattr(cfg.costs, "maker_fill_ratio", 0.5))
+
     equity = [1.0]
-    maker_ratio = 0.5  # assume half maker, half taker
     weights_hist = []
     turnover_hist = []
 
@@ -79,32 +86,39 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
     for i in range(warmup, len(idx) - 1):
         window = closes.iloc[:i+1]
 
-        # Optional regime gating
+        # Regime gating (PER-ASSET)
+        eligible_cols = list(window.columns)
         if cfg.strategy.regime_filter.enabled:
-            ok = regime_ok(
-                window.mean(axis=1),
-                cfg.strategy.regime_filter.ema_len,
-                cfg.strategy.regime_filter.slope_min_bps_per_day,
-                use_abs=bool(getattr(cfg.strategy.regime_filter, "use_abs", False)),
-            )
-            if not ok:
+            ema_len = int(cfg.strategy.regime_filter.ema_len)
+            thr = float(cfg.strategy.regime_filter.slope_min_bps_per_day)
+            use_abs = bool(getattr(cfg.strategy.regime_filter, "use_abs", False))
+
+            eligible_cols = []
+            for s in window.columns:
+                ser = window[s].dropna()
+                try:
+                    ok = regime_ok(ser, ema_len, thr, use_abs=use_abs)
+                except Exception:
+                    ok = True  # fail-open per symbol in BT
+                if ok:
+                    eligible_cols.append(s)
+
+            if len(eligible_cols) == 0:
+                # fully flat bar
                 weights_hist.append(pd.Series(0.0, index=closes.columns))
-                equity.append(equity[-1])  # flat
+                equity.append(equity[-1])
                 turnover_hist.append(0.0)
                 continue
+            # shrink window to eligible universe
+            window = window[eligible_cols]
 
         w = build_targets(
             window,
             cfg.strategy.lookbacks,
             cfg.strategy.lookback_weights,
             cfg.strategy.vol_lookback,
-            cfg.strategy.k_min,
-            cfg.strategy.k_max,
-            cfg.strategy.market_neutral,
-            cfg.strategy.gross_leverage,
-            cfg.strategy.max_weight_per_asset,
-            dynamic_k_fn=dynamic_k,  # dispersion-sensitive K
-            funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, "enabled", False) else None,
+            k_func=dynamic_k if bool(getattr(cfg.strategy, "use_dynamic_k", False)) else None,
+            funding_map=funding_map,
             funding_weight=float(getattr(cfg.strategy.funding_tilt, "weight", 0.0)) if getattr(cfg.strategy.funding_tilt, "enabled", False) else 0.0,
             entry_zscore_min=float(getattr(cfg.strategy, "entry_zscore_min", 0.0)),
             diversify_enabled=bool(getattr(cfg.strategy.diversify, "enabled", False)),
@@ -130,7 +144,12 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
         # apply costs & funding (simple model)
         pnl = equity[-1] * port_ret
         costs = _costs(turnover_notional * equity[-1], maker_ratio, cfg)
-        funding = -(cfg.costs.funding_bps_per_day / 10_000.0) * equity[-1] / 24.0  # per hour
+        funding = 0.0
+        if getattr(cfg.strategy.funding_tilt, "enabled", False):
+            # crude: apply symbol funding weighted by exposure
+            funding = float((w * pd.Series(funding_map).reindex(closes.columns).fillna(0.0)).sum()) / (365*24*10_000.0)
+            funding *= equity[-1]
+
         equity.append(equity[-1] + pnl + costs + funding)
 
     eq = pd.Series(equity, index=idx[-len(equity):])
