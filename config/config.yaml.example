@@ -24,6 +24,37 @@ strategy:
   gross_leverage: 1.10
   max_weight_per_asset: 0.14
 
+  # --- ADX filter ---
+  adx_filter:
+    enabled: true
+    len: 14
+    min_adx: 18.0
+    use_di_confirm: false
+
+  # --- dynamic symbol performance filter (banlist/downsizing) ---
+  symbol_filter:
+    enabled: true
+    banlist: []
+    whitelist: []
+    score:
+      enabled: true
+      min_sample_trades: 25
+      ema_alpha: 0.2
+
+      # downweight (but still trade) when below these:
+      min_win_rate_pct: 48.0
+      pf_downweight_threshold: 1.0
+      downweight_factor: 0.5
+
+      # hard-ban when below these:
+      block_below_win_rate_pct: 38.0
+      pf_block_threshold: 0.75
+      pnl_block_threshold_usdt_per_trade: -0.20
+
+      ban_minutes: 720
+      grace_trades_after_unban: 10
+      decay_days: 14
+
   regime_filter:
     enabled: true
     ema_len: 200
@@ -58,12 +89,6 @@ strategy:
     soft_daily_loss_pct: 1.5
     resume_after_minutes: 240
 
-  # NEW: Green-day soft win lock (blocks new entries after daily gain target)
-  soft_win_lock:
-    enabled: true
-    daily_gain_pct: 2.0      # block new entries once daily gain >= 2.0%
-    resume_after_minutes: 0  # 0 = wait until UTC day rollover
-
 liquidity:
   adv_cap_pct: 0.002
   notional_cap_usdt: 70
@@ -86,6 +111,27 @@ execution:
 
   cancel_open_orders_on_start: true
 
+  # Spread guard + dynamic price offset
+  spread_guard:
+    enabled: true
+    max_spread_bps: 12.0
+    skip_if_wider: true
+
+  dynamic_offset:
+    enabled: true
+    base_bps: 3.0
+    per_spread_coeff: 0.50
+    max_offset_bps: 20.0
+
+  # Stale order reconciliation / cleanup
+  stale_orders:
+    enabled: true
+    cleanup_interval_sec: 45
+    max_age_sec: 180
+    reprice_if_far_bps: 15.0
+    cancel_if_not_targeted: true
+    keep_reduce_only: true
+
 risk:
   atr_len: 28
   atr_mult_sl: 3.2
@@ -96,35 +142,52 @@ risk:
   stop_timeframe: "5m"
   trailing_enabled: true
   trail_atr_mult: 3.0
-  breakeven_after_r: 1.5          # tightened to secure profits sooner
+  breakeven_after_r: 2.0
 
   stop_on_close_only: true
-  stop_confirm_bars: 1            # require N closed bars to confirm a stop breach
-  min_hold_minutes: 12            # arm “normal” stop only after this hold time
-  catastrophic_atr_mult: 3.5      # catastrophic stop always live
+  stop_confirm_bars: 1
+  min_hold_minutes: 12
+  catastrophic_atr_mult: 3.5
 
-  # Profit securing & robustness
-  breakeven_extra_bps: 6          # nudges BE stop above/below entry to cover fees
-  stop_buffer_bps: 12             # extra buffer on all stops to reduce wick-outs
+  stop_buffer_bps: 10
   cooldown_minutes_after_stop: 90
 
   partial_tp_enabled: true
-  partial_tp_r: 1.8               # earlier partial to bank gains
+  partial_tp_r: 2.5
   partial_tp_size: 0.5
 
-  # NEW: Configurable profit-lock ladder (R → locked R)
-  profit_lock_steps:
-    - [1.0, 0.0]                  # at +1.0R, move to BE (0.0R locked)
-    - [1.8, 0.8]                  # at +1.8R, lock +0.8R
-    - [3.0, 1.8]                  # at +3.0R, lock +1.8R
+  # Volatility-aware partial TP ladders
+  partial_ladders:
+    enabled: true
+    r_levels: [1.0, 1.8, 2.6]
+    sizes:    [0.34, 0.33, 0.33]
+    reduce_only: true
 
-  # NEW: tighten trailing once partial TP has executed
-  trail_after_partial_mult: 2.4
+  # No-progress exit
+  no_progress:
+    enabled: true
+    min_minutes: 90
+    min_rr: 0.30
 
-  # NEW: age-based tightening
-  age_tighten:
-    hours: 12
-    trail_atr_mult: 2.0
+  # FAST exit on regime flip
+  exit_on_regime_flip:
+    enabled: true
+    confirm_bars: 1   # require N consecutive non-OK regime closes before exit
+
+  # Trailing unlocks (config-driven)
+  trailing_unlocks:
+    enabled: true
+    triggers_r: [0.8, 1.5, 2.5]  # when +R reaches these, lock the levels below
+    lock_r:      [0.0, 0.5, 1.2] # stop moves to entry+lock*R (long) or entry-lock*R (short)
+
+  # Adaptive TP/SL (volatility regime scaling)
+  adaptive:
+    enabled: true
+    low_thr_bps: 40          # ATR% (bps) <= low → "low" tier
+    high_thr_bps: 120        # ATR% (bps) >= high → "high" tier
+    sl_scale:        {low: 1.40, mid: 1.00, high: 0.80}   # scales atr_mult_sl
+    trail_scale:     {low: 1.20, mid: 1.00, high: 0.80}   # scales trail_atr_mult
+    ladder_r_scale:  {low: 1.10, mid: 1.00, high: 0.90}   # scales R triggers (both unlock & partial ladders)
 
   max_daily_loss_pct: 3.0
   trade_disable_minutes: 360
@@ -132,6 +195,13 @@ risk:
   min_close_pnl_pct: 2.0
 
   max_hours_in_trade: 48
+
+risk_stepdown:
+  enabled: true
+  dd_levels_pct: [2.0, 4.0, 6.0]
+  gross_leverage_multipliers: [0.9, 0.75, 0.6]
+  max_new_positions_multipliers: [0.8, 0.6, 0.4]
+  recover_hysteresis_pct: 1.0
 
 paths:
   state_path: "state/state.json"

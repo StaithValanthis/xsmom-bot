@@ -1,11 +1,9 @@
-# v1.6.1 – 2025-08-24
-# - Configurable profit-lock ladder (+R) and breakeven fee buffer
-# - Tighten trailing after partial TP; age-based tightening
-# - Green-day soft win lock (blocks new entries after daily gain target)
-# - Close-only stop logic with optional confirmation bars
-# - Hold timer + catastrophic ATR stop
-# - Cooldown on stop; apply cooldowns to target weights
-# - Intent-based limit-order reconciliation & stale cleanup (feature-gated via execution.stale_orders)
+# v1.7.0 – 2025-08-26
+# - Adaptive TP/SL multipliers by volatility regime (ATR% tiers)
+# - FAST exit on regime flip (configurable confirmation bars)
+# - Trailing unlock ladder is now config-driven
+# - Keeps: dynamic banlist & symbol scoring, ADX filter, partial-TP ladders, no-progress exit,
+#          spread guard + dynamic price offset, stale-order cleanup, risk stepdown, funding tilt, diversify, vol target, etc.
 from __future__ import annotations
 import logging
 import threading
@@ -20,10 +18,183 @@ from .config import AppConfig
 from .exchange import ExchangeWrapper
 from .signals import compute_atr, regime_ok, dynamic_k
 from .sizing import build_targets, apply_liquidity_caps
-from .risk import per_symbol_stops, kill_switch_should_trigger, resume_time_after_kill
+from .risk import kill_switch_should_trigger, resume_time_after_kill
 from .utils import utcnow, read_json, write_json
 
 log = logging.getLogger("live")
+
+# -------------------- helpers --------------------
+
+def _safe_float(x, default: Optional[float] = None) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _mid_price(tkr: dict) -> Optional[float]:
+    if not isinstance(tkr, dict):
+        return None
+    bid = tkr.get("bid") or tkr.get("bidPrice")
+    ask = tkr.get("ask") or tkr.get("askPrice")
+    last = tkr.get("last") or tkr.get("close")
+    try:
+        if bid and ask and float(bid) > 0 and float(ask) > 0:
+            return (float(bid) + float(ask)) / 2.0
+        return float(last) if last else None
+    except Exception:
+        return None
+
+def _spread_bps(tkr: dict) -> Optional[float]:
+    try:
+        bid = float(tkr.get("bid") or tkr.get("bidPrice") or 0.0)
+        ask = float(tkr.get("ask") or tkr.get("askPrice") or 0.0)
+        if bid > 0 and ask > 0 and ask >= bid:
+            return (ask - bid) / ((ask + bid) / 2.0) * 10_000.0
+    except Exception:
+        pass
+    return None
+
+def _is_new_position(pos: dict) -> bool:
+    return abs(float(pos.get("net_qty") or 0.0)) < 1e-9
+
+def _minute_aligned(minute: int) -> bool:
+    if minute <= 0:
+        return True
+    now = utcnow()
+    return (now.minute % minute) == 0
+
+def _dd_pct(ref: float, noweq: float) -> float:
+    if ref is None or ref <= 0 or noweq is None or noweq <= 0:
+        return 0.0
+    return 100.0 * max(0.0, (ref - noweq) / ref)
+
+# -------------------- ADX (Wilder DMI) --------------------
+
+def _compute_adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high = df["high"].astype("float64")
+    low = df["low"].astype("float64")
+    close = df["close"].astype("float64")
+
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = ((up > down) & (up > 0)) * up
+    minus_dm = ((down > up) & (down > 0)) * down
+
+    tr1 = (high - low)
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1.0 / n, adjust=False).mean()
+    plus_di = 100.0 * (plus_dm.ewm(alpha=1.0 / n, adjust=False).mean() / atr).replace([np.inf, -np.inf], np.nan)
+    minus_di = 100.0 * (minus_dm.ewm(alpha=1.0 / n, adjust=False).mean() / atr).replace([np.inf, -np.inf], np.nan)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0.0, np.nan)) * 100.0
+    adx = dx.ewm(alpha=1.0 / n, adjust=False).mean()
+    return adx
+
+# -------------------- DYNAMIC BANLIST / SYMBOL SCORING --------------------
+
+def _state_get_symstats(state: dict) -> dict:
+    return state.setdefault("sym_stats", {})
+
+def _ema_update(prev: Optional[float], value: float, alpha: float) -> float:
+    if prev is None:
+        return value
+    return float(alpha * value + (1 - alpha) * prev)
+
+def _update_symbol_score_on_close(state: dict, cfg: AppConfig, symbol: str, pnl_usdt: float) -> None:
+    sf_cfg = getattr(cfg.strategy, "symbol_filter", None)
+    if not sf_cfg or not sf_cfg.enabled or not getattr(sf_cfg, "score", None) or not sf_cfg.score.enabled:
+        return
+
+    stats = _state_get_symstats(state)
+    s = stats.get(symbol) or {
+        "n": 0, "wins": 0, "losses": 0,
+        "ema_wr": None, "ema_pf": None, "ema_pnl": None,
+        "gw": 0.0, "gl": 0.0,
+        "status": "active", "ban_until": None,
+        "grace_left": 0,
+        "last_update": None,
+    }
+
+    s["n"] += 1
+    if pnl_usdt >= 0:
+        s["wins"] += 1
+        s["gw"] += pnl_usdt
+    else:
+        s["losses"] += 1
+        s["gl"] += abs(pnl_usdt)
+
+    inst_wr = 100.0 if pnl_usdt >= 0 else 0.0
+    inst_pf = (abs(pnl_usdt) if pnl_usdt > 0 else 0.0) / (abs(pnl_usdt) if pnl_usdt < 0 else 0.0 or 1e-9)
+
+    alpha = float(sf_cfg.score.ema_alpha)
+    s["ema_wr"] = _ema_update(s.get("ema_wr"), inst_wr, alpha)
+    s["ema_pf"] = _ema_update(s.get("ema_pf"), inst_pf, alpha)
+    s["ema_pnl"] = _ema_update(s.get("ema_pnl"), float(pnl_usdt), alpha)
+    s["last_update"] = pd.Timestamp.utcnow().isoformat()
+
+    wl = set((sf_cfg.whitelist or []))
+    if symbol in wl:
+        s["status"] = "active"
+        s["ban_until"] = None
+        s["grace_left"] = 0
+    else:
+        nmin = int(sf_cfg.score.min_sample_trades)
+        if s["n"] >= nmin:
+            if (float(s["ema_wr"] or 0.0) < float(sf_cfg.score.block_below_win_rate_pct) or
+                float(s["ema_pf"] or 1.0) < float(sf_cfg.score.pf_block_threshold) or
+                float(s["ema_pnl"] or 0.0) < float(sf_cfg.score.pnl_block_threshold_usdt_per_trade)):
+                until = (pd.Timestamp.utcnow() + pd.Timedelta(minutes=int(sf_cfg.score.ban_minutes))).isoformat()
+                s["status"] = "banned"
+                s["ban_until"] = until
+                s["grace_left"] = int(sf_cfg.score.grace_trades_after_unban)
+            else:
+                if (float(s["ema_wr"] or 100.0) < float(sf_cfg.score.min_win_rate_pct) or
+                    float(s["ema_pf"] or 1.0) < float(sf_cfg.score.pf_downweight_threshold)):
+                    s["status"] = "downweighted"
+                else:
+                    s["status"] = "active"
+
+    stats[symbol] = s
+    state["sym_stats"] = stats
+
+def _apply_symbol_filter_to_targets(state: dict, cfg: AppConfig, targets: pd.Series) -> pd.Series:
+    sf_cfg = getattr(cfg.strategy, "symbol_filter", None)
+    if not sf_cfg or not sf_cfg.enabled:
+        return targets
+
+    stats = _state_get_symstats(state)
+    ban_static = set((sf_cfg.banlist or []))
+    wl = set((sf_cfg.whitelist or []))
+    down_factor = float(sf_cfg.score.downweight_factor) if getattr(sf_cfg, "score", None) and sf_cfg.score.enabled else 1.0
+
+    out = targets.copy()
+    now = pd.Timestamp.utcnow()
+    for s in list(out.index):
+        if s in ban_static and s not in wl:
+            out.loc[s] = 0.0
+            continue
+        st = (stats.get(s) or {})
+        status = st.get("status")
+        ban_until = st.get("ban_until")
+        if status == "banned" and ban_until:
+            try:
+                if pd.Timestamp(ban_until) > now and s not in wl:
+                    out.loc[s] = 0.0
+                    continue
+                else:
+                    st["status"] = "downweighted" if (st.get("grace_left", 0) or 0) > 0 else "active"
+                    st["ban_until"] = None
+                    stats[s] = st
+            except Exception:
+                pass
+
+        if st.get("status") == "downweighted" and s not in wl:
+            out.loc[s] = float(out.loc[s]) * down_factor
+
+    state["sym_stats"] = stats
+    return out
 
 # -------------------- FAST EVENT-DRIVEN SL/TP THREAD --------------------
 
@@ -37,7 +208,7 @@ class FastSLTPThread(threading.Thread):
         self.stop_event = stop_event
 
         self._last_ohlcv_ts: Dict[str, float] = {}
-        self._last_closed_bar: Dict[str, pd.DataFrame] = {}  # store N recent CLOSED bars for confirm logic
+        self._last_closed_tail: Dict[str, pd.DataFrame] = {}
         self._atr_cache: Dict[str, float] = {}
 
         self.state.setdefault("perpos", {})
@@ -51,16 +222,61 @@ class FastSLTPThread(threading.Thread):
         self.min_hold_minutes: int = int(getattr(self.cfg.risk, "min_hold_minutes", 0))
         self.catastrophic_mult: float = float(getattr(self.cfg.risk, "catastrophic_atr_mult", 3.5))
         self.stop_buffer_bps: float = float(getattr(self.cfg.risk, "stop_buffer_bps", 0.0))
-        self.trail_mult: float = float(getattr(self.cfg.risk, "trail_atr_mult", 0.0) or 0.0)
+        self.trail_mult_base: float = float(getattr(self.cfg.risk, "trail_atr_mult", 0.0) or 0.0)
 
-    @staticmethod
-    def _to_float(x, default: float = None) -> Optional[float]:
-        try:
-            if isinstance(x, (pd.Series, pd.Index, np.ndarray)) and hasattr(x, "item"):
-                return float(np.asarray(x).astype("float64").ravel()[-1])
-            return float(x)
-        except Exception:
-            return default
+        # ladders/no-progress
+        np_cfg = getattr(self.cfg.risk, "no_progress", None)
+        self.no_progress_enabled = bool(np_cfg and np_cfg.enabled)
+        self.no_progress_min_minutes = int(np_cfg.min_minutes) if np_cfg else 0
+        self.no_progress_min_rr = float(np_cfg.min_rr) if np_cfg else 0.0
+
+        ladd = getattr(self.cfg.risk, "partial_ladders", None)
+        self.ladd_enabled = bool(ladd and ladd.enabled)
+        self.ladd_levels_base = list(getattr(ladd, "r_levels", []) or [])
+        self.ladd_sizes = list(getattr(ladd, "sizes", []) or [])
+        self.ladd_reduce_only = bool(getattr(ladd, "reduce_only", True))
+
+        # trailing unlocks (config-driven)
+        tu = getattr(self.cfg.risk, "trailing_unlocks", None)
+        self.unlock_enabled = bool(tu and tu.enabled)
+        self.unlock_triggers = list(getattr(tu, "triggers_r", []) or [])
+        self.unlock_locks = list(getattr(tu, "lock_r", []) or [])
+
+        # fast exit on regime flip
+        rx = getattr(self.cfg.risk, "exit_on_regime_flip", None)
+        self.exit_regime_enabled = bool(rx and rx.enabled)
+        self.exit_regime_confirm = int(getattr(rx, "confirm_bars", 1) or 1)
+
+    # -------- Adaptive scales (per symbol, on latest bar) --------
+    def _adaptive_scales(self, symbol: str, last_close: float) -> Tuple[float, float, float]:
+        """Returns (sl_scale, trail_scale, ladder_r_scale)."""
+        ad = getattr(self.cfg.risk, "adaptive", None)
+        if not ad or not ad.enabled or last_close <= 0:
+            return 1.0, 1.0, 1.0
+        atr = float(self._atr_cache.get(symbol, 0.0) or 0.0)
+        if atr <= 0:
+            return 1.0, 1.0, 1.0
+        # ATR% in bps
+        atrp_bps = (atr / float(last_close)) * 10_000.0
+        low = float(getattr(ad, "low_thr_bps", 40.0))
+        high = float(getattr(ad, "high_thr_bps", 120.0))
+
+        tier = "mid"
+        if atrp_bps <= low:
+            tier = "low"
+        elif atrp_bps >= high:
+            tier = "high"
+
+        def _pick(obj, key, default=1.0):
+            try:
+                return float(getattr(obj, key).get(tier, default))
+            except Exception:
+                return default
+
+        sl_scale = _pick(ad, "sl_scale", 1.0)
+        trail_scale = _pick(ad, "trail_scale", 1.0)
+        ladd_scale = _pick(ad, "ladder_r_scale", 1.0)
+        return sl_scale, trail_scale, ladd_scale
 
     def _minutes_held(self, symbol: str) -> float:
         entered_iso = self.state.get("enter_bar_time", {}).get(symbol)
@@ -76,11 +292,11 @@ class FastSLTPThread(threading.Thread):
         perpos = self.state.setdefault("perpos", {})
         pinfo = perpos.get(symbol)
 
-        close_v = self._to_float(last_closed.get("close"))
-        high_v = self._to_float(last_closed.get("high"))
-        low_v  = self._to_float(last_closed.get("low"))
-        atr_v  = self._to_float(atr_val)
-        entry_v = self._to_float(entry_price, close_v)
+        close_v = _safe_float(last_closed.get("close"))
+        high_v = _safe_float(last_closed.get("high"))
+        low_v  = _safe_float(last_closed.get("low"))
+        atr_v  = _safe_float(atr_val)
+        entry_v = _safe_float(entry_price, close_v)
 
         if (not isinstance(pinfo, dict)) or (int(pinfo.get("sign", 0) or 0) != sign):
             perpos[symbol] = {
@@ -90,15 +306,17 @@ class FastSLTPThread(threading.Thread):
                 "trail_hh": float(high_v),
                 "trail_ll": float(low_v),
                 "partial_done": False,
+                "max_rr": 0.0,
+                "ladder_done": [False] * len(self.ladd_levels_base),
+                "regime_bad_count": 0,
             }
             self.state.setdefault("enter_bar_time", {})[symbol] = pd.Timestamp.utcnow().isoformat()
             self.state.setdefault("locked_r", {})[symbol] = 0.0
         else:
-            # update trail anchors with CLOSED bar extremes
             if sign > 0:
-                pinfo["trail_hh"] = float(max(self._to_float(pinfo.get("trail_hh"), high_v), high_v))
+                pinfo["trail_hh"] = float(max(_safe_float(pinfo.get("trail_hh"), high_v), high_v))
             else:
-                pinfo["trail_ll"] = float(min(self._to_float(pinfo.get("trail_ll"), low_v), low_v))
+                pinfo["trail_ll"] = float(min(_safe_float(pinfo.get("trail_ll"), low_v), low_v))
 
     def _compute_stop_px(self, symbol: str, last_closed: pd.Series) -> Tuple[Optional[float], Optional[float], float, float, int]:
         """
@@ -106,84 +324,64 @@ class FastSLTPThread(threading.Thread):
         """
         pinfo = self.state.get("perpos", {}).get(symbol) or {}
         sign = int(pinfo.get("sign", 0) or 0)
-        entry_price = self._to_float(pinfo.get("entry_price"))
-        entry_atr   = self._to_float(pinfo.get("entry_atr"))
+        entry_price = _safe_float(pinfo.get("entry_price"))
+        entry_atr   = _safe_float(pinfo.get("entry_atr"))
         if entry_price is None or entry_atr is None or entry_atr <= 0 or sign == 0:
             return None, None, 0.0, 0.0, 0
 
-        atr_mult_sl = float(getattr(self.cfg.risk, "atr_mult_sl", 2.0))
+        last_close = _safe_float(last_closed.get("close"), entry_price)
+        sl_scale, trail_scale, ladd_scale = self._adaptive_scales(symbol, last_close or entry_price)
+
+        atr_mult_sl_eff = float(getattr(self.cfg.risk, "atr_mult_sl", 2.0)) * sl_scale
+        trail_k_eff = self.trail_mult_base * trail_scale
         trailing_enabled = bool(getattr(self.cfg.risk, "trailing_enabled", True))
 
-        # ----- profit-lock ladder (configurable via risk.profit_lock_steps) -----
-        steps_cfg = getattr(self.cfg.risk, "profit_lock_steps", None)
-        if not steps_cfg:
-            steps = [(1.0, 0.0), (1.8, 0.8), (3.0, 1.8)]
-        else:
-            steps = [(float(t), float(l)) for (t, l) in steps_cfg]
-
-        # breakeven extras
-        be_after = float(getattr(self.cfg.risk, "breakeven_after_r", 0.0))
-        be_extra_bps = float(getattr(self.cfg.risk, "breakeven_extra_bps", 0.0) or 0.0)
-        be_extra = be_extra_bps / 10_000.0
-
-        # ----- dynamic trail multiplier adjustments -----
-        # base
-        trail_k = float(getattr(self.cfg.risk, "trail_atr_mult", 0.0) or 0.0)
-
-        # after partial tighten
-        if pinfo.get("partial_done"):
-            trail_k_after = float(getattr(self.cfg.risk, "trail_after_partial_mult", 0.0) or 0.0)
-            if trail_k_after > 1e-12:
-                trail_k = trail_k_after
-
-        # age-based tighten
-        age_cfg = getattr(self.cfg.risk, "age_tighten", None)
-        if age_cfg:
-            try:
-                hrs = float(age_cfg.get("hours", 0) or 0)
-                t_mult = float(age_cfg.get("trail_atr_mult", 0.0) or 0.0)
-                if hrs > 0 and t_mult > 0:
-                    enter_iso = self.state.get("enter_bar_time", {}).get(symbol)
-                    if enter_iso:
-                        age_h = (pd.Timestamp.utcnow() - pd.Timestamp(enter_iso)).total_seconds() / 3600.0
-                        if age_h >= hrs:
-                            trail_k = t_mult
-            except Exception:
-                pass
-
         # base stop from entry
-        init_sl = entry_price - atr_mult_sl * entry_atr if sign > 0 else entry_price + atr_mult_sl * entry_atr
+        init_sl = entry_price - atr_mult_sl_eff * entry_atr if sign > 0 else entry_price + atr_mult_sl_eff * entry_atr
 
         cur_atr = self._atr_cache.get(symbol, entry_atr)
-        hh = self._to_float(pinfo.get("trail_hh"), self._to_float(last_closed.get("high")))
-        ll = self._to_float(pinfo.get("trail_ll"), self._to_float(last_closed.get("low")))
+        hh = _safe_float(pinfo.get("trail_hh"), _safe_float(last_closed.get("high")))
+        ll = _safe_float(pinfo.get("trail_ll"), _safe_float(last_closed.get("low")))
 
         stop_px = init_sl
-        if trailing_enabled and trail_k > 1e-12 and cur_atr > 0:
-            trail_sl = (hh - trail_k * cur_atr) if sign > 0 else (ll + trail_k * cur_atr)
+        if trailing_enabled and trail_k_eff > 1e-12 and cur_atr > 0:
+            trail_sl = (hh - trail_k_eff * cur_atr) if sign > 0 else (ll + trail_k_eff * cur_atr)
             stop_px = max(init_sl, trail_sl) if sign > 0 else min(init_sl, trail_sl)
 
-        # breakeven bump (+bps) only when BE is armed
-        last_close = self._to_float(last_closed.get("close"), entry_price)
-        R_unit = float(entry_atr * atr_mult_sl)
+        # R unit uses the effective SL distance
+        R_unit = float(entry_atr * atr_mult_sl_eff)
+        be_after = float(getattr(self.cfg.risk, "breakeven_after_r", 0.0))
         if be_after > 0 and last_close is not None:
             if sign > 0 and last_close >= entry_price + be_after * R_unit:
-                be_px = entry_price * (1.0 + be_extra)
-                stop_px = max(stop_px, be_px)
+                stop_px = max(stop_px, entry_price)
             elif sign < 0 and last_close <= entry_price - be_after * R_unit:
-                be_px = entry_price * (1.0 - be_extra)
-                stop_px = min(stop_px, be_px)
+                stop_px = min(stop_px, entry_price)
 
-        # profit-lock ladder
+        # configurable trailing unlock ladder
         locked = float(self.state.get("locked_r", {}).get(symbol, 0.0) or 0.0)
-        for trig, lock in steps:
-            if locked < lock:
-                if sign > 0 and last_close >= entry_price + trig * R_unit:
-                    stop_px = max(stop_px, entry_price + lock * R_unit)
-                    locked = lock
-                elif sign < 0 and last_close <= entry_price - trig * R_unit:
-                    stop_px = min(stop_px, entry_price - lock * R_unit)
-                    locked = lock
+        if self.unlock_enabled and self.unlock_triggers and self.unlock_locks:
+            for trig, lock in zip(self.unlock_triggers, self.unlock_locks):
+                trig_eff = float(trig) * (ladd_scale if ladd_scale else 1.0)
+                lock_r = float(lock)
+                if locked < lock_r:
+                    if sign > 0 and last_close >= entry_price + trig_eff * R_unit:
+                        stop_px = max(stop_px, entry_price + lock_r * R_unit)
+                        locked = lock_r
+                    elif sign < 0 and last_close <= entry_price - trig_eff * R_unit:
+                        stop_px = min(stop_px, entry_price - lock_r * R_unit)
+                        locked = lock_r
+        else:
+            # fallback to legacy ladder
+            for trig, lock in [(0.8, 0.0), (1.5, 0.5), (2.5, 1.2)]:
+                trig_eff = trig * (ladd_scale if ladd_scale else 1.0)
+                if locked < lock:
+                    if sign > 0 and last_close >= entry_price + trig_eff * R_unit:
+                        stop_px = max(stop_px, entry_price + lock * R_unit)
+                        locked = lock
+                    elif sign < 0 and last_close <= entry_price - trig_eff * R_unit:
+                        stop_px = min(stop_px, entry_price - lock * R_unit)
+                        locked = lock
+
         if locked > 0:
             self.state.setdefault("locked_r", {})[symbol] = locked
 
@@ -192,33 +390,43 @@ class FastSLTPThread(threading.Thread):
         if buf > 0:
             stop_px = stop_px * (1.0 - buf) if sign > 0 else stop_px * (1.0 + buf)
 
-        # catastrophic
+        # catastrophic (note: not scaled; intended as hard guard)
         cat_px = entry_price - self.catastrophic_mult * entry_atr if sign > 0 else entry_price + self.catastrophic_mult * entry_atr
         return float(stop_px), float(cat_px), float(entry_price), float(R_unit), sign
 
-    def _maybe_partial_tp(self, symbol: str, qty: float, rr_now: float) -> None:
-        if not self.cfg.risk.partial_tp_enabled:
+    def _partial_ladders(self, symbol: str, qty: float, rr_now: float, last_close: float):
+        if not self.ladd_enabled or qty == 0:
             return
         pinfo = self.state.get("perpos", {}).get(symbol) or {}
-        if pinfo.get("partial_done"):
-            return
-        if rr_now >= float(getattr(self.cfg.risk, "partial_tp_r", 2.0)):
-            take = float(getattr(self.cfg.risk, "partial_tp_size", 0.5))
-            side = "sell" if qty > 0 else "buy"
-            q = abs(qty) * take
-            if q <= 0:
-                return
-            try:
-                if self.dry:
-                    log.info(f"[DRY] Partial TP {symbol} {side} {q}")
-                else:
-                    self.ex.create_order_safe(symbol, side, q, None, post_only=False, reduce_only=True)
-                pinfo["partial_done"] = True
-                self.state.setdefault("perpos", {})[symbol] = pinfo
-            except Exception as e:
-                log.warning(f"Partial TP error {symbol}: {e}")
+        done = pinfo.get("ladder_done") or [False] * len(self.ladd_levels_base)
 
-    def _place_exit(self, symbol: str, qty: float, reason: str):
+        # adapt ladder trigger levels with volatility tier
+        _, _, ladd_scale = self._adaptive_scales(symbol, last_close)
+        levels_eff = [float(r) * (ladd_scale if ladd_scale else 1.0) for r in self.ladd_levels_base]
+
+        changed = False
+        for i, (r, sz) in enumerate(zip(levels_eff, self.ladd_sizes)):
+            if done[i]:
+                continue
+            if rr_now >= float(r):
+                side = "sell" if qty > 0 else "buy"
+                q = max(0.0, abs(qty) * float(sz))
+                if q <= 0:
+                    continue
+                try:
+                    if self.dry:
+                        log.info(f"[DRY-LADDER] {symbol} {side} {q}")
+                    else:
+                        self.ex.create_order_safe(symbol, side, q, None, post_only=False, reduce_only=self.ladd_reduce_only)
+                    done[i] = True
+                    changed = True
+                except Exception as e:
+                    log.warning(f"Ladder TP error {symbol}: {e}")
+        if changed:
+            pinfo["ladder_done"] = done
+            self.state.setdefault("perpos", {})[symbol] = pinfo
+
+    def _place_exit(self, symbol: str, qty: float, reason: str, exit_px: Optional[float]):
         side_close = "sell" if qty > 0 else "buy"
         q = abs(qty)
         if q <= 0:
@@ -230,6 +438,17 @@ class FastSLTPThread(threading.Thread):
                 self.ex.create_order_safe(symbol, side_close, q, None, post_only=False, reduce_only=True)
                 log.info(f"[LIVE-{reason}] {symbol}: {side_close} {q} @ mkt")
         finally:
+            # update symbol performance scoring
+            try:
+                pinfo = (self.state.get("perpos", {}) or {}).get(symbol, {})
+                ep = float(pinfo.get("entry_price") or 0.0)
+                sign = int(pinfo.get("sign") or (1 if qty > 0 else -1))
+                px = float(exit_px or ep)
+                realized = (px - ep) * (q if sign > 0 else -q)
+                _update_symbol_score_on_close(self.state, self.cfg, symbol, float(realized))
+            except Exception:
+                pass
+
             # cooldown after stop/exit
             cdm = int(getattr(self.cfg.risk, "cooldown_minutes_after_stop", 0))
             if cdm > 0:
@@ -257,7 +476,6 @@ class FastSLTPThread(threading.Thread):
                 for sym, pdct in positions.items():
                     qty = float(pdct.get("net_qty") or 0.0)
                     if qty == 0.0:
-                        # clear if any residual state
                         self.state.get("perpos", {}).pop(sym, None)
                         self.state.get("enter_bar_time", {}).pop(sym, None)
                         self.state.get("locked_r", {}).pop(sym, None)
@@ -272,15 +490,15 @@ class FastSLTPThread(threading.Thread):
                             df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
                             df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
                             df.set_index("dt", inplace=True)
-                            # treat last rows as CLOSED bars (ccxt OHLCV returns closed bars)
-                            self._last_closed_bar[sym] = df.tail(max(3, self.stop_confirm_bars + 1)).copy()
-                            self._atr_cache[sym] = float(self._to_float(compute_atr(df, n=atr_len, method="rma").iloc[-1], default=np.nan))
+                            tail = df.tail(max(3, self.stop_confirm_bars + 2)).copy()
+                            self._last_closed_tail[sym] = tail
+                            self._atr_cache[sym] = float(_safe_float(compute_atr(df, n=atr_len, method="rma").iloc[-1], np.nan))
                             self._last_ohlcv_ts[sym] = nowts
                         except Exception as e:
                             log.debug(f"fast fetch_ohlcv {sym} failed: {e}")
                             continue
 
-                    closed_tail = self._last_closed_bar.get(sym)
+                    closed_tail = self._last_closed_tail.get(sym)
                     if closed_tail is None or closed_tail.empty:
                         continue
                     last_closed = closed_tail.iloc[-1]
@@ -288,16 +506,41 @@ class FastSLTPThread(threading.Thread):
                     entry_px = float(pdct.get("entryPrice") or last_closed["close"])
                     self._init_or_update_perpos(sym, qty, last_closed, self._atr_cache.get(sym, 0.0), entry_px)
 
-                    # compute R now (closed bar)
+                    # FAST exit on regime flip (optional)
+                    if self.exit_regime_enabled and getattr(self.cfg.strategy, "regime_filter", None) and self.cfg.strategy.regime_filter.enabled:
+                        try:
+                            # use the same 'tf' stream; cheap and consistent
+                            ser = closed_tail["close"].dropna()
+                            ok = regime_ok(ser, int(self.cfg.strategy.regime_filter.ema_len),
+                                           float(self.cfg.strategy.regime_filter.slope_min_bps_per_day),
+                                           use_abs=bool(getattr(self.cfg.strategy.regime_filter, "use_abs", False)))
+                        except Exception:
+                            ok = True
+                        pinfo = self.state["perpos"].get(sym, {})
+                        if ok:
+                            pinfo["regime_bad_count"] = 0
+                        else:
+                            pinfo["regime_bad_count"] = int(pinfo.get("regime_bad_count", 0)) + 1
+                        self.state["perpos"][sym] = pinfo
+                        if pinfo.get("regime_bad_count", 0) >= max(1, self.exit_regime_confirm):
+                            self._place_exit(sym, qty, "REGIME-FLIP", float(last_closed["close"]))
+                            continue
+
+                    # compute R progress
                     pinfo = self.state["perpos"].get(sym, {})
                     ep = float(pinfo.get("entry_price") or entry_px)
                     atr0 = float(pinfo.get("entry_atr") or self._atr_cache.get(sym, 0.0) or 1.0)
                     last_c = float(last_closed["close"])
-                    R_unit = atr0 * float(getattr(self.cfg.risk, "atr_mult_sl", 2.0))
-                    rr_now = abs(last_c - ep) / (R_unit if R_unit > 1e-12 else 1.0)
 
-                    # partials on closed bar progress
-                    self._maybe_partial_tp(sym, qty, rr_now)
+                    # effective R uses adaptive SL multiplier
+                    sl_scale, _, _ = self._adaptive_scales(sym, last_c)
+                    R_unit = atr0 * float(getattr(self.cfg.risk, "atr_mult_sl", 2.0)) * sl_scale
+                    rr_now = abs(last_c - ep) / (R_unit if R_unit > 1e-12 else 1.0)
+                    pinfo["max_rr"] = float(max(float(pinfo.get("max_rr", 0.0)), rr_now))
+                    self.state["perpos"][sym] = pinfo
+
+                    # partial ladders (vol-aware)
+                    self._partial_ladders(sym, qty, rr_now, last_c)
 
                     # time-based exit
                     max_hours = int(getattr(self.cfg.risk, "max_hours_in_trade", 0) or 0)
@@ -306,11 +549,17 @@ class FastSLTPThread(threading.Thread):
                         if enter_iso:
                             age_h = (pd.Timestamp.utcnow() - pd.Timestamp(enter_iso)).total_seconds() / 3600.0
                             if age_h >= max_hours:
-                                self._place_exit(sym, qty, "TIME-EXIT")
+                                self._place_exit(sym, qty, "TIME-EXIT", last_c)
                                 continue
 
+                    # no-progress exit
+                    if self.no_progress_enabled and self._minutes_held(sym) >= self.no_progress_min_minutes:
+                        if float(pinfo.get("max_rr", 0.0)) < self.no_progress_min_rr:
+                            self._place_exit(sym, qty, "NO-PROGRESS", last_c)
+                            continue
+
                     # compute stops
-                    normal_px, cat_px, ep, R_unit, sign = self._compute_stop_px(sym, last_closed)
+                    normal_px, cat_px, ep, R_unit_eff, sign = self._compute_stop_px(sym, last_closed)
                     if sign == 0:
                         continue
 
@@ -325,7 +574,6 @@ class FastSLTPThread(threading.Thread):
                             if (sign > 0 and last_closed["close"] <= normal_px) or (sign < 0 and last_closed["close"] >= normal_px):
                                 hit_normal = True
                         else:
-                            # require N consecutive closes beyond the stop
                             tail = closed_tail.tail(self.stop_confirm_bars)
                             if sign > 0:
                                 hit_normal = bool((tail["close"] <= normal_px).all())
@@ -336,22 +584,30 @@ class FastSLTPThread(threading.Thread):
                         if (sign > 0 and last_closed["low"] <= cat_px) or (sign < 0 and last_closed["high"] >= cat_px):
                             hit_cat = True
 
-                    # trailing breach (based on closed price)
-                    if bool(getattr(self.cfg.risk, "trailing_enabled", True)) and self.trail_mult > 0 and not hit_cat and not hit_normal:
+                    # trailing breach (closed price)
+                    if bool(getattr(self.cfg.risk, "trailing_enabled", True)) and self.trail_mult_base > 0 and not hit_cat and not hit_normal:
+                        # use adaptive trail multiplier inside compute_stop_px (already applied)
                         if sign > 0:
-                            trail = float(max(pinfo.get("trail_hh", last_c), last_c)) - self.trail_mult * (self._atr_cache.get(sym, atr0) or atr0)
+                            # recompute trail using current adaptive values
+                            sl_scale, trail_scale, _ = self._adaptive_scales(sym, last_c)
+                            cur_atr = self._atr_cache.get(sym, atr0) or atr0
+                            trail_k_eff = self.trail_mult_base * trail_scale
+                            trail = float(max(pinfo.get("trail_hh", last_c), last_c)) - trail_k_eff * cur_atr
                             if last_closed["close"] <= trail:
                                 hit_normal = True
                         else:
-                            trail = float(min(pinfo.get("trail_ll", last_c), last_c)) + self.trail_mult * (self._atr_cache.get(sym, atr0) or atr0)
+                            sl_scale, trail_scale, _ = self._adaptive_scales(sym, last_c)
+                            cur_atr = self._atr_cache.get(sym, atr0) or atr0
+                            trail_k_eff = self.trail_mult_base * trail_scale
+                            trail = float(min(pinfo.get("trail_ll", last_c), last_c)) + trail_k_eff * cur_atr
                             if last_closed["close"] >= trail:
                                 hit_normal = True
 
                     if hit_cat:
-                        self._place_exit(sym, qty, "CAT-STOP")
+                        self._place_exit(sym, qty, "CAT-STOP", last_c)
                         continue
                     if hit_normal:
-                        self._place_exit(sym, qty, "STOP")
+                        self._place_exit(sym, qty, "STOP", last_c)
                         continue
 
             except Exception as e:
@@ -392,6 +648,9 @@ def _reconcile_positions_on_start(ex: ExchangeWrapper, cfg: AppConfig, state: di
                 "trail_hh": float(lr["high"]),
                 "trail_ll": float(lr["low"]),
                 "partial_done": bool(state.get("perpos", {}).get(sym, {}).get("partial_done", False)),
+                "max_rr": float(state.get("perpos", {}).get(sym, {}).get("max_rr", 0.0) or 0.0),
+                "ladder_done": state.get("perpos", {}).get(sym, {}).get("ladder_done", []),
+                "regime_bad_count": int(state.get("perpos", {}).get(sym, {}).get("regime_bad_count", 0) or 0),
             }
             state.setdefault("enter_bar_time", {})[sym] = state.get("enter_bar_time", {}).get(sym) or pd.Timestamp.utcnow().isoformat()
             state.setdefault("locked_r", {})[sym] = float(state.get("locked_r", {}).get(sym, 0.0) or 0.0)
@@ -415,33 +674,15 @@ def _reconcile_positions_on_start(ex: ExchangeWrapper, cfg: AppConfig, state: di
     else:
         log.info("Startup reconcile: no live positions found on exchange.")
 
-# -------------------- ORDER BOOK RECONCILIATION (stale limits) --------------------
-
-def _mid_price(tkr: dict) -> Optional[float]:
-    if not isinstance(tkr, dict):
-        return None
-    bid = tkr.get("bid") or tkr.get("bidPrice")
-    ask = tkr.get("ask") or tkr.get("askPrice")
-    last = tkr.get("last") or tkr.get("close")
-    try:
-        if bid and ask and float(bid) > 0 and float(ask) > 0:
-            return (float(bid) + float(ask)) / 2.0
-        return float(last) if last else None
-    except Exception:
-        return None
-
-def _desired_side_from_weight(w: float) -> Optional[str]:
-    if w is None or abs(w) < 1e-12:
-        return None
-    return "buy" if w > 0 else "sell"
+# -------------------- ORDER CLEANUP (reconciliation) --------------------
 
 def _reconcile_open_orders(
     ex: ExchangeWrapper,
     cfg: AppConfig,
-    targets: pd.Series,          # symbol -> weight
-    positions: dict,             # symbol -> current position dict (optional use)
-    tickers: dict,               # symbol -> ticker dict
-    eligible_syms: set,          # symbols still allowed by regime/cooldowns
+    targets: pd.Series,
+    positions: dict,
+    tickers: dict,
+    eligible_syms: set,
     state: dict,
     now_ts: float,
 ):
@@ -449,7 +690,6 @@ def _reconcile_open_orders(
     if not st or not getattr(st, "enabled", False):
         return
 
-    # Throttle cleanup frequency
     last_ts = float(state.get("last_stale_cleanup_ts", 0.0) or 0.0)
     if (now_ts - last_ts) < int(getattr(st, "cleanup_interval_sec", 60)):
         return
@@ -459,7 +699,6 @@ def _reconcile_open_orders(
     cancel_if_not_targeted = bool(getattr(st, "cancel_if_not_targeted", True))
     keep_reduce_only = bool(getattr(st, "keep_reduce_only", True))
 
-    # Try bulk fetch; fall back to per-symbol if not supported
     open_by_sym: Dict[str, List[dict]] = {}
     try:
         all_open = ex.fetch_open_orders(None)
@@ -481,10 +720,9 @@ def _reconcile_open_orders(
         tkr = tickers.get(s, {}) or {}
         mid = _mid_price(tkr)
         tgt_w = float(targets.get(s, 0.0) or 0.0)
-        desired_side = _desired_side_from_weight(tgt_w)
+        desired_side = "buy" if tgt_w > 0 else ("sell" if tgt_w < 0 else None)
         still_eligible = (s in eligible_syms)
 
-        # If symbol not eligible (regime/cooldown) or not targeted, cancel (except reduce-only if we keep them)
         if cancel_if_not_targeted and (desired_side is None or not still_eligible):
             try:
                 if keep_reduce_only:
@@ -502,10 +740,6 @@ def _reconcile_open_orders(
                 log.debug(f"cleanup cancel {s} failed: {e}")
             continue
 
-        # Otherwise, cancel/replace orders that:
-        # - are on the opposite side vs desired
-        # - are too old
-        # - are too far from mid
         to_cancel = []
         for od in odlist:
             if keep_reduce_only and (od.get("reduceOnly") or od.get("reduce_only")):
@@ -516,7 +750,7 @@ def _reconcile_open_orders(
                 to_cancel.append(od.get("id"))
                 continue
 
-            # age check
+            # age
             age_bad = False
             created = od.get("timestamp") or od.get("time") or od.get("created")
             if created:
@@ -526,7 +760,7 @@ def _reconcile_open_orders(
                 except Exception:
                     age_bad = False
 
-            # distance check
+            # distance from mid
             far_bad = False
             if far_bps > 0 and mid:
                 try:
@@ -540,7 +774,6 @@ def _reconcile_open_orders(
             if age_bad or far_bad:
                 to_cancel.append(od.get("id"))
 
-        # Execute cancels
         if to_cancel:
             canceled = 0
             for oid in to_cancel:
@@ -550,7 +783,6 @@ def _reconcile_open_orders(
                     ex.cancel_order(oid, s)
                     canceled += 1
                 except Exception:
-                    # fallback: if id cancel fails, nuke all for symbol once
                     try:
                         ex.cancel_all_orders(s)
                         canceled = len(to_cancel)
@@ -563,20 +795,6 @@ def _reconcile_open_orders(
     state["last_stale_cleanup_ts"] = now_ts
 
 # -------------------- MAIN LOOP --------------------
-
-def _minute_aligned(minute: int) -> bool:
-    if minute <= 0:
-        return True
-    now = utcnow()
-    return (now.minute % minute) == 0
-
-def _dd_pct(ref: float, noweq: float) -> float:
-    if ref is None or ref <= 0 or noweq is None or noweq <= 0:
-        return 0.0
-    return 100.0 * max(0.0, (ref - noweq) / ref)
-
-def _is_new_position(pos: dict) -> bool:
-    return abs(float(pos.get("net_qty") or 0.0)) < 1e-9
 
 def run_live(cfg: AppConfig, dry: bool = False):
     log.info(f"Fast SL/TP loop starting: check every {cfg.risk.fast_check_seconds}s on timeframe={cfg.risk.stop_timeframe}")
@@ -591,11 +809,13 @@ def run_live(cfg: AppConfig, dry: bool = False):
     state.setdefault("day_date", None)
     state.setdefault("day_high_equity", 0.0)
     state.setdefault("last_stale_cleanup_ts", 0.0)
+    state.setdefault("sym_stats", {})
 
     day_start_equity = float(state.get("day_start_equity", 0.0))
     day_high_equity = float(state.get("day_high_equity", 0.0))
     disable_until_ts = float(state.get("disable_until_ts", 0.0))
     soft_block_until_ts = float(state.get("soft_block_until_ts", 0.0))
+    current_stepdown_tier = int(state.get("risk_stepdown_tier", 0))
 
     ex = ExchangeWrapper(cfg.exchange)
 
@@ -650,6 +870,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
         last_align_log = 0.0
 
         while True:
+            # pause handling
             if disable_until_ts and time.time() < disable_until_ts:
                 if time.time() - last_pause_log > 30:
                     resume_dt = pd.to_datetime(disable_until_ts, unit="s", utc=True)
@@ -724,16 +945,6 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     write_json(state_path, state)
                     log.warning(f"SOFT KILL: dd_from_start={dd_start:.2f}% ; blocking new entries until {soft_resume.isoformat()}")
 
-            # Soft WIN lock: block new entries after daily gain target
-            swl = getattr(cfg.strategy, "soft_win_lock", None)
-            if swl and getattr(swl, "enabled", False) and eq > 0 and day_start_equity > 0:
-                gain_from_start = 100.0 * max(0.0, (eq - day_start_equity) / day_start_equity)
-                if gain_from_start >= float(getattr(swl, "daily_gain_pct", 0.0) or 0.0):
-                    allow_new_entries = False
-                    state["soft_win_lock_active"] = True
-                    write_json(state_path, state)
-                    log.info(f"SOFT WIN LOCK: daily gain {gain_from_start:.2f}% ≥ target; new entries disabled for the day.")
-
             # 1) OHLCV
             bars: Dict[str, pd.DataFrame] = {}
             syms = ex.fetch_markets_filtered()
@@ -753,26 +964,48 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                 continue
 
-            closes = pd.concat({s: bars[s]["close"] for s in bars}, axis=1).dropna(how="all")
+            # ADX filter (per-asset)
+            eligible_syms = list(bars.keys())
+            adx_cfg = getattr(cfg.strategy, "adx_filter", None)
+            if adx_cfg and adx_cfg.enabled:
+                blocked = 0
+                keep = []
+                for s, df in bars.items():
+                    try:
+                        adx = _compute_adx(df[["high","low","close"]], int(adx_cfg.len)).iloc[-1]
+                        if float(adx) >= float(adx_cfg.min_adx):
+                            keep.append(s)
+                        else:
+                            blocked += 1
+                    except Exception:
+                        keep.append(s)  # fail-open
+                eligible_syms = keep
+                if blocked > 0:
+                    log.info(f"ADX gate: {blocked}/{len(bars)} symbols blocked this cycle.")
+                if not eligible_syms:
+                    log.info("ADX gate blocked all symbols; staying flat.")
+                    time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
+                    continue
 
-            # 2) Regime (per-asset)
-            eligible_syms = list(closes.columns)
+            # Regime (per-asset)
+            closes = pd.concat({s: bars[s]["close"] for s in bars}, axis=1).dropna(how="all")
             if cfg.strategy.regime_filter.enabled:
                 ema_len = int(cfg.strategy.regime_filter.ema_len)
                 thr = float(cfg.strategy.regime_filter.slope_min_bps_per_day)
                 use_abs = bool(getattr(cfg.strategy.regime_filter, "use_abs", False))
                 blocked = 0
-                eligible_syms = []
-                for s in closes.columns:
+                keep = []
+                for s in list(eligible_syms):
                     ser = closes[s].dropna()
                     try:
                         ok = regime_ok(ser, ema_len, thr, use_abs=use_abs)
                     except Exception:
                         ok = True
                     if ok:
-                        eligible_syms.append(s)
+                        keep.append(s)
                     else:
                         blocked += 1
+                eligible_syms = keep
                 if blocked > 0:
                     log.info(f"Regime gate: {blocked}/{len(closes.columns)} symbols blocked this cycle.")
                 if len(eligible_syms) == 0:
@@ -780,7 +1013,34 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                     continue
 
-            closes_used = closes[eligible_syms] if cfg.strategy.regime_filter.enabled else closes
+            closes_used = closes[eligible_syms]
+
+            # 2) Risk step-down with drawdown
+            step_cfg = getattr(cfg, "risk_stepdown", None)
+            gl_mult = 1.0
+            max_new_mult = 1.0
+            if step_cfg and step_cfg.enabled:
+                ref = day_high_equity if bool(getattr(cfg.risk, "use_trailing_killswitch", True)) else day_start_equity
+                dd = _dd_pct(ref, eq)
+                tiers = list(getattr(step_cfg, "dd_levels_pct", []) or [])
+                gl_m = list(getattr(step_cfg, "gross_leverage_multipliers", []) or [])
+                new_m = list(getattr(step_cfg, "max_new_positions_multipliers", []) or [])
+                tier = 0
+                for i, lvl in enumerate(tiers, start=1):
+                    if dd >= float(lvl):
+                        tier = i
+                if tier > current_stepdown_tier:
+                    current_stepdown_tier = tier
+                elif tier < current_stepdown_tier:
+                    rec = float(getattr(step_cfg, "recover_hysteresis_pct", 0.0))
+                    need = max(0.0, dd - rec)
+                    if dd <= need:
+                        current_stepdown_tier = tier
+                state["risk_stepdown_tier"] = current_stepdown_tier
+                if current_stepdown_tier > 0:
+                    idx = current_stepdown_tier - 1
+                    gl_mult = float(gl_m[idx]) if idx < len(gl_m) else gl_mult
+                    max_new_mult = float(new_m[idx]) if idx < len(new_m) else max_new_mult
 
             # 3) Targets
             funding_map: Dict[str, float] = {}
@@ -798,7 +1058,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 cfg.strategy.k_min,
                 cfg.strategy.k_max,
                 cfg.strategy.market_neutral,
-                cfg.strategy.gross_leverage,
+                cfg.strategy.gross_leverage * gl_mult,   # step-down applied here
                 cfg.strategy.max_weight_per_asset,
                 dynamic_k_fn=dynamic_k,
                 funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, "enabled", False) else None,
@@ -816,7 +1076,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
             # Reindex to full universe so blocked symbols have 0 weight
             targets = targets.reindex(closes.columns).fillna(0.0)
 
-            # 3.5) Apply cooldowns: zero weights while cooldown active
+            # 3.3) Apply cooldowns to weights
             try:
                 cds = state.get("cooldowns", {}) if isinstance(state, dict) else {}
                 if cds:
@@ -828,12 +1088,14 @@ def run_live(cfg: AppConfig, dry: bool = False):
                                 if pd.Timestamp(until_iso) > now_ts:
                                     targets.loc[s] = 0.0
                                 else:
-                                    # cooldown expired
                                     state["cooldowns"].pop(s, None)
                             except Exception:
                                 pass
             except Exception:
                 pass
+
+            # 3.4) Apply dynamic symbol filter (banlist/downsizing)
+            targets = _apply_symbol_filter_to_targets(state, cfg, targets)
 
             # 4) Liquidity caps
             tickers = ex.fetch_tickers(list(targets.index))
@@ -854,7 +1116,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 targets=targets,
                 positions=positions,
                 tickers=tickers or {},
-                eligible_syms=set(eligible_syms) if cfg.strategy.regime_filter.enabled else set(targets.index),
+                eligible_syms=set(eligible_syms),
                 state=state,
                 now_ts=time.time(),
             )
@@ -864,19 +1126,19 @@ def run_live(cfg: AppConfig, dry: bool = False):
             min_delta_bps = float(getattr(cfg.execution, "min_rebalance_delta_bps", 1.0))
 
             open_symbols = [s for s, p in positions.items() if not _is_new_position(p)]
-            remaining_slots = max(0, getattr(cfg.strategy.entry_throttle, "max_open_positions", 999) - len(open_symbols))
-            new_entries_cap = min(getattr(cfg.strategy.entry_throttle, "max_new_positions_per_cycle", 999), remaining_slots)
+            base_slots = int(getattr(cfg.strategy.entry_throttle, "max_open_positions", 999))
+            remaining_slots = max(0, int(round(base_slots * max_new_mult)) - len(open_symbols))
+
+            base_new_per_cycle = int(getattr(cfg.strategy.entry_throttle, "max_new_positions_per_cycle", 999))
+            new_entries_cap = min(int(round(base_new_per_cycle * max_new_mult)), remaining_slots)
 
             now_ts_fn = time.time
             last_ts_map: Dict[str, float] = state.get("last_trade_ts", {})
 
-            # throttle: honor per-symbol trade cooldown; use weight magnitude as tiebreaker
             candidates: List[Tuple[str, float]] = []
             for s, w in targets.items():
                 pos = positions.get(s, {}) or {}
                 if _is_new_position(pos) and w != 0.0:
-                    if not allow_new_entries:
-                        continue
                     last_t = float(last_ts_map.get(s, 0.0))
                     if (now_ts_fn() - last_t) < 60.0 * getattr(cfg.strategy.entry_throttle, "per_symbol_trade_cooldown_min", 0):
                         continue
@@ -887,23 +1149,33 @@ def run_live(cfg: AppConfig, dry: bool = False):
             orders: List[Dict] = []
             for s, w in targets.items():
                 t = (tickers.get(s, {}) or {})
-                px = t.get("last") or t.get("close")
-                if px is None:
+                px_last = t.get("last") or t.get("close")
+                if px_last is None:
                     continue
-                px = float(px)
+                px_last = float(px_last)
                 target_notional = w * eq
 
                 pos = positions.get(s, {}) or {}
                 long_qty = float(pos.get("long_qty") or 0.0)
                 short_qty = float(pos.get("short_qty") or 0.0)
                 net_qty = float(pos.get("net_qty") or 0.0)
-                cur_notional = net_qty * px
+                cur_notional = net_qty * px_last
                 delta_notional = target_notional - cur_notional
 
                 if abs(delta_notional) < min_notional:
                     continue
                 if eq > 0 and (abs(delta_notional) / eq * 10_000.0) < min_delta_bps:
                     continue
+
+                # Spread guard & dynamic offset
+                sg = getattr(cfg.execution, "spread_guard", None)
+                dyn = getattr(cfg.execution, "dynamic_offset", None)
+                mid = _mid_price(t)
+                spr_bps = _spread_bps(t) or 0.0
+                if sg and sg.enabled and sg.max_spread_bps and spr_bps > float(sg.max_spread_bps):
+                    if bool(getattr(sg, "skip_if_wider", True)):
+                        if _is_new_position(pos):
+                            continue
 
                 want_buy = delta_notional > 0
                 want_sell = delta_notional < 0
@@ -915,32 +1187,39 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     if s not in allow_syms_new:
                         continue
 
+                # close opposite first
                 if want_buy and short_qty > 0:
-                    qty_to_close = min(abs(delta_notional) / px, short_qty)
+                    qty_to_close = min(abs(delta_notional) / px_last, short_qty)
                     if qty_to_close > 0:
                         orders.append({"symbol": s, "side": "buy", "qty": qty_to_close, "price": None, "reduceOnly": True})
-                    delta_notional -= min(abs(delta_notional), qty_to_close * px)
+                    delta_notional -= min(abs(delta_notional), qty_to_close * px_last)
 
                 if want_sell and long_qty > 0:
-                    qty_to_close = min(abs(delta_notional) / px, long_qty)
+                    qty_to_close = min(abs(delta_notional) / px_last, long_qty)
                     if qty_to_close > 0:
                         orders.append({"symbol": s, "side": "sell", "qty": qty_to_close, "price": None, "reduceOnly": True})
-                    delta_notional += min(abs(delta_notional), qty_to_close * px)
+                    delta_notional += min(abs(delta_notional), qty_to_close * px_last)
 
                 if abs(delta_notional) >= min_notional:
                     side = "buy" if delta_notional > 0 else "sell"
-                    size = abs(delta_notional) / px
+                    size = abs(delta_notional) / px_last
                     price = None
                     if getattr(cfg.execution, "order_type", "market").lower() == "limit":
-                        off_bps = getattr(cfg.execution, "price_offset_bps", 0)
-                        off = (off_bps / 10_000.0) * px
-                        price = (px - off) if side == "buy" else (px + off)
+                        off_bps = float(getattr(cfg.execution, "price_offset_bps", 0.0))
+                        if dyn and dyn.enabled:
+                            base = float(getattr(dyn, "base_bps", off_bps))
+                            coeff = float(getattr(dyn, "per_spread_coeff", 0.0))
+                            max_off = float(getattr(dyn, "max_offset_bps", 50.0))
+                            off_bps = min(max_off, base + coeff * float(spr_bps or 0.0))
+                        off = (off_bps / 10_000.0) * (mid or px_last)
+                        price = ((mid or px_last) - off) if side == "buy" else ((mid or px_last) + off)
                     orders.append({"symbol": s, "side": side, "qty": size, "price": price, "reduceOnly": False})
 
             t_ord_start = perf_counter()
             for od in orders:
                 s = od["symbol"]; side = od["side"]; q = float(od["qty"]); px = od["price"]; ro = bool(od.get("reduceOnly", False))
-                notional = q * (tickers.get(s, {}) or {}).get("last", 0.0)
+                tkr = (tickers.get(s, {}) or {})
+                notional = q * float(tkr.get("last") or tkr.get("close") or 0.0)
                 try:
                     if dry:
                         tag = "REDUCE" if ro else "OPEN"
