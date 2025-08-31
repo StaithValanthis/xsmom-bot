@@ -31,13 +31,6 @@ strategy:
   market_neutral: true
   gross_leverage: 1.1
   max_weight_per_asset: 0.14
-  adx_filter:
-    enabled: true
-    len: 14
-    min_adx: 22.0
-    require_rising: true
-    use_di_alignment: true
-    min_di_separation: 5.0
   symbol_filter:
     enabled: true
     banlist: []
@@ -85,8 +78,8 @@ strategy:
     min_scale: 0.6
     max_scale: 1.2
   entry_throttle:
-    max_new_positions_per_cycle: 36
-    max_open_positions: 36
+    max_new_positions_per_cycle: 8
+    max_open_positions: 16
     per_symbol_trade_cooldown_min: 60
     min_entry_zscore: 0.6
   soft_kill:
@@ -94,13 +87,26 @@ strategy:
     soft_daily_loss_pct: 1.5
     resume_after_minutes: 240
   time_of_day_whitelist:
-    enabled: true
+    enabled: false
     use_ema: true
     ema_alpha: 0.2
     min_trades_per_hour: 5
     min_hours_allowed: 6
     threshold_bps: 0.0
     fixed_hours: null
+  adx_filter:
+    enabled: true
+    len: 14
+    min_adx: 20
+    require_rising: false
+    min_di_separation: 3
+    use_di_alignment: true
+    di_hysteresis_bps: 4
+  funding_trim:
+    enabled: true
+    threshold_bps: 1.0
+    slope_per_bps: 0.02
+    max_reduction: 0.5
 liquidity:
   adv_cap_pct: 0.002
   notional_cap_usdt: 70
@@ -173,10 +179,6 @@ risk:
     - 0.33
     - 0.33
     reduce_only: true
-  no_progress:
-    enabled: true
-    min_minutes: 90
-    min_rr: 0.3
   exit_on_regime_flip:
     enabled: true
     confirm_bars: 1
@@ -211,6 +213,18 @@ risk:
   use_trailing_killswitch: true
   min_close_pnl_pct: 2.0
   max_hours_in_trade: 48
+  no_progress:
+    enabled: true
+    min_minutes: 20
+    min_rr: 0.3
+    min_close_pnl_pct: 0.0   # guard: require uPnL >= -0.05% to exit non-stop
+    tiers:
+      minutes: [20, 40, 80, 160]
+      min_rr:  [0.3, 0.45, 0.6, 0.8]
+  profit_lock:
+    enabled: true
+    triggers_r: [1.0, 1.5, 2.5]
+    lock_to_r:  [0.2, 0.6, 1.2]
 risk_stepdown:
   enabled: true
   dd_levels_pct:
@@ -229,6 +243,7 @@ risk_stepdown:
 paths:
   state_path: state/state.json
   logs_dir: logs
+  metrics_path: state/metrics.json
 logging:
   level: INFO
   file_max_mb: 20

@@ -325,6 +325,39 @@ class FastSLTPThread(threading.Thread):
         self.exit_regime_confirm = int(getattr(rx, "confirm_bars", 1) or 1)
 
     # -------- Adaptive scales (per symbol, on latest bar) --------
+        # --- Age-tiered no-progress ---
+        self.np_tier_minutes = []
+        self.np_tier_rr = []
+        if np_cfg and getattr(np_cfg, "tiers", None):
+            try:
+                self.np_tier_minutes = list(getattr(np_cfg.tiers, "minutes", []) or [])
+                self.np_tier_rr = list(getattr(np_cfg.tiers, "min_rr", []) or [])
+            except Exception:
+                self.np_tier_minutes = []
+                self.np_tier_rr = []
+        
+        # --- Profit-lock ladder ---
+        pl = getattr(self.cfg.risk, "profit_lock", None)
+        self.pl_enabled = bool(pl and pl.enabled)
+        self.pl_triggers = list(getattr(pl, "triggers_r", []) or [])
+        self.pl_locks = list(getattr(pl, "lock_to_r", []) or [])
+        
+        # --- DI hysteresis store ---
+        self.state.setdefault("di_hyst", {})
+    def _should_exit_non_stop(self, entry_px: float, last_close: float, qty: float) -> bool:
+        """Return True if allowed to exit non-stop, based on min_close_pnl_pct guard."""
+        try:
+            np_cfg = getattr(self.cfg.risk, "no_progress", None)
+            thr = float(getattr(np_cfg, "min_close_pnl_pct", 0.0)) if np_cfg else 0.0
+        except Exception:
+            thr = 0.0
+        if entry_px is None or last_close is None or float(entry_px) <= 0:
+            return True
+        sign = 1.0 if float(qty) > 0 else -1.0
+        ret_pct = (sign * (float(last_close) - float(entry_px)) / float(entry_px)) * 100.0
+        return ret_pct >= thr
+
+
     def _adaptive_scales(self, symbol: str, last_close: float) -> Tuple[float, float, float]:
         """Returns (sl_scale, trail_scale, ladder_r_scale)."""
         ad = getattr(self.cfg.risk, "adaptive", None)
@@ -354,6 +387,19 @@ class FastSLTPThread(threading.Thread):
         trail_scale = _pick(ad, "trail_scale", 1.0)
         ladd_scale = _pick(ad, "ladder_r_scale", 1.0)
         return sl_scale, trail_scale, ladd_scale
+    def _no_progress_required_rr(self, held_minutes: float) -> float:
+        """Return required RR given time-in-trade using age-tier schedule if configured."""
+        try:
+            if self.np_tier_minutes and self.np_tier_rr:
+                req = float(self.no_progress_min_rr)
+                for m, rr in sorted(zip(self.np_tier_minutes, self.np_tier_rr), key=lambda x: float(x[0])):
+                    if held_minutes >= float(m):
+                        req = float(rr)
+                return req
+        except Exception:
+            pass
+        return float(self.no_progress_min_rr)
+
 
     def _minutes_held(self, symbol: str) -> float:
         entered_iso = self.state.get("enter_bar_time", {}).get(symbol)
@@ -459,10 +505,22 @@ class FastSLTPThread(threading.Thread):
                         stop_px = min(stop_px, entry_price - lock * R_unit)
                         locked = lock
 
-        if locked > 0:
-            self.state.setdefault("locked_r", {})[symbol] = locked
+        # profit-lock ladder (independent of trailing unlocks)
+        if self.pl_enabled and self.pl_triggers and self.pl_locks:
+            for trig, lock in zip(self.pl_triggers, self.pl_locks):
+                trig_eff = float(trig) * (ladd_scale if ladd_scale else 1.0)
+                lock_r = float(lock)
+                if locked < lock_r:
+                    if sign > 0 and last_close >= entry_price + trig_eff * R_unit:
+                        stop_px = max(stop_px, entry_price + lock_r * R_unit)
+                        locked = lock_r
+                    elif sign < 0 and last_close <= entry_price - trig_eff * R_unit:
+                        stop_px = min(stop_px, entry_price - lock_r * R_unit)
+                        locked = lock_r
+            if locked > 0:
+                self.state.setdefault("locked_r", {})[symbol] = locked
 
-        # buffer (bps)
+# buffer (bps)
         buf = self.stop_buffer_bps / 10_000.0
         if buf > 0:
             stop_px = stop_px * (1.0 - buf) if sign > 0 else stop_px * (1.0 + buf)
@@ -630,11 +688,16 @@ class FastSLTPThread(threading.Thread):
                                 self._place_exit(sym, qty, "TIME-EXIT", last_c)
                                 continue
 
-                    # no-progress exit
+                    # no-progress exit (age-tiered, guarded by min_close_pnl_pct)
                     if self.no_progress_enabled and self._minutes_held(sym) >= self.no_progress_min_minutes:
-                        if float(pinfo.get("max_rr", 0.0)) < self.no_progress_min_rr:
-                            self._place_exit(sym, qty, "NO-PROGRESS", last_c)
-                            continue
+                        req_rr = self._no_progress_required_rr(self._minutes_held(sym))
+                        if float(pinfo.get('max_rr', 0.0)) < req_rr:
+                            ep_guard = float(self.state.get('perpos', {}).get(sym, {}).get('entry_price') or last_c)
+                            if self._should_exit_non_stop(ep_guard, last_c, qty):
+                                self._place_exit(sym, qty, 'NO-PROGRESS', last_c)
+                                continue
+                            else:
+                                log.debug(f'[SKIP-NO-PROGRESS] {sym}: uPnL below min_close_pnl_pct')
 
                     # compute stops
                     normal_px, cat_px, ep, R_unit_eff, sign = self._compute_stop_px(sym, last_closed)
@@ -1042,24 +1105,62 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                 continue
 
-            # ADX filter (per-asset)
+            
+            # ADX filter (per-asset) with optional rising ADX and DI separation
             eligible_syms = list(bars.keys())
             adx_cfg = getattr(cfg.strategy, "adx_filter", None)
+            di_bias_by_sym = {}
+            adx_blocked = 0
+
             if adx_cfg and adx_cfg.enabled:
-                blocked = 0
                 keep = []
                 for s, df in bars.items():
                     try:
-                        adx = _compute_adx(df[["high","low","close"]], int(adx_cfg.len)).iloc[-1]
-                        if float(adx) >= float(adx_cfg.min_adx):
+                        adx, plus_di, minus_di, adx_rising = _compute_dmi(df[["high","low","close"]], int(adx_cfg.len))
+                        a = float(adx.iloc[-1])
+                        rising_ok = True if not getattr(adx_cfg, "require_rising", False) else bool(adx_rising.iloc[-1])
+
+                        # DI separation (bps)
+                        min_sep = float(getattr(adx_cfg, "min_di_separation", 0.0) or 0.0)
+                        sep = abs(float(plus_di.iloc[-1]) - float(minus_di.iloc[-1]))
+                        sep_ok = True if min_sep <= 0 else (sep >= min_sep)
+
+                        if a >= float(adx_cfg.min_adx) and rising_ok and sep_ok:
                             keep.append(s)
+                            di_bias_by_sym[s] = 1 if float(plus_di.iloc[-1]) >= float(minus_di.iloc[-1]) else -1
                         else:
-                            blocked += 1
+                            adx_blocked += 1
                     except Exception:
                         keep.append(s)  # fail-open
                 eligible_syms = keep
-                if blocked > 0:
-                    log.info(f"ADX gate: {blocked}/{len(bars)} symbols blocked this cycle.")
+                if adx_blocked > 0:
+                    log.info(f"ADX gate: {adx_blocked}/{len(bars)} symbols blocked this cycle.")
+            else:
+                di_bias_by_sym = {s: 0 for s in eligible_syms}
+
+            # DI hysteresis smoothing
+            try:
+                hyst_bps = float(getattr(getattr(cfg.strategy, 'adx_filter', None), 'di_hysteresis_bps', 0.0) or 0.0)
+                if hyst_bps > 0:
+                    di_state = state.get('di_hyst', {})
+                    for _s, _bias in list(di_bias_by_sym.items()):
+                        try:
+                            df = bars.get(_s)
+                            if df is None or df.empty:
+                                continue
+                            _, pdi, mdi, _ = _compute_dmi(df[['high','low','close']], int(getattr(getattr(cfg.strategy, 'adx_filter', None), 'len', 14)))
+                            sep_bps = abs(float(pdi.iloc[-1]) - float(mdi.iloc[-1]))
+                            prev = di_state.get(_s, {})
+                            prev_bias = int(prev.get('bias', _bias))
+                            if _bias != prev_bias and sep_bps < hyst_bps:
+                                di_bias_by_sym[_s] = prev_bias
+                            else:
+                                di_state[_s] = {'bias': int(_bias), 'sep': float(sep_bps), 'ts': pd.Timestamp.utcnow().isoformat()}
+                        except Exception:
+                            pass
+                    state['di_hyst'] = di_state
+            except Exception:
+                pass
             # Time-of-day whitelist gate (UTC hours)
             tod_cfg = getattr(cfg.strategy, "time_of_day_whitelist", None)
             if tod_cfg and tod_cfg.enabled:
@@ -1117,6 +1218,17 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
             closes_used = closes[eligible_syms]
 
+            
+            # Ensure 'targets' is defined even if build_targets is skipped by earlier gates
+            targets = pd.Series(0.0, index=closes.columns)
+# Metrics snapshot
+            metrics = {
+                'ts': utcnow().isoformat(),
+                'total_syms': len(bars),
+                'eligible_after_adx': len(eligible_syms),
+            }
+
+
             # 2) Risk step-down with drawdown
             step_cfg = getattr(cfg, "risk_stepdown", None)
             gl_mult = 1.0
@@ -1152,28 +1264,49 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 except Exception:
                     pass
 
-            targets = build_targets(
-                closes_used,
-                cfg.strategy.lookbacks,
-                cfg.strategy.lookback_weights,
-                cfg.strategy.vol_lookback,
-                cfg.strategy.k_min,
-                cfg.strategy.k_max,
-                cfg.strategy.market_neutral,
-                cfg.strategy.gross_leverage * gl_mult,   # step-down applied here
-                cfg.strategy.max_weight_per_asset,
-                dynamic_k_fn=dynamic_k,
-                funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, "enabled", False) else None,
-                funding_weight=float(getattr(cfg.strategy.funding_tilt, "weight", 0.0)) if getattr(cfg.strategy.funding_tilt, "enabled", False) else 0.0,
-                entry_zscore_min=float(getattr(cfg.strategy, "entry_zscore_min", 0.0)),
-                diversify_enabled=bool(getattr(cfg.strategy.diversify, "enabled", False)),
-                corr_lookback=int(getattr(cfg.strategy.diversify, "corr_lookback", 48)),
-                max_pair_corr=float(getattr(cfg.strategy.diversify, "max_pair_corr", 0.9)),
-                vol_target_enabled=bool(getattr(cfg.strategy.vol_target, "enabled", False)),
-                target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, "target_daily_vol_bps", 0.0)),
-                vol_target_min_scale=float(getattr(cfg.strategy.vol_target, "min_scale", 0.5)),
-                vol_target_max_scale=float(getattr(cfg.strategy.vol_target, "max_scale", 2.0)),
-            )
+            # Funding-aware trimming (reduce target abs weight if we're paying high funding)
+            ft_cfg = getattr(cfg.strategy, 'funding_trim', None)
+            if ft_cfg and getattr(ft_cfg, 'enabled', False):
+                thr = float(getattr(ft_cfg, 'threshold_bps', 0.0) or 0.0)
+                slope = float(getattr(ft_cfg, 'slope_per_bps', 0.0) or 0.0)
+                max_red = float(getattr(ft_cfg, 'max_reduction', 0.5) or 0.5)
+                try:
+                    for _s in list(targets.index):
+                        w = float(targets.loc[_s])
+                        if w == 0.0:
+                            continue
+                        fr = funding_map.get(_s) if 'funding_map' in locals() else None
+                        if fr is None:
+                            continue
+                        try:
+                            fr_bps = float(fr) * 10_000.0
+                        except Exception:
+                            continue
+                        paying = (w > 0 and fr_bps > 0) or (w < 0 and fr_bps < 0)
+                        if not paying:
+                            continue
+                        excess = max(0.0, abs(fr_bps) - thr)
+                        if excess <= 0.0 or slope <= 0.0:
+                            continue
+                        red = min(max_red, slope * excess)
+                        targets.loc[_s] = w * (1.0 - red)
+                except Exception as e:
+                    log.debug(f'Funding trim failed: {e}')
+
+            # Optional DI alignment: zero weights that fight DMI direction
+            if getattr(getattr(cfg.strategy, 'adx_filter', None), 'use_di_alignment', False):
+                try:
+                    for _s in list(targets.index):
+                        w = float(targets.loc[_s])
+                        if w == 0.0:
+                            continue
+                        bias = di_bias_by_sym.get(_s)
+                        if bias is None or bias == 0:
+                            continue
+                        if (w > 0 and bias < 0) or (w < 0 and bias > 0):
+                            targets.loc[_s] = 0.0
+                except Exception as e:
+                    log.debug(f'DI alignment pass failed: {e}')
 
             # Reindex to full universe so blocked symbols have 0 weight
             targets = targets.reindex(closes.columns).fillna(0.0)
@@ -1199,6 +1332,11 @@ def run_live(cfg: AppConfig, dry: bool = False):
             # 3.4) Apply dynamic symbol filter (banlist/downsizing)
             targets = _apply_symbol_filter_to_targets(state, cfg, targets)
 
+            try:
+                metrics['nonzero_after_symbol_filter'] = int((targets != 0).sum())
+            except Exception:
+                pass
+
             # 4) Liquidity caps
             tickers = ex.fetch_tickers(list(targets.index))
             eq = ex.get_equity_usdt()
@@ -1209,6 +1347,11 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 adv_cap_pct=cfg.liquidity.adv_cap_pct,
                 notional_cap_usdt=cfg.liquidity.notional_cap_usdt,
             )
+
+            try:
+                metrics['nonzero_after_liquidity_caps'] = int((targets != 0).sum())
+            except Exception:
+                pass
 
             # 4.5) Reconcile & clean stale/open orders BEFORE creating new ones
             positions = ex.fetch_positions() or {}
@@ -1247,6 +1390,24 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     candidates.append((s, abs(float(w))))
             candidates.sort(key=lambda x: x[1], reverse=True)
             allow_syms_new = set([s for s, _ in candidates[: new_entries_cap]])
+            try:
+                metrics['candidates'] = int(len(candidates))
+                metrics['new_entries_cap'] = int(new_entries_cap)
+                metrics['open_symbols'] = int(len(open_symbols))
+            except Exception:
+                pass
+            # ---- Unified ENTRY_STATUS (exact layout) ----
+            kill_active = bool(disable_until_ts and time.time() < disable_until_ts)
+            tod_enabled = bool(getattr(getattr(cfg.strategy, 'time_of_day_whitelist', None), 'enabled', False))
+            tod_block = bool(tod_enabled and len(eligible_syms) == 0 and len(bars) > 0)
+            _adx_blocked = int(adx_blocked if 'adx_blocked' in locals() else 0)
+            _new_cap = int(new_entries_cap) if 'new_entries_cap' in locals() else int(getattr(getattr(cfg.strategy, 'entry_throttle', None), 'max_new_positions_per_cycle', 0))
+            _open_ct = int(len(open_symbols)) if 'open_symbols' in locals() else int(len(positions))
+            log.info(
+                'ENTRY_STATUS | eligible_syms=%d | adx_blocked=%d | tod_block=%s | soft_block=%s | kill_active=%s | throttle: new=%d open=%d',
+                int(len(eligible_syms)), _adx_blocked, str(tod_block), str(not allow_new_entries), str(kill_active), _new_cap, _open_ct,
+            )
+
 
             orders: List[Dict] = []
             for s, w in targets.items():
@@ -1341,6 +1502,13 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 write_json(state_path, state)
             except Exception as e:
                 log.warning(f"State persist failed: {e}")
+
+            try:
+                state['gate_metrics'] = metrics
+                mpath = getattr(cfg.paths, 'metrics_path', None) or (state_path.replace('state.json', 'metrics.json') if isinstance(state_path, str) else 'state/metrics.json')
+                write_json(mpath, metrics)
+            except Exception as e:
+                log.debug(f"Metrics persist failed: {e}")
 
             cycle_time = (utcnow() - cycle_started_at).total_seconds()
             log.info(f"Cycle complete in {cycle_time:.2f}s")
