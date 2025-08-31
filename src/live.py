@@ -25,6 +25,55 @@ log = logging.getLogger("live")
 
 # -------------------- helpers --------------------
 
+def _normalize_soft_block(value):
+    try:
+        if value is None:
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _state_get_hourstats(state: dict) -> dict:
+    return state.setdefault("hour_stats", {})
+
+def _ema_update(prev: Optional[float], value: float, alpha: float) -> float:
+    if prev is None:
+        return value
+    return float(alpha * value + (1 - alpha) * prev)
+
+def _update_hour_stats_on_close(state: dict, cfg: AppConfig, symbol: str, pnl_usdt: float, entry_time_iso: Optional[str]) -> None:
+    """
+    Update per-UTC-hour profitability stats on each closed trade.
+    Uses entry bar time if available to attribute PnL to the hour the trade was *started*.
+    """
+    tod_cfg = getattr(cfg.strategy, "time_of_day_whitelist", None)
+    if not tod_cfg or not getattr(tod_cfg, "enabled", False):
+        return
+    try:
+        if entry_time_iso:
+            et = pd.Timestamp(entry_time_iso)
+        else:
+            et = pd.Timestamp.utcnow()
+        hour = int(et.hour)
+        hs = _state_get_hourstats(state)
+        rec = hs.get(str(hour)) or {"n": 0, "sum": 0.0, "ema_pnl_bps": None}
+
+        # Convert pnl to bps approximating entry notional from state if present (fallback raw USDT)
+        # We store PnL in "bps-like" by dividing by abs(pnl) proxy? Safer: keep raw USDT and also EMA in USDT.
+        # For gating we can use EMA USDT >= 0 if threshold_bps == 0.
+        pnl = float(pnl_usdt or 0.0)
+
+        rec["n"] = int(rec["n"]) + 1
+        rec["sum"] = float(rec["sum"] or 0.0) + pnl
+        alpha = float(getattr(tod_cfg, "ema_alpha", 0.2))
+        rec["ema_usdt"] = _ema_update(rec.get("ema_usdt"), pnl, alpha)
+        hs[str(hour)] = rec
+        state["hour_stats"] = hs
+    except Exception as e:
+        log.debug(f"hour-stats update failed: {e}")
+
+
 def _safe_float(x, default: Optional[float] = None) -> Optional[float]:
     try:
         return float(x)
@@ -91,6 +140,34 @@ def _compute_adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
     dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0.0, np.nan)) * 100.0
     adx = dx.ewm(alpha=1.0 / n, adjust=False).mean()
     return adx
+
+
+def _compute_dmi(df: pd.DataFrame, n: int = 14):
+    """Return ADX, +DI, -DI and whether ADX is rising on the latest bar."""
+    high = df["high"].astype("float64")
+    low = df["low"].astype("float64")
+    close = df["close"].astype("float64")
+
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = ((up > down) & (up > 0)) * up
+    minus_dm = ((down > up) & (down > 0)) * down
+
+    tr1 = (high - low)
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1.0 / n, adjust=False).mean().replace(0.0, np.nan)
+
+    plus_di = 100.0 * (plus_dm.ewm(alpha=1.0 / n, adjust=False).mean() / atr)
+    minus_di = 100.0 * (minus_dm.ewm(alpha=1.0 / n, adjust=False).mean() / atr)
+
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0.0, np.nan)) * 100.0
+    adx = dx.ewm(alpha=1.0 / n, adjust=False).mean()
+
+    adx_rising = adx.diff() > 0
+    return adx, plus_di, minus_di, adx_rising
 
 # -------------------- DYNAMIC BANLIST / SYMBOL SCORING --------------------
 
@@ -167,7 +244,7 @@ def _apply_symbol_filter_to_targets(state: dict, cfg: AppConfig, targets: pd.Ser
     stats = _state_get_symstats(state)
     ban_static = set((sf_cfg.banlist or []))
     wl = set((sf_cfg.whitelist or []))
-    down_factor = float(sf_cfg.score.downweight_factor) if getattr(sf_cfg, "score", None) and sf_cfg.score.enabled else 1.0
+    down_factor = float(getattr(getattr(sf_cfg, "score", None), "downweight_factor", 0.6)) if getattr(getattr(sf_cfg, "score", None), "enabled", False) else 1.0
 
     out = targets.copy()
     now = pd.Timestamp.utcnow()
@@ -446,6 +523,7 @@ class FastSLTPThread(threading.Thread):
                 px = float(exit_px or ep)
                 realized = (px - ep) * (q if sign > 0 else -q)
                 _update_symbol_score_on_close(self.state, self.cfg, symbol, float(realized))
+                _update_hour_stats_on_close(self.state, self.cfg, symbol, float(realized), (self.state.get("enter_bar_time", {}) or {}).get(symbol))
             except Exception:
                 pass
 
@@ -814,7 +892,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
     day_start_equity = float(state.get("day_start_equity", 0.0))
     day_high_equity = float(state.get("day_high_equity", 0.0))
     disable_until_ts = float(state.get("disable_until_ts", 0.0))
-    soft_block_until_ts = float(state.get("soft_block_until_ts", 0.0))
+    soft_block_until_ts = (_tmp := state.get("soft_block_until_ts")) if isinstance(state.get("soft_block_until_ts"), (int, float, str)) and str(state.get("soft_block_until_ts")).strip() not in ("", "None") and not isinstance(state.get("soft_block_until_ts"), bool) else 0.0 if False else float(state.get("soft_block_until_ts") or 0.0)
     current_stepdown_tier = int(state.get("risk_stepdown_tier", 0))
 
     ex = ExchangeWrapper(cfg.exchange)
@@ -982,6 +1060,30 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 eligible_syms = keep
                 if blocked > 0:
                     log.info(f"ADX gate: {blocked}/{len(bars)} symbols blocked this cycle.")
+            # Time-of-day whitelist gate (UTC hours)
+            tod_cfg = getattr(cfg.strategy, "time_of_day_whitelist", None)
+            if tod_cfg and tod_cfg.enabled:
+                hour_now = int(pd.Timestamp.utcnow().hour)
+                allowed_hours = set((tod_cfg.fixed_hours or []))
+                if not allowed_hours:
+                    hs = state.get("hour_stats", {})
+                    allowed = []
+                    for h, rec in hs.items():
+                        n = int(rec.get("n") or 0)
+                        ema_usdt = float(rec.get("ema_usdt") or 0.0)
+                        if n >= int(tod_cfg.min_trades_per_hour or 0):
+                            if bool(tod_cfg.use_ema):
+                                # threshold in USDT per trade; if threshold_bps=0, we use non-negative EMA
+                                if ema_usdt >= float(getattr(tod_cfg, "threshold_bps", 0.0)):
+                                    allowed.append(int(h))
+                            else:
+                                if float(rec.get("sum") or 0.0) >= 0.0:
+                                    allowed.append(int(h))
+                    if len(allowed) >= int(tod_cfg.min_hours_allowed or 0):
+                        allowed_hours = set(allowed)
+                if allowed_hours and hour_now not in allowed_hours:
+                    log.info(f"Time-of-day gate: hour {hour_now} not in allowed {sorted(list(allowed_hours))}; pausing new entries this cycle.")
+                    eligible_syms = []
                 if not eligible_syms:
                     log.info("ADX gate blocked all symbols; staying flat.")
                     time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))

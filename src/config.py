@@ -72,6 +72,36 @@ class SoftWinLockCfg(BaseModel):
     lock_r: float = 0.0
     cooldown_minutes: int = 0
 
+class AdxFilterCfg(BaseModel):
+    enabled: bool = False
+    len: int = 14
+    min_adx: float = 20.0
+class SymbolScoreCfg(BaseModel):
+    enabled: bool = True
+    ema_alpha: float = 0.2
+    min_sample_trades: int = 8
+    block_below_win_rate_pct: float = 48.0
+    pf_block_threshold: float = 1.0
+    pf_warn_threshold: float = 1.2
+class SymbolFilterCfg(BaseModel):
+    enabled: bool = True
+    whitelist: list[str] | None = None
+    banlist: list[str] | None = None
+    ban_minutes_after_loss: int = 0
+    score: SymbolScoreCfg = SymbolScoreCfg()
+class TimeOfDayWhitelistCfg(BaseModel):
+    enabled: bool = False
+    # Only trade during hours with positive EMA PnL (or above threshold) computed from paper/live results
+    use_ema: bool = True
+    ema_alpha: float = 0.2
+    min_trades_per_hour: int = 5
+    min_hours_allowed: int = 6
+    # If use_ema=True, require ema_pnl_bps >= threshold_bps; else mean pnl >= 0
+    threshold_bps: float = 0.0
+    # Optional: hard allowlist of UTC hours (0-23) that overrides stats if provided
+    fixed_hours: list[int] | None = None
+    downweight_factor: float = 0.6
+
 
 class StrategyCfg(BaseModel):
     lookbacks: List[int]
@@ -95,6 +125,14 @@ class StrategyCfg(BaseModel):
     entry_throttle: EntryThrottleCfg = EntryThrottleCfg()
     soft_kill: SoftKillCfg = SoftKillCfg()
     soft_win_lock: SoftWinLockCfg = SoftWinLockCfg()
+    adx_filter: AdxFilterCfg = AdxFilterCfg()
+    symbol_filter: SymbolFilterCfg = SymbolFilterCfg()
+    time_of_day_whitelist: TimeOfDayWhitelistCfg = TimeOfDayWhitelistCfg()
+
+
+
+
+
 
 
 class LiquidityCfg(BaseModel):
@@ -211,6 +249,10 @@ def _merge_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
     raw["strategy"].setdefault("entry_throttle", {})
     raw["strategy"].setdefault("soft_kill", {})
     raw["strategy"].setdefault("soft_win_lock", {})
+    raw["strategy"].setdefault("adx_filter", {})
+    raw["strategy"].setdefault("symbol_filter", {})
+    raw["strategy"]["symbol_filter"].setdefault("banlist", [])
+    raw["strategy"].setdefault("time_of_day_whitelist", {})
 
     raw.setdefault("execution", {})
     raw["execution"].setdefault("stale_orders", {})
@@ -240,3 +282,4 @@ def load_config(yaml_path: str) -> AppConfig:
         raise RuntimeError(f"Invalid config.yaml: {e}")
 
     return cfg
+

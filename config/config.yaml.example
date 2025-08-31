@@ -1,3 +1,9 @@
+# Updated config with:
+# - strategy.adx_filter.{require_rising,use_di_alignment,min_di_separation}
+# - strategy.time_of_day_whitelist (dynamic hour gating)
+# - strategy.symbol_filter.banlist and score.downweight_factor
+# - strategy.regime_filter.hurst (optional)
+# - execution.{max_spread_bps,base_offset_bps} & execution.microstructure (optional)
 exchange:
   id: bybit
   account_type: swap
@@ -5,33 +11,33 @@ exchange:
   only_perps: true
   unified_margin: true
   testnet: false
-
-  max_symbols: 36
+  max_symbols: 100
   min_usd_volume_24h: 30000000
   min_price: 0.03
-  timeframe: "1h"
+  timeframe: 1h
   candles_limit: 1500
-
 strategy:
-  lookbacks: [1, 6, 24]
-  lookback_weights: [1.0, 1.0, 1.0]
+  lookbacks:
+  - 1
+  - 6
+  - 24
+  lookback_weights:
+  - 1.0
+  - 1.0
+  - 1.0
   vol_lookback: 72
-
   k_min: 2
   k_max: 6
-
   market_neutral: true
-  gross_leverage: 1.10
+  gross_leverage: 1.1
   max_weight_per_asset: 0.14
-
-  # --- ADX filter ---
   adx_filter:
     enabled: true
     len: 14
-    min_adx: 18.0
-    use_di_confirm: false
-
-  # --- dynamic symbol performance filter (banlist/downsizing) ---
+    min_adx: 22.0
+    require_rising: true
+    use_di_alignment: true
+    min_di_separation: 5.0
   symbol_filter:
     enabled: true
     banlist: []
@@ -40,59 +46,64 @@ strategy:
       enabled: true
       min_sample_trades: 25
       ema_alpha: 0.2
-
-      # downweight (but still trade) when below these:
       min_win_rate_pct: 48.0
       pf_downweight_threshold: 1.0
       downweight_factor: 0.5
-
-      # hard-ban when below these:
       block_below_win_rate_pct: 38.0
       pf_block_threshold: 0.75
-      pnl_block_threshold_usdt_per_trade: -0.20
-
+      pnl_block_threshold_usdt_per_trade: -0.2
       ban_minutes: 720
       grace_trades_after_unban: 10
       decay_days: 14
-
+      pf_warn_threshold: 1.2
+    ban_minutes_after_loss: 0
   regime_filter:
     enabled: true
     ema_len: 200
     slope_min_bps_per_day: 2.0
     use_abs: true
-
+    hurst:
+      enabled: true
+      lags:
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      min_h: 0.5
   funding_tilt:
     enabled: true
     weight: 0.15
-
   entry_zscore_min: 0.4
-
   diversify:
     enabled: true
     corr_lookback: 96
-    max_pair_corr: 0.60
-
+    max_pair_corr: 0.6
   vol_target:
     enabled: true
     target_daily_vol_bps: 60
     min_scale: 0.6
     max_scale: 1.2
-
   entry_throttle:
     max_new_positions_per_cycle: 36
     max_open_positions: 36
     per_symbol_trade_cooldown_min: 60
     min_entry_zscore: 0.6
-
   soft_kill:
     enabled: true
     soft_daily_loss_pct: 1.5
     resume_after_minutes: 240
-
+  time_of_day_whitelist:
+    enabled: true
+    use_ema: true
+    ema_alpha: 0.2
+    min_trades_per_hour: 5
+    min_hours_allowed: 6
+    threshold_bps: 0.0
+    fixed_hours: null
 liquidity:
   adv_cap_pct: 0.002
   notional_cap_usdt: 70
-
 execution:
   reload_positions_on_start: true
   order_type: limit
@@ -100,30 +111,25 @@ execution:
   price_offset_bps: 3
   slippage_bps_guard: 25
   set_leverage: 3
-
   rebalance_minute: 5
   poll_seconds: 15
   align_after_funding_minutes: 0
-  funding_hours_utc: [0, 8, 16]
-
+  funding_hours_utc:
+  - 0
+  - 8
+  - 16
   min_notional_per_order_usdt: 15
   min_rebalance_delta_bps: 60
-
   cancel_open_orders_on_start: true
-
-  # Spread guard + dynamic price offset
   spread_guard:
     enabled: true
     max_spread_bps: 12.0
     skip_if_wider: true
-
   dynamic_offset:
     enabled: true
     base_bps: 3.0
-    per_spread_coeff: 0.50
+    per_spread_coeff: 0.5
     max_offset_bps: 20.0
-
-  # Stale order reconciliation / cleanup
   stale_orders:
     enabled: true
     cleanup_interval_sec: 45
@@ -131,82 +137,98 @@ execution:
     reprice_if_far_bps: 15.0
     cancel_if_not_targeted: true
     keep_reduce_only: true
-
+  max_spread_bps: 12.0
+  base_offset_bps: 3.0
+  microstructure:
+    enabled: false
+    min_obi: 0.15
+    max_spread_bps: 8.0
 risk:
   atr_len: 28
   atr_mult_sl: 3.2
   atr_mult_tp: 4.2
   use_tp: true
-
   fast_check_seconds: 2
-  stop_timeframe: "5m"
+  stop_timeframe: 5m
   trailing_enabled: true
   trail_atr_mult: 3.0
   breakeven_after_r: 2.0
-
   stop_on_close_only: true
   stop_confirm_bars: 1
   min_hold_minutes: 12
   catastrophic_atr_mult: 3.5
-
   stop_buffer_bps: 10
   cooldown_minutes_after_stop: 90
-
   partial_tp_enabled: true
   partial_tp_r: 2.5
   partial_tp_size: 0.5
-
-  # Volatility-aware partial TP ladders
   partial_ladders:
     enabled: true
-    r_levels: [1.0, 1.8, 2.6]
-    sizes:    [0.34, 0.33, 0.33]
+    r_levels:
+    - 1.0
+    - 1.8
+    - 2.6
+    sizes:
+    - 0.34
+    - 0.33
+    - 0.33
     reduce_only: true
-
-  # No-progress exit
   no_progress:
     enabled: true
     min_minutes: 90
-    min_rr: 0.30
-
-  # FAST exit on regime flip
+    min_rr: 0.3
   exit_on_regime_flip:
     enabled: true
-    confirm_bars: 1   # require N consecutive non-OK regime closes before exit
-
-  # Trailing unlocks (config-driven)
+    confirm_bars: 1
   trailing_unlocks:
     enabled: true
-    triggers_r: [0.8, 1.5, 2.5]  # when +R reaches these, lock the levels below
-    lock_r:      [0.0, 0.5, 1.2] # stop moves to entry+lock*R (long) or entry-lock*R (short)
-
-  # Adaptive TP/SL (volatility regime scaling)
+    triggers_r:
+    - 0.8
+    - 1.5
+    - 2.5
+    lock_r:
+    - 0.0
+    - 0.5
+    - 1.2
   adaptive:
     enabled: true
-    low_thr_bps: 40          # ATR% (bps) <= low → "low" tier
-    high_thr_bps: 120        # ATR% (bps) >= high → "high" tier
-    sl_scale:        {low: 1.40, mid: 1.00, high: 0.80}   # scales atr_mult_sl
-    trail_scale:     {low: 1.20, mid: 1.00, high: 0.80}   # scales trail_atr_mult
-    ladder_r_scale:  {low: 1.10, mid: 1.00, high: 0.90}   # scales R triggers (both unlock & partial ladders)
-
+    low_thr_bps: 40
+    high_thr_bps: 120
+    sl_scale:
+      low: 1.4
+      mid: 1.0
+      high: 0.8
+    trail_scale:
+      low: 1.2
+      mid: 1.0
+      high: 0.8
+    ladder_r_scale:
+      low: 1.1
+      mid: 1.0
+      high: 0.9
   max_daily_loss_pct: 3.0
   trade_disable_minutes: 360
   use_trailing_killswitch: true
   min_close_pnl_pct: 2.0
-
   max_hours_in_trade: 48
-
 risk_stepdown:
   enabled: true
-  dd_levels_pct: [2.0, 4.0, 6.0]
-  gross_leverage_multipliers: [0.9, 0.75, 0.6]
-  max_new_positions_multipliers: [0.8, 0.6, 0.4]
+  dd_levels_pct:
+  - 2.0
+  - 4.0
+  - 6.0
+  gross_leverage_multipliers:
+  - 0.9
+  - 0.75
+  - 0.6
+  max_new_positions_multipliers:
+  - 0.8
+  - 0.6
+  - 0.4
   recover_hysteresis_pct: 1.0
-
 paths:
-  state_path: "state/state.json"
-  logs_dir: "logs"
-
+  state_path: state/state.json
+  logs_dir: logs
 logging:
   level: INFO
   file_max_mb: 20
