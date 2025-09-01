@@ -1,9 +1,3 @@
-# Updated config with:
-# - strategy.adx_filter.{require_rising,use_di_alignment,min_di_separation}
-# - strategy.time_of_day_whitelist (dynamic hour gating)
-# - strategy.symbol_filter.banlist and score.downweight_factor
-# - strategy.regime_filter.hurst (optional)
-# - execution.{max_spread_bps,base_offset_bps} & execution.microstructure (optional)
 exchange:
   id: bybit
   account_type: swap
@@ -31,22 +25,30 @@ strategy:
   market_neutral: true
   gross_leverage: 1.1
   max_weight_per_asset: 0.14
+  adx_filter:
+    enabled: true
+    len: 14
+    min_adx: 22
+    require_rising: true
+    use_di_alignment: true
+    min_di_separation: 5
+    di_hysteresis_bps: 8
   symbol_filter:
     enabled: true
     banlist: []
     whitelist: []
     score:
       enabled: true
-      min_sample_trades: 25
+      min_sample_trades: 6
       ema_alpha: 0.2
-      min_win_rate_pct: 48.0
+      min_win_rate_pct: 38.0
       pf_downweight_threshold: 1.0
       downweight_factor: 0.5
       block_below_win_rate_pct: 38.0
-      pf_block_threshold: 0.75
-      pnl_block_threshold_usdt_per_trade: -0.2
-      ban_minutes: 720
-      grace_trades_after_unban: 10
+      pf_block_threshold: 0.90
+      pnl_block_threshold_usdt_per_trade: -0.1
+      ban_minutes: 1440
+      grace_trades_after_unban: 3
       decay_days: 14
       pf_warn_threshold: 1.2
     ban_minutes_after_loss: 0
@@ -67,46 +69,38 @@ strategy:
   funding_tilt:
     enabled: true
     weight: 0.15
-  entry_zscore_min: 0.4
+  entry_zscore_min: 0.8
   diversify:
     enabled: true
-    corr_lookback: 96
-    max_pair_corr: 0.6
+    corr_lookback: 48
+    max_pair_corr: 0.85
   vol_target:
     enabled: true
     target_daily_vol_bps: 60
     min_scale: 0.6
     max_scale: 1.2
   entry_throttle:
-    max_new_positions_per_cycle: 8
-    max_open_positions: 16
-    per_symbol_trade_cooldown_min: 60
+    max_new_positions_per_cycle: 3
+    max_open_positions: 12
+    per_symbol_trade_cooldown_min: 30
     min_entry_zscore: 0.6
   soft_kill:
     enabled: true
     soft_daily_loss_pct: 1.5
     resume_after_minutes: 240
   time_of_day_whitelist:
-    enabled: false
+    enabled: true
     use_ema: true
     ema_alpha: 0.2
-    min_trades_per_hour: 5
-    min_hours_allowed: 6
+    min_trades_per_hour: 8
+    min_hours_allowed: 12
     threshold_bps: 0.0
     fixed_hours: null
-  adx_filter:
-    enabled: true
-    len: 14
-    min_adx: 20
-    require_rising: false
-    min_di_separation: 3
-    use_di_alignment: true
-    di_hysteresis_bps: 4
   funding_trim:
     enabled: true
-    threshold_bps: 1.0
-    slope_per_bps: 0.02
-    max_reduction: 0.5
+    threshold_bps: 3.0
+    slope_per_bps: 0.01
+    max_reduction: 0.4
 liquidity:
   adv_cap_pct: 0.002
   notional_cap_usdt: 70
@@ -125,11 +119,11 @@ execution:
   - 8
   - 16
   min_notional_per_order_usdt: 15
-  min_rebalance_delta_bps: 60
+  min_rebalance_delta_bps: 30
   cancel_open_orders_on_start: true
   spread_guard:
     enabled: true
-    max_spread_bps: 12.0
+    max_spread_bps: 15
     skip_if_wider: true
   dynamic_offset:
     enabled: true
@@ -179,6 +173,22 @@ risk:
     - 0.33
     - 0.33
     reduce_only: true
+  no_progress:
+    enabled: true
+    min_minutes: 20
+    min_rr: 0.3
+    min_close_pnl_pct: 0.0
+    tiers:
+      minutes:
+      - 20
+      - 40
+      - 80
+      - 160
+      min_rr:
+      - 0.3
+      - 0.45
+      - 0.6
+      - 0.8
   exit_on_regime_flip:
     enabled: true
     confirm_bars: 1
@@ -213,18 +223,16 @@ risk:
   use_trailing_killswitch: true
   min_close_pnl_pct: 2.0
   max_hours_in_trade: 48
-  no_progress:
-    enabled: true
-    min_minutes: 20
-    min_rr: 0.3
-    min_close_pnl_pct: 0.0   # guard: require uPnL >= -0.05% to exit non-stop
-    tiers:
-      minutes: [20, 40, 80, 160]
-      min_rr:  [0.3, 0.45, 0.6, 0.8]
   profit_lock:
     enabled: true
-    triggers_r: [1.0, 1.5, 2.5]
-    lock_to_r:  [0.2, 0.6, 1.2]
+    triggers_r:
+    - 1.0
+    - 1.5
+    - 2.5
+    lock_to_r:
+    - 0.2
+    - 0.6
+    - 1.2
 risk_stepdown:
   enabled: true
   dd_levels_pct:
