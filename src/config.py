@@ -171,6 +171,11 @@ class ExecutionCfg(BaseModel):
     stale_orders: StaleOrdersCfg = StaleOrdersCfg()
 
 
+
+
+    # If True, when computed order size is below the exchange minimum amount/notional,
+    # bump the size up to the minimum instead of skipping the trade.
+    bump_to_exchange_min: bool = True
 class RiskCfg(BaseModel):
     atr_len: int = 28
     atr_mult_sl: float = 2.0

@@ -25,6 +25,46 @@ log = logging.getLogger("live")
 
 # -------------------- helpers --------------------
 
+def _bump_qty_to_exchange_min(ex: ExchangeWrapper, cfg: AppConfig, symbol: str, qty: float, price_for_cost: float | None) -> float:
+    """Bump qty up to exchange min amount/notional, then apply amount_to_precision.
+    Only used for opening (non-reduce-only) orders when enabled via cfg.execution.bump_to_exchange_min.
+    """
+    try:
+        if not bool(getattr(cfg.execution, "bump_to_exchange_min", True)):
+            return float(qty)
+        # Try to get market definition and limits
+        market = None
+        try:
+            market = ex.x.market(symbol)
+        except Exception:
+            try:
+                ex.load_markets()
+                market = ex.x.market(symbol)
+            except Exception:
+                market = None
+        min_amt = None
+        min_cost = None
+        if isinstance(market, dict):
+            limits = market.get("limits") or {}
+            amt_lim = limits.get("amount") or {}
+            cost_lim = limits.get("cost") or {}
+            min_amt = amt_lim.get("min")
+            min_cost = cost_lim.get("min")
+        px = float(price_for_cost or 0.0)
+        if min_cost and px > 0:
+            implied_min_amt = float(min_cost) / px
+            min_amt = implied_min_amt if min_amt is None else max(float(min_amt), implied_min_amt)
+        if min_amt is not None:
+            qty = max(float(qty), float(min_amt))
+        try:
+            qty = float(ex.x.amount_to_precision(symbol, qty))
+        except Exception:
+            pass
+        return float(qty)
+    except Exception:
+        return float(qty)
+
+
 def _normalize_soft_block(value):
     try:
         if value is None:
@@ -892,7 +932,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
     day_start_equity = float(state.get("day_start_equity", 0.0))
     day_high_equity = float(state.get("day_high_equity", 0.0))
     disable_until_ts = float(state.get("disable_until_ts", 0.0))
-    soft_block_until_ts = (_tmp := state.get("soft_block_until_ts")) if isinstance(state.get("soft_block_until_ts"), (int, float, str)) and str(state.get("soft_block_until_ts")).strip() not in ("", "None") and not isinstance(state.get("soft_block_until_ts"), bool) else 0.0 if False else float(state.get("soft_block_until_ts") or 0.0)
+    soft_block_until_ts = _normalize_soft_block(state.get("soft_block_until_ts"))
     current_stepdown_tier = int(state.get("risk_stepdown_tier", 0))
 
     ex = ExchangeWrapper(cfg.exchange)
@@ -1050,8 +1090,19 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 keep = []
                 for s, df in bars.items():
                     try:
-                        adx = _compute_adx(df[["high","low","close"]], int(adx_cfg.len)).iloc[-1]
-                        if float(adx) >= float(adx_cfg.min_adx):
+                        dmi = _compute_dmi(df[["high","low","close"]], int(adx_cfg.len))
+                        adx_now = float(dmi["adx"].iloc[-1])
+                        cond = adx_now >= float(getattr(adx_cfg, "min_adx", 0.0))
+                        if bool(getattr(adx_cfg, "require_rising", False)):
+                            adx_rising = float(dmi["adx"].diff().iloc[-1] or 0.0) > 0.0
+                            cond = cond and adx_rising
+                        sep_req = float(getattr(adx_cfg, "min_di_separation", 0.0) or 0.0)
+                        if sep_req > 0.0:
+                            plus_di = float(dmi["+di"].iloc[-1])
+                            minus_di = float(dmi["-di"].iloc[-1])
+                            sep = abs(plus_di - minus_di)
+                            cond = cond and (sep >= sep_req)
+                        if cond:
                             keep.append(s)
                         else:
                             blocked += 1
@@ -1085,7 +1136,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     log.info(f"Time-of-day gate: hour {hour_now} not in allowed {sorted(list(allowed_hours))}; pausing new entries this cycle.")
                     eligible_syms = []
                 if not eligible_syms:
-                    log.info("ADX gate blocked all symbols; staying flat.")
+                    log.info("Time-of-day gate blocked all symbols; staying flat.")
                     time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                     continue
 
@@ -1203,6 +1254,49 @@ def run_live(cfg: AppConfig, dry: bool = False):
             # 3.4) Apply dynamic symbol filter (banlist/downsizing)
             targets = _apply_symbol_filter_to_targets(state, cfg, targets)
 
+            # 3.5) Funding trim (reduce exposure on paying side of extreme funding)
+            ft_cfg = getattr(cfg.strategy, "funding_trim", None)
+            if ft_cfg and getattr(ft_cfg, "enabled", False):
+                try:
+                    if not funding_map:
+                        funding_map = ex.fetch_funding_rates(list(targets.index)) or {}
+                except Exception:
+                    funding_map = funding_map or {}
+                thr = float(getattr(ft_cfg, "threshold_bps", 0.0) or 0.0)
+                slope = float(getattr(ft_cfg, "slope_per_bps", 0.0) or 0.0)
+                max_red = float(getattr(ft_cfg, "max_reduction", 0.9) or 0.9)
+                if slope > 0 and max_red > 0:
+                    for s in list(targets.index):
+                        r_bps = float((funding_map or {}).get(s, 0.0) or 0.0)
+                        w = float(targets.get(s, 0.0) or 0.0)
+                        # paying side if funding and weight have same sign (assuming positive means longs pay)
+                        paying = (r_bps > 0 and w > 0) or (r_bps < 0 and w < 0)
+                        if not paying or w == 0.0:
+                            continue
+                        excess = max(0.0, abs(r_bps) - thr)
+                        if excess > 0.0:
+                            reduce = min(max_red, slope * excess)
+                            targets.loc[s] = w * max(0.0, 1.0 - reduce)
+
+            # 3.6) Optional DI alignment filter: drop weights whose sign conflicts with DMI direction when separation is strong
+            adx_cfg = getattr(cfg.strategy, "adx_filter", None)
+            if adx_cfg and getattr(adx_cfg, "enabled", False) and bool(getattr(adx_cfg, "use_di_alignment", False)):
+                sep_req = float(getattr(adx_cfg, "min_di_separation", 0.0) or 0.0)
+                for s in list(targets.index):
+                    if s not in bars:
+                        continue
+                    try:
+                        dmi = _compute_dmi(bars[s][["high","low","close"]], int(adx_cfg.len))
+                        plus_di = float(dmi["+di"].iloc[-1])
+                        minus_di = float(dmi["-di"].iloc[-1])
+                        sep = abs(plus_di - minus_di)
+                        if sep >= sep_req:
+                            w = float(targets.get(s, 0.0) or 0.0)
+                            if (w > 0 and plus_di < minus_di) or (w < 0 and minus_di < plus_di):
+                                targets.loc[s] = 0.0
+                    except Exception:
+                        pass
+    
             # 4) Liquidity caps
             tickers = ex.fetch_tickers(list(targets.index))
             eq = ex.get_equity_usdt()
@@ -1325,6 +1419,10 @@ def run_live(cfg: AppConfig, dry: bool = False):
             for od in orders:
                 s = od["symbol"]; side = od["side"]; q = float(od["qty"]); px = od["price"]; ro = bool(od.get("reduceOnly", False))
                 tkr = (tickers.get(s, {}) or {})
+                # bump undersized opens
+                if not ro:
+                    price_for_cost = float(px or (tkr.get("last") or tkr.get("close") or 0.0) or 0.0)
+                    q = _bump_qty_to_exchange_min(ex, cfg, s, q, price_for_cost)
                 notional = q * float(tkr.get("last") or tkr.get("close") or 0.0)
                 try:
                     if dry:

@@ -101,7 +101,7 @@ strategy:
     enabled: true
     threshold_bps: 3.0
     slope_per_bps: 0.01
-    max_reduction: 0.4
+    max_reduction: 0.40
 liquidity:
   adv_cap_pct: 0.002
   notional_cap_usdt: 70

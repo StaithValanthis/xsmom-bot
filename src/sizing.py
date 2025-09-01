@@ -25,7 +25,9 @@ import numpy as np
 import pandas as pd
 
 def _pct_change(df: pd.DataFrame) -> pd.DataFrame:
-    return df.pct_change()
+    df = df.ffill()                      # explicit pad if that's what you intended
+    out = df.pct_change(fill_method=None)  # silence deprecation; no implicit pad
+    return out
 
 def _zscore(s: pd.Series) -> pd.Series:
     mu = float(s.mean())
