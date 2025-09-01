@@ -11,6 +11,7 @@ exchange:
   timeframe: 1h
   candles_limit: 1500
 strategy:
+  signal_power: 1.35
   lookbacks:
   - 1
   - 6
@@ -145,13 +146,13 @@ execution:
     max_spread_bps: 8.0
 risk:
   atr_len: 28
-  atr_mult_sl: 3.2
-  atr_mult_tp: 4.2
+  atr_mult_sl: 2.2
+  atr_mult_tp: 3.0
   use_tp: true
   fast_check_seconds: 2
   stop_timeframe: 5m
   trailing_enabled: true
-  trail_atr_mult: 3.0
+  trail_atr_mult: 1.2
   breakeven_after_r: 2.0
   stop_on_close_only: true
   stop_confirm_bars: 1
@@ -196,8 +197,8 @@ risk:
     enabled: true
     triggers_r:
     - 0.8
-    - 1.5
-    - 2.5
+    - 1.3
+    - 2.0
     lock_r:
     - 0.0
     - 0.5
@@ -227,12 +228,12 @@ risk:
     enabled: true
     triggers_r:
     - 1.0
-    - 1.5
-    - 2.5
+    - 1.3
+    - 2.0
     lock_to_r:
-    - 0.2
-    - 0.6
-    - 1.2
+    - 0.1
+    - 0.5
+    - 1.0
 risk_stepdown:
   enabled: true
   dd_levels_pct:

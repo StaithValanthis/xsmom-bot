@@ -1172,6 +1172,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, 'target_daily_vol_bps', 0.0)),
                 vol_target_min_scale=float(getattr(cfg.strategy.vol_target, 'min_scale', 0.5)),
                 vol_target_max_scale=float(getattr(cfg.strategy.vol_target, 'max_scale', 1.2)),
+                signal_power=float(getattr(cfg.strategy, 'signal_power', 1.35)),
             )
             try:
                 metrics['nonzero_before_cooldowns'] = int((targets != 0).sum())

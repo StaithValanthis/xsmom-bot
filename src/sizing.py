@@ -1,55 +1,127 @@
-# v1.2.0 – 2025-08-21
+# -*- coding: utf-8 -*-
+"""
+sizing.py.next — drop-in replacement for build_targets with confidence-weighted sizing.
+Implements `signal_power` (zscore^p inside-bucket weighting), entry z-score filter,
+optional funding tilt, diversify (pair-corr cap), and soft vol targeting.
+
+Signature kept compatible with live.py call:
+    build_targets(
+        closes, lookbacks, lookback_weights, vol_lookback,
+        k_min, k_max, market_neutral, gross_leverage, max_weight_per_asset,
+        dynamic_k_fn=None,
+        funding_tilt=None, funding_weight=0.0,
+        entry_zscore_min=0.0,
+        diversify_enabled=False, corr_lookback=48, max_pair_corr=0.9,
+        vol_target_enabled=False, target_daily_vol_bps=0.0,
+        vol_target_min_scale=0.5, vol_target_max_scale=1.2,
+        signal_power=1.35,
+    )
+"""
 from __future__ import annotations
-import logging
+
+import math
+from typing import Iterable, Optional, Callable, Dict
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional, List, Tuple
 
-from .signals import momentum_score, inverse_vol_weights
-
-log = logging.getLogger("sizing")
+def _pct_change(df: pd.DataFrame) -> pd.DataFrame:
+    return df.pct_change()
 
 def _zscore(s: pd.Series) -> pd.Series:
-    m = s.mean()
-    v = s.std()
-    if not np.isfinite(v) or v <= 0:
-        return pd.Series(0.0, index=s.index)
-    return (s - m) / v
+    mu = float(s.mean())
+    sd = float(s.std())
+    if not np.isfinite(sd) or sd < 1e-12:
+        sd = 1.0
+    z = (s - mu) / sd
+    return z.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-def _pick_diversified(
-    ranked: List[str],
-    rets: pd.DataFrame,
-    k: int,
-    max_pair_corr: float,
-) -> List[str]:
-    chosen: List[str] = []
-    if k <= 0 or len(ranked) == 0 or rets.shape[0] < 2:
-        return chosen
-    corr = rets.corr().clip(-1.0, 1.0).fillna(0.0)
-    for s in ranked:
-        if len(chosen) >= k:
+def _momentum_score(closes: pd.DataFrame,
+                    lookbacks: Iterable[int],
+                    weights: Iterable[float]) -> pd.Series:
+    score = pd.Series(0.0, index=closes.columns, dtype=float)
+    for lb, w in zip(lookbacks, weights):
+        if lb <= 0:
+            continue
+        ret = (closes / closes.shift(lb) - 1.0).iloc[-1].astype(float)
+        score = score.add(w * ret, fill_value=0.0)
+    return score.fillna(0.0)
+
+def _inverse_vol_weights(closes: pd.DataFrame, vol_lookback: int) -> pd.Series:
+    rets = _pct_change(closes).iloc[-vol_lookback:]
+    vol = rets.std().replace(0, np.nan)
+    iv = 1.0 / vol
+    iv = iv / iv.sum()
+    return iv.fillna(0.0)
+
+def _cap_pair_corr(selected: list[str], rets: pd.DataFrame, max_pair_corr: float, score: pd.Series) -> list[str]:
+    """
+    Greedy prune to satisfy pairwise |corr| <= max_pair_corr.
+    Drops the lowest-score asset among any violating pair until satisfied.
+    """
+    if len(selected) <= 1:
+        return selected
+    keep = list(selected)
+    sub = rets[keep].fillna(0.0)
+    # compute once; update lazily
+    while True:
+        C = sub.corr().fillna(0.0).values
+        np.fill_diagonal(C, 0.0)
+        i, j = divmod(np.abs(C).argmax(), C.shape[1])
+        if C.size == 0 or abs(C[i, j]) <= max_pair_corr:
             break
-        ok = True
-        for c in chosen:
-            if abs(float(corr.loc[s, c])) > max_pair_corr:
-                ok = False
-                break
-        if ok:
-            chosen.append(s)
-    return chosen
+        # drop the worse-scored of the pair
+        a, b = keep[i], keep[j]
+        drop = a if score[a] <= score[b] else b
+        keep.remove(drop)
+        sub = rets[keep].fillna(0.0)
+        if len(keep) <= 1:
+            break
+    return keep
+
+def _portfolio_vol(w: pd.Series, rets: pd.DataFrame) -> float:
+    if w.abs().sum() == 0:
+        return 0.0
+    cov = rets.cov()
+    v = float(np.dot(w.values, cov.values @ w.values))
+    return math.sqrt(max(v, 0.0))
+
+def apply_liquidity_caps(targets, cfg=None, *_, **__):
+    """
+    Simple per-asset cap based on a config:
+      strategy.liquidity_caps.enabled: bool
+      strategy.liquidity_caps.max_weight_low_liq: float (e.g., 0.02)
+      strategy.liquidity_caps.symbols_low_liq: list[str]
+    If cfg or fields are missing, this is a no-op.
+    """
+    try:
+        if not hasattr(cfg, "strategy"):
+            return targets.fillna(0.0)
+        lc = getattr(cfg.strategy, "liquidity_caps", None)
+        if not lc or not getattr(lc, "enabled", False):
+            return targets.fillna(0.0)
+
+        max_w = float(getattr(lc, "max_weight_low_liq", 0.0) or 0.0)
+        low_syms = set(getattr(lc, "symbols_low_liq", []) or [])
+        out = targets.copy().fillna(0.0)
+        if max_w > 0 and low_syms:
+            # clip only the designated low-liquidity symbols
+            out.loc[out.index.intersection(low_syms)] = out.loc[out.index.intersection(low_syms)].clip(-max_w, max_w)
+        return out
+    except Exception:
+        return targets.fillna(0.0)
+
 
 def build_targets(
-    window: pd.DataFrame,
-    lookbacks: List[int],
-    weights: List[float],
+    closes: pd.DataFrame,
+    lookbacks: Iterable[int],
+    lookback_weights: Iterable[float],
     vol_lookback: int,
     k_min: int,
     k_max: int,
     market_neutral: bool,
     gross_leverage: float,
     max_weight_per_asset: float,
-    *,
-    dynamic_k_fn,
+    dynamic_k_fn: Optional[Callable[[pd.Series], int]] = None,
     funding_tilt: Optional[Dict[str, float]] = None,
     funding_weight: float = 0.0,
     entry_zscore_min: float = 0.0,
@@ -59,107 +131,98 @@ def build_targets(
     vol_target_enabled: bool = False,
     target_daily_vol_bps: float = 0.0,
     vol_target_min_scale: float = 0.5,
-    vol_target_max_scale: float = 2.0,
+    vol_target_max_scale: float = 1.2,
+    signal_power: float = 1.35,
 ) -> pd.Series:
     """
-    Returns target weights (sum(abs)=gross_leverage if market_neutral).
+    Returns a vector of target weights indexed by symbol.
     """
-    closes = window["close"].unstack(0) if isinstance(window.columns, pd.MultiIndex) else window
-    prices = closes.dropna(how="all", axis=1).copy()
-    prices = prices.ffill().bfill()
+    closes = closes.copy()
+    cols = list(closes.columns)
+    if len(cols) == 0:
+        return pd.Series(dtype=float)
 
-    # 1) Momentum score
-    score = momentum_score(prices, lookbacks, weights).fillna(0.0)
+    # 1) score & (optional) funding tilt to selection score
+    score = _momentum_score(closes, lookbacks, lookback_weights)
 
-    # 2) Compute dynamic K and rank
-    kL, kS = dynamic_k_fn(score, k_min, k_max)
-    longs = score.sort_values(ascending=False).index.tolist()
-    shorts = score.sort_values(ascending=True).index.tolist()
+    if funding_tilt is not None and funding_weight:
+        # funding_tilt: dict {sym: signed tilt}, higher tilt favours long, lower favours short
+        tilt = pd.Series(funding_tilt).reindex(cols)
+        tilt = pd.to_numeric(tilt, errors="coerce").fillna(0.0)  # avoid FutureWarning on fillna downcast
+        score = score + float(funding_weight) * tilt
 
-    # 3) Entry quality gate via z-score
-    z = _zscore(score)
-    longs = [s for s in longs if float(z.loc[s]) >= entry_zscore_min]
-    shorts = [s for s in shorts if float(-z.loc[s]) >= entry_zscore_min]
+    # entry floor by zscore
+    z_all = _zscore(score)
+    eligible = z_all.index[(z_all.abs() >= float(entry_zscore_min))]
 
-    # 4) Diversification gating (optional)
-    if diversify_enabled:
-        recent = prices.pct_change().iloc[-corr_lookback:].dropna(how="all", axis=1)
-        longs = _pick_diversified(longs, recent, kL, max_pair_corr)
-        shorts = _pick_diversified(shorts, recent, kS, max_pair_corr)
+    # 2) choose K
+    if callable(dynamic_k_fn):
+        try:
+            # preferred: dynamic_k(score, k_min, k_max)
+            K = int(dynamic_k_fn(score, k_min, k_max))
+        except TypeError:
+            try:
+                # fallback: dynamic_k(score)
+                K = int(dynamic_k_fn(score))
+            except TypeError:
+                # last resort: midpoint
+                K = int(round(0.5 * (k_min + k_max)))
     else:
-        longs = longs[:kL]
-        shorts = shorts[:kS]
+        K = int(round(0.5 * (k_min + k_max)))
+    K = int(max(k_min, min(k_max, K)))
+    kL = kS = max(0, K)
 
-    # 5) Inverse-vol scaling (per-side)
-    iv = inverse_vol_weights(prices, vol_lookback)
+    # Rank on *raw* score for direction
+    ranks_desc = score.sort_values(ascending=False).index.tolist()
+    longs = [s for s in ranks_desc if s in eligible][:kL]
+    shorts = [s for s in reversed(ranks_desc) if s in eligible][:kS]
 
-    wl = (iv.reindex(longs).fillna(0.0))
-    ws = (iv.reindex(shorts).fillna(0.0))
-    if wl.sum() > 0:
-        wl = wl / wl.sum()
-    if ws.sum() > 0:
-        ws = ws / ws.sum()
+    # 3) diversify: cap pairwise correlation
+    if diversify_enabled:
+        rets_corr = _pct_change(closes).iloc[-int(corr_lookback):].dropna(how="all")
+        longs  = _cap_pair_corr(longs,  rets_corr, max_pair_corr, score)
+        shorts = _cap_pair_corr(shorts, rets_corr, max_pair_corr, score)
 
-    raw_long = (+wl)
-    raw_short = (-ws)
+    # 4) inside-bucket weights: inverse-vol * (zscore^signal_power)
+    iv = _inverse_vol_weights(closes, int(vol_lookback)).reindex(cols).fillna(0.0)
+    z = z_all.copy()
 
-    w = pd.concat([raw_long, raw_short], axis=0).reindex(prices.columns).fillna(0.0)
+    w = pd.Series(0.0, index=cols, dtype=float)
+    if longs:
+        sigL = (z.loc[longs].clip(lower=0.0)) ** float(signal_power)
+        w.loc[longs] = (iv.loc[longs] * sigL)
+    if shorts:
+        sigS = (-z.loc[shorts].clip(upper=0.0)).abs() ** float(signal_power)
+        w.loc[shorts] = -(iv.loc[shorts] * sigS)
 
-    # 6) Funding tilt (soft preference)
-    if funding_tilt and abs(funding_weight) > 0:
-        tilt = pd.Series({s: float(funding_tilt.get(s, 0.0)) for s in w.index})
-        tilt = (tilt - tilt.median())  # center
-        tilt = tilt / (tilt.abs().max() or 1.0)
-        w = w + funding_weight * tilt
-        # keep direction for selected side
-        w = w.where(w * pd.concat([raw_long, raw_short], axis=0).reindex(w.index).fillna(0.0) >= 0, 0.0)
+    # 5) normalize each side to 0.5 gross (market neutral book)
+    gL = float(w.loc[longs].abs().sum()) if longs else 0.0
+    gS = float(w.loc[shorts].abs().sum()) if shorts else 0.0
+    if gL > 0:
+        w.loc[longs] /= gL
+    if gS > 0:
+        w.loc[shorts] /= gS
 
-    # 7) Cap per-asset weight
-    w = w.clip(lower=-max_weight_per_asset, upper=+max_weight_per_asset)
+    # 6) cap per-asset
+    w = w.clip(-float(max_weight_per_asset), float(max_weight_per_asset))
 
-    # 8) Re-scale to desired gross leverage if market-neutral
-    if market_neutral:
-        gross = w.abs().sum()
-        if gross > 0:
-            w = w * (gross_leverage / gross)
+    # 7) scale to gross leverage
+    gross = float(w.abs().sum())
+    if gross > 0:
+        if market_neutral:
+            w = (w / gross) * float(gross_leverage)
+        else:
+            w = w * float(gross_leverage)
 
-    # 9) Optional volatility targeting at portfolio level
+    # 8) vol targeting (soft clamp via scaling)
     if vol_target_enabled and target_daily_vol_bps > 0:
-        try:
-            rets = prices.pct_change().dropna().iloc[-vol_lookback:]
-            port_rets = (rets * w).sum(axis=1)
-            port_vol_daily = float(port_rets.std()) * np.sqrt(24)  # 1h bars ⇒ ~24 per day
-            target = float(target_daily_vol_bps) / 10_000.0
-            if port_vol_daily > 1e-12 and target > 0:
-                scale = target / port_vol_daily
-                scale = float(np.clip(scale, vol_target_min_scale, vol_target_max_scale))
-                if np.isfinite(scale) and scale > 0:
-                    w = w * scale
-        except Exception as e:
-            log.debug(f"vol_targeting failed: {e}")
+        # Use last vol_lookback bars on returns for risk estimate
+        rets = _pct_change(closes).iloc[-int(vol_lookback):].fillna(0.0)
+        pv = _portfolio_vol(w, rets)  # standard deviation of return
+        target = float(target_daily_vol_bps) / 10000.0
+        if pv > 1e-9 and np.isfinite(pv):
+            scale = target / pv
+            scale = float(np.clip(scale, float(vol_target_min_scale), float(vol_target_max_scale)))
+            w = w * scale
 
-    w = w[w.abs() > 1e-9]
-    return w.round(6)
-
-def apply_liquidity_caps(
-    targets: pd.Series,
-    equity_usdt: float,
-    tickers: Dict[str, dict],
-    adv_cap_pct: float,
-    notional_cap_usdt: float,
-) -> pd.Series:
-    capped = targets.copy()
-    for s in targets.index:
-        qv = 0.0
-        try:
-            qv = float(tickers.get(s, {}).get("quoteVolume") or 0.0)
-        except Exception:
-            qv = 0.0
-        cap_by_adv = adv_cap_pct * qv
-        cap_abs = notional_cap_usdt
-        notional = abs(targets[s]) * equity_usdt
-        max_notional = max(0.0, min(cap_by_adv if cap_by_adv > 0 else float("inf"), cap_abs))
-        if max_notional > 0 and notional > max_notional:
-            new_weight = max_notional / equity_usdt
-            capped[s] = new_weight * np.sign(targets[s])
-    return capped
+    return w.fillna(0.0)
