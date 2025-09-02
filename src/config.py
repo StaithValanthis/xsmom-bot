@@ -1,19 +1,13 @@
-# config.py — v1.9 (2025-09-02)
-# - Expanded schema to match config.yaml.example (ADX extras, symbol scoring, hurst, funding_trim, time-of-day gating)
-# - Added CostsCfg (used by backtester.py)
-# - Added execution sub-sections: dynamic_offset, spread_guard, microstructure, stale_orders
-# - Added paths.metrics_path
+# config.py — v2.0 (2025-09-02)
 from __future__ import annotations
 
 from typing import List, Optional, Tuple, Dict, Any
 from pydantic import BaseModel, Field, ValidationError
-import yaml
-import os
+import yaml, os
 
 # -----------------------------
-# Section models
+# Exchange
 # -----------------------------
-
 class ExchangeCfg(BaseModel):
     id: str
     account_type: str
@@ -28,6 +22,9 @@ class ExchangeCfg(BaseModel):
     timeframe: str = "1h"
     candles_limit: int = 1500
 
+# -----------------------------
+# Strategy filters & extras
+# -----------------------------
 class HurstCfg(BaseModel):
     enabled: bool = False
     lags: List[int] = Field(default_factory=lambda: [2,4,8,16,32])
@@ -118,24 +115,45 @@ class TimeOfDayWhitelistCfg(BaseModel):
     threshold_bps: float = 0.0  # interpreted as USDT/trade in live.py
     fixed_hours: List[int] | None = None
     downweight_factor: float = 0.6
+    # NEW optional boosters
+    boost_good_hours: bool = False
+    boost_factor: float = 1.0
+    fixed_good_hours: List[int] | None = None
 
 class LiquidityCapsCfg(BaseModel):
     enabled: bool = False
     max_weight_low_liq: float = 0.02
     symbols_low_liq: List[str] = Field(default_factory=list)
 
+# NEW: Majors regime guard
+class MajorsRegimeCfg(BaseModel):
+    enabled: bool = False
+    majors: List[str] = Field(default_factory=lambda: ["BTC/USDT:USDT","ETH/USDT:USDT"])
+    ema_len: int = 200
+    slope_bps_per_day: float = 1.0
+    action: str = "block"   # or "downweight"
+    downweight_factor: float = 0.6
+
+# NEW: Kelly-style conviction scaling
+class KellyCfg(BaseModel):
+    enabled: bool = False
+    base_frac: float = 0.5
+    half_kelly: bool = True
+    min_scale: float = 0.5
+    max_scale: float = 1.6
+
 class StrategyCfg(BaseModel):
     signal_power: float = 1.35
-    lookbacks: List[int]
-    lookback_weights: List[float]
-    vol_lookback: int
+    lookbacks: List[int] = Field(default_factory=lambda: [12,24,48,96])
+    lookback_weights: List[float] = Field(default_factory=lambda: [0.4,0.3,0.2,0.1])
+    vol_lookback: int = 96
 
-    k_min: int
-    k_max: int
+    k_min: int = 2
+    k_max: int = 4
 
-    market_neutral: bool
-    gross_leverage: float
-    max_weight_per_asset: float
+    market_neutral: bool = True
+    gross_leverage: float = 1.5
+    max_weight_per_asset: float = 0.2
 
     # Filters
     adx_filter: AdxFilterCfg = AdxFilterCfg()
@@ -160,10 +178,25 @@ class StrategyCfg(BaseModel):
     # Entry threshold
     entry_zscore_min: float = 0.0
 
+    # NEW: multi-timeframe confirmation
+    confirmation_timeframe: str = "4h"
+    confirmation_lookback: int = 6
+    require_mtf_alignment: bool = True
+
+    # NEW: majors regime & kelly sections
+    majors_regime: MajorsRegimeCfg = MajorsRegimeCfg()
+    kelly: KellyCfg = KellyCfg()
+
+# -----------------------------
+# Liquidity
+# -----------------------------
 class LiquidityCfg(BaseModel):
     adv_cap_pct: float = 0.0
     notional_cap_usdt: float = 0.0
 
+# -----------------------------
+# Execution
+# -----------------------------
 class SpreadGuardCfg(BaseModel):
     enabled: bool = False
     max_spread_bps: float = 15.0
@@ -215,6 +248,9 @@ class ExecutionCfg(BaseModel):
     # bump the size up to the minimum instead of skipping the trade.
     bump_to_exchange_min: bool = True
 
+# -----------------------------
+# Risk
+# -----------------------------
 class TrailingUnlocksCfg(BaseModel):
     enabled: bool = False
     triggers_r: List[float] = Field(default_factory=list)
@@ -290,12 +326,15 @@ class RiskCfg(BaseModel):
     no_progress: NoProgressCfg = NoProgressCfg()
     profit_lock: ProfitLockCfg = ProfitLockCfg()
 
-    # Profit protection extras (legacy compat)
-    profit_lock_steps: Optional[List[Tuple[float, float]]] = None  # deprecated
+    # Legacy compat
+    profit_lock_steps: Optional[List[Tuple[float, float]]] = None
     breakeven_extra_bps: float = 0.0
     trail_after_partial_mult: float = 0.0
     age_tighten: Optional[Dict[str, float]] = None
 
+# -----------------------------
+# Paths, logging, costs
+# -----------------------------
 class PathsCfg(BaseModel):
     state_path: str
     logs_dir: str
@@ -326,7 +365,6 @@ class AppConfig(BaseModel):
 # -----------------------------
 # Loader
 # -----------------------------
-
 def _merge_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
     raw = dict(raw or {})
 
@@ -345,12 +383,19 @@ def _merge_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
     raw["strategy"]["symbol_filter"].setdefault("banlist", [])
     raw["strategy"].setdefault("time_of_day_whitelist", {})
     raw["strategy"].setdefault("liquidity_caps", {})
+    # new
+    raw["strategy"].setdefault("majors_regime", {})
+    raw["strategy"].setdefault("kelly", {})
+    raw["strategy"].setdefault("confirmation_timeframe", "4h")
+    raw["strategy"].setdefault("confirmation_lookback", 6)
+    raw["strategy"].setdefault("require_mtf_alignment", True)
 
     raw.setdefault("execution", {})
     raw["execution"].setdefault("stale_orders", {})
     raw["execution"].setdefault("spread_guard", {})
     raw["execution"].setdefault("dynamic_offset", {})
     raw["execution"].setdefault("microstructure", {})
+    raw["execution"].setdefault("bump_to_exchange_min", True)
 
     raw.setdefault("risk", {})
     raw["risk"].setdefault("trailing_unlocks", {})

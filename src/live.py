@@ -17,53 +17,56 @@ import pandas as pd
 from .config import AppConfig
 from .exchange import ExchangeWrapper
 from .signals import compute_atr, regime_ok, dynamic_k
-from .sizing import build_targets, apply_liquidity_caps
+from .sizing import build_targets, apply_liquidity_caps, apply_kelly_scaling
 from .risk import kill_switch_should_trigger, resume_time_after_kill
 from .utils import utcnow, read_json, write_json
 
 log = logging.getLogger("live")
 
-# -------------------- helpers --------------------
 
-def _bump_qty_to_exchange_min(ex: ExchangeWrapper, cfg: AppConfig, symbol: str, qty: float, price_for_cost: float | None) -> float:
-    """Bump qty up to exchange min amount/notional, then apply amount_to_precision.
-    Only used for opening (non-reduce-only) orders when enabled via cfg.execution.bump_to_exchange_min.
-    """
+def _micro_ok(cfg: AppConfig, tkr: dict, orderbook: dict | None) -> bool:
+    mc = getattr(cfg.execution, "microstructure", None)
+    if not mc or not getattr(mc, "enabled", False):
+        return True
     try:
-        if not bool(getattr(cfg.execution, "bump_to_exchange_min", True)):
-            return float(qty)
-        # Try to get market definition and limits
-        market = None
-        try:
-            market = ex.x.market(symbol)
-        except Exception:
-            try:
-                ex.load_markets()
-                market = ex.x.market(symbol)
-            except Exception:
-                market = None
-        min_amt = None
-        min_cost = None
-        if isinstance(market, dict):
-            limits = market.get("limits") or {}
-            amt_lim = limits.get("amount") or {}
-            cost_lim = limits.get("cost") or {}
-            min_amt = amt_lim.get("min")
-            min_cost = cost_lim.get("min")
-        px = float(price_for_cost or 0.0)
-        if min_cost and px > 0:
-            implied_min_amt = float(min_cost) / px
-            min_amt = implied_min_amt if min_amt is None else max(float(min_amt), implied_min_amt)
-        if min_amt is not None:
-            qty = max(float(qty), float(min_amt))
-        try:
-            qty = float(ex.x.amount_to_precision(symbol, qty))
-        except Exception:
-            pass
-        return float(qty)
+        bid = float(tkr.get("bid") or tkr.get("bidPrice") or 0.0)
+        ask = float(tkr.get("ask") or tkr.get("askPrice") or 0.0)
+        if bid <= 0 or ask <= 0:
+            return True
+        spread_bps = 10000.0 * (ask - bid) / ((ask + bid) / 2.0)
+        if spread_bps > float(getattr(mc, "max_spread_bps", 8.0)):
+            return False
+        if orderbook and (bids := orderbook.get("bids")) and (asks := orderbook.get("asks")):
+            bvol = sum([float(x[1]) for x in bids[:5]])
+            avol = sum([float(x[1]) for x in asks[:5]])
+            obi = (bvol - avol) / max(bvol + avol, 1e-9)
+            if abs(obi) < float(getattr(mc, "min_obi", 0.15)):
+                return False
+        return True
     except Exception:
-        return float(qty)
+        return True
 
+def _majors_gate(ex: ExchangeWrapper, cfg: AppConfig, timeframe: str, candles_limit: int) -> tuple[bool, int]:
+    mj = getattr(cfg.strategy, "majors_regime", None)
+    if not mj or not getattr(mj, "enabled", False):
+        return True, 0
+    ok = 0
+    for s in list(getattr(mj, "majors", [])):
+        try:
+            raw = ex.fetch_ohlcv(s, timeframe=timeframe, limit=candles_limit)
+            if not raw:
+                ok += 1
+                continue
+            df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+            df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            df.set_index("dt", inplace=True)
+            ser = df["close"]
+            if regime_ok(ser, int(mj.ema_len), float(mj.slope_bps_per_day), use_abs=False):
+                ok += 1
+        except Exception:
+            ok += 1
+    return (ok >= 2), ok
+# -------------------- helpers --------------------
 
 def _normalize_soft_block(value):
     try:
@@ -932,7 +935,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
     day_start_equity = float(state.get("day_start_equity", 0.0))
     day_high_equity = float(state.get("day_high_equity", 0.0))
     disable_until_ts = float(state.get("disable_until_ts", 0.0))
-    soft_block_until_ts = _normalize_soft_block(state.get("soft_block_until_ts"))
+    soft_block_until_ts = (_tmp := state.get("soft_block_until_ts")) if isinstance(state.get("soft_block_until_ts"), (int, float, str)) and str(state.get("soft_block_until_ts")).strip() not in ("", "None") and not isinstance(state.get("soft_block_until_ts"), bool) else 0.0 if False else float(state.get("soft_block_until_ts") or 0.0)
     current_stepdown_tier = int(state.get("risk_stepdown_tier", 0))
 
     ex = ExchangeWrapper(cfg.exchange)
@@ -1079,6 +1082,26 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
             if not bars:
                 log.error("No bars fetched this cycle; sleeping.")
+            # Microstructure pre-gate (per symbol, on entries)
+            if getattr(cfg.execution, "microstructure", None) and getattr(cfg.execution.microstructure, "enabled", False):
+                tkr_map = ex.fetch_tickers(list(bars.keys())) or {}
+                keep = []
+                for s in list(bars.keys()):
+                    tkr = tkr_map.get(s, {}) or {}
+                    ob = None
+                    try:
+                        ob = ex.fetch_order_book(s, limit=10)
+                    except Exception:
+                        ob = None
+                    if _micro_ok(cfg, tkr, ob):
+                        keep.append(s)
+                bars = {k: bars[k] for k in keep if k in bars}
+            try:
+                removed = [s for s in tkr_map.keys() if s not in keep] if isinstance(tkr_map, dict) else []
+                log.info(f"[GATE] Microstructure pre-gate: kept={len(keep)} removed={len(removed)} enabled={getattr(cfg.execution.microstructure, 'enabled', False)}")
+            except Exception:
+                pass
+
                 time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                 continue
 
@@ -1090,19 +1113,8 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 keep = []
                 for s, df in bars.items():
                     try:
-                        dmi = _compute_dmi(df[["high","low","close"]], int(adx_cfg.len))
-                        adx_now = float(dmi["adx"].iloc[-1])
-                        cond = adx_now >= float(getattr(adx_cfg, "min_adx", 0.0))
-                        if bool(getattr(adx_cfg, "require_rising", False)):
-                            adx_rising = float(dmi["adx"].diff().iloc[-1] or 0.0) > 0.0
-                            cond = cond and adx_rising
-                        sep_req = float(getattr(adx_cfg, "min_di_separation", 0.0) or 0.0)
-                        if sep_req > 0.0:
-                            plus_di = float(dmi["+di"].iloc[-1])
-                            minus_di = float(dmi["-di"].iloc[-1])
-                            sep = abs(plus_di - minus_di)
-                            cond = cond and (sep >= sep_req)
-                        if cond:
+                        adx = _compute_adx(df[["high","low","close"]], int(adx_cfg.len)).iloc[-1]
+                        if float(adx) >= float(adx_cfg.min_adx):
                             keep.append(s)
                         else:
                             blocked += 1
@@ -1136,7 +1148,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     log.info(f"Time-of-day gate: hour {hour_now} not in allowed {sorted(list(allowed_hours))}; pausing new entries this cycle.")
                     eligible_syms = []
                 if not eligible_syms:
-                    log.info("Time-of-day gate blocked all symbols; staying flat.")
+                    log.info("ADX gate blocked all symbols; staying flat.")
                     time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                     continue
 
@@ -1166,6 +1178,20 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                     continue
 
+            
+            # Majors regime (BTC/ETH) overall gate or downweight
+            mj = getattr(cfg.strategy, "majors_regime", None)
+            majors_ok, okc = _majors_gate(ex, cfg, cfg.exchange.timeframe, cfg.exchange.candles_limit)
+            majors_downweight = 1.0
+            log.info(f"[GATE] Majors regime: enabled={getattr(cfg.strategy, 'majors_regime', None) and getattr(cfg.strategy.majors_regime, 'enabled', False)} ok={majors_ok} action={getattr(cfg.strategy.majors_regime, 'action', 'block')} ok_count={okc}")
+            if mj and getattr(mj, "enabled", False):
+                if not majors_ok:
+                    if getattr(mj, "action", "block") == "block":
+                        log.info("Majors regime gate blocked entries this cycle.")
+                        eligible_syms = []  # block new entries
+                    else:
+                        majors_downweight = float(getattr(mj, "downweight_factor", 0.6))
+    
             closes_used = closes[eligible_syms]
 
             # 2) Risk step-down with drawdown
@@ -1232,6 +1258,70 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
             # Reindex to full universe so blocked symbols have 0 weight
             targets = targets.reindex(closes.columns).fillna(0.0)
+            try:
+                longs = int((targets > 0).sum()); shorts = int((targets < 0).sum()); gross = float(targets.abs().sum())
+                log.info(f"[SUMMARY] sizing pipeline: longs={longs} shorts={shorts} gross={gross:.4f}")
+            except Exception:
+                pass
+
+            # --- MTF CONFIRM ---
+            if bool(getattr(cfg.strategy, "require_mtf_alignment", True)):
+                tf = getattr(cfg.strategy, "confirmation_timeframe", "4h")
+                lb = int(getattr(cfg.strategy, "confirmation_lookback", 6))
+                keep = []
+                for s in list(targets.index):
+                    try:
+                        raw = ex.fetch_ohlcv(s, timeframe=tf, limit=max(60, lb+2))
+                        if not raw:
+                            keep.append(s); continue
+                        dfc = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+                        dfc["dt"] = pd.to_datetime(dfc["ts"], unit="ms", utc=True); dfc.set_index("dt", inplace=True)
+                        pc = closes_used[s].dropna()
+                        hc = dfc["close"].dropna()
+                        if len(pc) > lb and len(hc) > lb:
+                            p_ret = float(pc.iloc[-1] / pc.iloc[-lb] - 1.0)
+                            c_ret = float(hc.iloc[-1] / hc.iloc[-lb] - 1.0)
+                            if (targets.loc[s] > 0 and c_ret >= 0) or (targets.loc[s] < 0 and c_ret <= 0):
+                                keep.append(s)
+                        else:
+                            keep.append(s)
+                    except Exception:
+                        keep.append(s)
+                targets = targets.reindex(keep).fillna(0.0)
+                try:
+                    log.info(f"[GATE] MTF confirm: kept={len(keep)}")
+                except Exception:
+                    pass
+
+            # --- KELLY SCALING ---
+            if getattr(cfg.strategy, "kelly", None) and getattr(cfg.strategy.kelly, "enabled", False):
+                sym_stats = state.get("sym_stats")
+                if isinstance(sym_stats, dict) and len(sym_stats) > 0:
+                    targets = apply_kelly_scaling(targets, sym_stats, cfg.strategy.kelly)
+                    try:
+                        nz = targets.replace(0.0, float('nan')).abs()
+                        log.info(f"[SIZING] KELLY scaling applied: nonzero={int(nz.count())} gross={float(nz.sum()):.4f}")
+                    except Exception:
+                        pass
+
+            # --- MAJORS DOWNWEIGHT (if used) ---
+            try:
+                if majors_downweight < 0.999:
+                    targets *= float(majors_downweight)
+            except Exception:
+                pass
+
+            # --- TIME-OF-DAY BOOST ---
+            tod = getattr(cfg.strategy, "time_of_day_whitelist", None)
+            if tod and getattr(tod, "enabled", False) and bool(getattr(tod, "boost_good_hours", False)):
+                cur_h = pd.Timestamp.utcnow().hour
+                good = getattr(tod, "fixed_good_hours", None)
+                if good and cur_h in good:
+                    bf = float(getattr(tod, "boost_factor", 1.0))
+                    if bf != 1.0:
+                        targets *= bf
+                    log.info(f"[SIZING] ToD boost applied: hour={cur_h} factor={bf}")
+    
 
             # 3.3) Apply cooldowns to weights
             try:
@@ -1254,49 +1344,6 @@ def run_live(cfg: AppConfig, dry: bool = False):
             # 3.4) Apply dynamic symbol filter (banlist/downsizing)
             targets = _apply_symbol_filter_to_targets(state, cfg, targets)
 
-            # 3.5) Funding trim (reduce exposure on paying side of extreme funding)
-            ft_cfg = getattr(cfg.strategy, "funding_trim", None)
-            if ft_cfg and getattr(ft_cfg, "enabled", False):
-                try:
-                    if not funding_map:
-                        funding_map = ex.fetch_funding_rates(list(targets.index)) or {}
-                except Exception:
-                    funding_map = funding_map or {}
-                thr = float(getattr(ft_cfg, "threshold_bps", 0.0) or 0.0)
-                slope = float(getattr(ft_cfg, "slope_per_bps", 0.0) or 0.0)
-                max_red = float(getattr(ft_cfg, "max_reduction", 0.9) or 0.9)
-                if slope > 0 and max_red > 0:
-                    for s in list(targets.index):
-                        r_bps = float((funding_map or {}).get(s, 0.0) or 0.0)
-                        w = float(targets.get(s, 0.0) or 0.0)
-                        # paying side if funding and weight have same sign (assuming positive means longs pay)
-                        paying = (r_bps > 0 and w > 0) or (r_bps < 0 and w < 0)
-                        if not paying or w == 0.0:
-                            continue
-                        excess = max(0.0, abs(r_bps) - thr)
-                        if excess > 0.0:
-                            reduce = min(max_red, slope * excess)
-                            targets.loc[s] = w * max(0.0, 1.0 - reduce)
-
-            # 3.6) Optional DI alignment filter: drop weights whose sign conflicts with DMI direction when separation is strong
-            adx_cfg = getattr(cfg.strategy, "adx_filter", None)
-            if adx_cfg and getattr(adx_cfg, "enabled", False) and bool(getattr(adx_cfg, "use_di_alignment", False)):
-                sep_req = float(getattr(adx_cfg, "min_di_separation", 0.0) or 0.0)
-                for s in list(targets.index):
-                    if s not in bars:
-                        continue
-                    try:
-                        dmi = _compute_dmi(bars[s][["high","low","close"]], int(adx_cfg.len))
-                        plus_di = float(dmi["+di"].iloc[-1])
-                        minus_di = float(dmi["-di"].iloc[-1])
-                        sep = abs(plus_di - minus_di)
-                        if sep >= sep_req:
-                            w = float(targets.get(s, 0.0) or 0.0)
-                            if (w > 0 and plus_di < minus_di) or (w < 0 and minus_di < plus_di):
-                                targets.loc[s] = 0.0
-                    except Exception:
-                        pass
-    
             # 4) Liquidity caps
             tickers = ex.fetch_tickers(list(targets.index))
             eq = ex.get_equity_usdt()
@@ -1419,10 +1466,6 @@ def run_live(cfg: AppConfig, dry: bool = False):
             for od in orders:
                 s = od["symbol"]; side = od["side"]; q = float(od["qty"]); px = od["price"]; ro = bool(od.get("reduceOnly", False))
                 tkr = (tickers.get(s, {}) or {})
-                # bump undersized opens
-                if not ro:
-                    price_for_cost = float(px or (tkr.get("last") or tkr.get("close") or 0.0) or 0.0)
-                    q = _bump_qty_to_exchange_min(ex, cfg, s, q, price_for_cost)
                 notional = q * float(tkr.get("last") or tkr.get("close") or 0.0)
                 try:
                     if dry:

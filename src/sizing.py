@@ -68,6 +68,36 @@ def _portfolio_vol(w: pd.Series, rets: pd.DataFrame) -> float:
     v = float(np.dot(w.values, cov.values @ w.values))
     return math.sqrt(max(v, 0.0))
 
+
+def _kelly_scale(p: float, pf: float, base_frac: float, half_kelly: bool, min_scale: float, max_scale: float) -> float:
+    p = max(0.0, min(1.0, float(p)))
+    pf = max(0.0, float(pf))
+    if pf <= 1.0 or p <= 0.0:
+        k = 0.0
+    else:
+        k = p * (1.0 - 1.0 / pf)  # f* ≈ p - p/PF
+        if half_kelly:
+            k *= 0.5
+    scale = base_frac + k
+    return float(np.clip(scale, min_scale, max_scale))
+
+def apply_kelly_scaling(w: pd.Series, sym_stats: Dict[str, dict] | None, cfg) -> pd.Series:
+    if sym_stats is None or not getattr(cfg, "enabled", False):
+        return w
+    scaled = w.copy()
+    for s in w.index:
+        st = (sym_stats.get(s) or {})
+        p = float(st.get("win_rate", st.get("ema_wr", 0.0))) / (100.0 if float(st.get("win_rate", 0.0)) > 1.0 else 1.0)
+        pf = float(st.get("pf", st.get("ema_pf", 0.0)))
+        scale = _kelly_scale(p, pf, getattr(cfg, "base_frac", 0.5), getattr(cfg, "half_kelly", True), getattr(cfg, "min_scale", 0.5), getattr(cfg, "max_scale", 1.6))
+        scaled.loc[s] = float(w.loc[s]) * scale
+    g0 = float(w.abs().sum())
+    g1 = float(scaled.abs().sum())
+    if g0 > 0 and g1 > 0:
+        scaled *= g0 / g1
+    return scaled
+
+
 def build_targets(
     closes: pd.DataFrame,
     lookbacks: Iterable[int],
