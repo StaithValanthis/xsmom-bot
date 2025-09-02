@@ -1,13 +1,14 @@
-# config.py — v1.6
-# - Pydantic schema for all sections
-# - Backward-compatible load_config(yaml_path) for main.py
+# config.py — v1.9 (2025-09-02)
+# - Expanded schema to match config.yaml.example (ADX extras, symbol scoring, hurst, funding_trim, time-of-day gating)
+# - Added CostsCfg (used by backtester.py)
+# - Added execution sub-sections: dynamic_offset, spread_guard, microstructure, stale_orders
+# - Added paths.metrics_path
 from __future__ import annotations
 
 from typing import List, Optional, Tuple, Dict, Any
 from pydantic import BaseModel, Field, ValidationError
 import yaml
 import os
-
 
 # -----------------------------
 # Section models
@@ -27,24 +28,32 @@ class ExchangeCfg(BaseModel):
     timeframe: str = "1h"
     candles_limit: int = 1500
 
+class HurstCfg(BaseModel):
+    enabled: bool = False
+    lags: List[int] = Field(default_factory=lambda: [2,4,8,16,32])
+    min_h: float = 0.5
 
 class RegimeFilterCfg(BaseModel):
     enabled: bool = False
     ema_len: int = 200
     slope_min_bps_per_day: float = 0.0
     use_abs: bool = False
-
+    hurst: HurstCfg = HurstCfg()
 
 class FundingTiltCfg(BaseModel):
     enabled: bool = False
     weight: float = 0.0
 
+class FundingTrimCfg(BaseModel):
+    enabled: bool = False
+    threshold_bps: float = 0.0
+    slope_per_bps: float = 0.0
+    max_reduction: float = 0.0
 
 class DiversifyCfg(BaseModel):
     enabled: bool = False
     corr_lookback: int = 48
     max_pair_corr: float = 0.9
-
 
 class VolTargetCfg(BaseModel):
     enabled: bool = False
@@ -52,19 +61,16 @@ class VolTargetCfg(BaseModel):
     min_scale: float = 0.5
     max_scale: float = 2.0
 
-
 class EntryThrottleCfg(BaseModel):
     max_new_positions_per_cycle: int = 999
     max_open_positions: int = 999
     per_symbol_trade_cooldown_min: int = 0
     min_entry_zscore: float = 0.0
 
-
 class SoftKillCfg(BaseModel):
     enabled: bool = False
     soft_daily_loss_pct: float = 0.0
     resume_after_minutes: int = 0
-
 
 class SoftWinLockCfg(BaseModel):
     enabled: bool = False
@@ -76,34 +82,50 @@ class AdxFilterCfg(BaseModel):
     enabled: bool = False
     len: int = 14
     min_adx: float = 20.0
+    require_rising: bool = False
+    use_di_alignment: bool = True
+    min_di_separation: float = 0.0
+    di_hysteresis_bps: float = 0.0
+
 class SymbolScoreCfg(BaseModel):
     enabled: bool = True
-    ema_alpha: float = 0.2
     min_sample_trades: int = 8
-    block_below_win_rate_pct: float = 48.0
-    pf_block_threshold: float = 1.0
+    ema_alpha: float = 0.2
+    min_win_rate_pct: float = 38.0
+    pf_downweight_threshold: float = 1.0
+    downweight_factor: float = 0.6
+    block_below_win_rate_pct: float = 38.0
+    pf_block_threshold: float = 0.90
+    pnl_block_threshold_usdt_per_trade: float = -0.1
+    ban_minutes: int = 1440
+    grace_trades_after_unban: int = 3
+    decay_days: int = 14
     pf_warn_threshold: float = 1.2
+
 class SymbolFilterCfg(BaseModel):
     enabled: bool = True
-    whitelist: list[str] | None = None
-    banlist: list[str] | None = None
+    whitelist: List[str] | None = None
+    banlist: List[str] | None = None
     ban_minutes_after_loss: int = 0
     score: SymbolScoreCfg = SymbolScoreCfg()
+
 class TimeOfDayWhitelistCfg(BaseModel):
     enabled: bool = False
-    # Only trade during hours with positive EMA PnL (or above threshold) computed from paper/live results
     use_ema: bool = True
     ema_alpha: float = 0.2
     min_trades_per_hour: int = 5
     min_hours_allowed: int = 6
-    # If use_ema=True, require ema_pnl_bps >= threshold_bps; else mean pnl >= 0
-    threshold_bps: float = 0.0
-    # Optional: hard allowlist of UTC hours (0-23) that overrides stats if provided
-    fixed_hours: list[int] | None = None
+    threshold_bps: float = 0.0  # interpreted as USDT/trade in live.py
+    fixed_hours: List[int] | None = None
     downweight_factor: float = 0.6
 
+class LiquidityCapsCfg(BaseModel):
+    enabled: bool = False
+    max_weight_low_liq: float = 0.02
+    symbols_low_liq: List[str] = Field(default_factory=list)
 
 class StrategyCfg(BaseModel):
+    signal_power: float = 1.35
     lookbacks: List[int]
     lookback_weights: List[float]
     vol_lookback: int
@@ -115,30 +137,48 @@ class StrategyCfg(BaseModel):
     gross_leverage: float
     max_weight_per_asset: float
 
+    # Filters
+    adx_filter: AdxFilterCfg = AdxFilterCfg()
+    symbol_filter: SymbolFilterCfg = SymbolFilterCfg()
     regime_filter: RegimeFilterCfg = RegimeFilterCfg()
+    time_of_day_whitelist: TimeOfDayWhitelistCfg = TimeOfDayWhitelistCfg()
+
+    # Sizing extras
     funding_tilt: FundingTiltCfg = FundingTiltCfg()
-
-    entry_zscore_min: float = 0.0
-
+    funding_trim: FundingTrimCfg = FundingTrimCfg()
     diversify: DiversifyCfg = DiversifyCfg()
     vol_target: VolTargetCfg = VolTargetCfg()
     entry_throttle: EntryThrottleCfg = EntryThrottleCfg()
+
+    # Soft controls
     soft_kill: SoftKillCfg = SoftKillCfg()
     soft_win_lock: SoftWinLockCfg = SoftWinLockCfg()
-    adx_filter: AdxFilterCfg = AdxFilterCfg()
-    symbol_filter: SymbolFilterCfg = SymbolFilterCfg()
-    time_of_day_whitelist: TimeOfDayWhitelistCfg = TimeOfDayWhitelistCfg()
 
+    # Optional caps for known illiquid tickers
+    liquidity_caps: LiquidityCapsCfg = LiquidityCapsCfg()
 
-
-
-
-
+    # Entry threshold
+    entry_zscore_min: float = 0.0
 
 class LiquidityCfg(BaseModel):
-    adv_cap_pct: float
-    notional_cap_usdt: float
+    adv_cap_pct: float = 0.0
+    notional_cap_usdt: float = 0.0
 
+class SpreadGuardCfg(BaseModel):
+    enabled: bool = False
+    max_spread_bps: float = 15.0
+    skip_if_wider: bool = True
+
+class DynamicOffsetCfg(BaseModel):
+    enabled: bool = False
+    base_bps: float = 3.0
+    per_spread_coeff: float = 0.5
+    max_offset_bps: float = 20.0
+
+class MicrostructureCfg(BaseModel):
+    enabled: bool = False
+    min_obi: float = 0.15
+    max_spread_bps: float = 8.0
 
 class StaleOrdersCfg(BaseModel):
     enabled: bool = False
@@ -147,7 +187,6 @@ class StaleOrdersCfg(BaseModel):
     reprice_if_far_bps: float = 15.0
     cancel_if_not_targeted: bool = True
     keep_reduce_only: bool = True
-
 
 class ExecutionCfg(BaseModel):
     reload_positions_on_start: bool = True
@@ -167,15 +206,50 @@ class ExecutionCfg(BaseModel):
 
     cancel_open_orders_on_start: bool = False
 
-    # NEW
     stale_orders: StaleOrdersCfg = StaleOrdersCfg()
-
-
-
+    spread_guard: SpreadGuardCfg = SpreadGuardCfg()
+    dynamic_offset: DynamicOffsetCfg = DynamicOffsetCfg()
+    microstructure: MicrostructureCfg = MicrostructureCfg()
 
     # If True, when computed order size is below the exchange minimum amount/notional,
     # bump the size up to the minimum instead of skipping the trade.
     bump_to_exchange_min: bool = True
+
+class TrailingUnlocksCfg(BaseModel):
+    enabled: bool = False
+    triggers_r: List[float] = Field(default_factory=list)
+    lock_r: List[float] = Field(default_factory=list)
+
+class ExitOnRegimeFlipCfg(BaseModel):
+    enabled: bool = False
+    confirm_bars: int = 1
+
+class AdaptiveRiskCfg(BaseModel):
+    enabled: bool = False
+    low_thr_bps: float = 40.0
+    high_thr_bps: float = 120.0
+    sl_scale: Dict[str, float] = Field(default_factory=lambda: {"low":1.4, "mid":1.0, "high":0.8})
+    trail_scale: Dict[str, float] = Field(default_factory=lambda: {"low":1.2, "mid":1.0, "high":0.8})
+    ladder_r_scale: Dict[str, float] = Field(default_factory=lambda: {"low":1.1, "mid":1.0, "high":0.9})
+
+class PartialLaddersCfg(BaseModel):
+    enabled: bool = False
+    r_levels: List[float] = Field(default_factory=list)
+    sizes: List[float] = Field(default_factory=list)
+    reduce_only: bool = True
+
+class ProfitLockCfg(BaseModel):
+    enabled: bool = False
+    triggers_r: List[float] = Field(default_factory=list)
+    lock_to_r: List[float] = Field(default_factory=list)
+
+class NoProgressCfg(BaseModel):
+    enabled: bool = False
+    min_minutes: int = 20
+    min_rr: float = 0.3
+    min_close_pnl_pct: float = 0.0
+    tiers: Dict[str, List[float]] | None = None
+
 class RiskCfg(BaseModel):
     atr_len: int = 28
     atr_mult_sl: float = 2.0
@@ -190,9 +264,9 @@ class RiskCfg(BaseModel):
     breakeven_after_r: float = 0.0
 
     stop_on_close_only: bool = False
-    stop_confirm_bars: int = 0              # NEW
-    min_hold_minutes: int = 0               # NEW
-    catastrophic_atr_mult: float = 3.5      # NEW
+    stop_confirm_bars: int = 0
+    min_hold_minutes: int = 0
+    catastrophic_atr_mult: float = 3.5
 
     stop_buffer_bps: float = 0.0
     cooldown_minutes_after_stop: int = 0
@@ -208,23 +282,36 @@ class RiskCfg(BaseModel):
 
     max_hours_in_trade: int = 0
 
-    # Profit protection extras (used by live.py v1.6+)
-    profit_lock_steps: Optional[List[Tuple[float, float]]] = None  # e.g. [[0.8,0.0],[1.5,0.5],[2.5,1.2]]
+    # Extended
+    trailing_unlocks: TrailingUnlocksCfg = TrailingUnlocksCfg()
+    exit_on_regime_flip: ExitOnRegimeFlipCfg = ExitOnRegimeFlipCfg()
+    adaptive: AdaptiveRiskCfg = AdaptiveRiskCfg()
+    partial_ladders: PartialLaddersCfg = PartialLaddersCfg()
+    no_progress: NoProgressCfg = NoProgressCfg()
+    profit_lock: ProfitLockCfg = ProfitLockCfg()
+
+    # Profit protection extras (legacy compat)
+    profit_lock_steps: Optional[List[Tuple[float, float]]] = None  # deprecated
     breakeven_extra_bps: float = 0.0
     trail_after_partial_mult: float = 0.0
-    age_tighten: Optional[Dict[str, float]] = None  # e.g. {"12h":0.7,"24h":0.5}
-
+    age_tighten: Optional[Dict[str, float]] = None
 
 class PathsCfg(BaseModel):
     state_path: str
     logs_dir: str
-
+    metrics_path: Optional[str] = None
 
 class LoggingCfg(BaseModel):
     level: str = "INFO"
     file_max_mb: int = 20
     file_backups: int = 5
 
+class CostsCfg(BaseModel):
+    maker_fee_bps: float = 1.0
+    taker_fee_bps: float = 5.0
+    slippage_bps: float = 2.0
+    borrow_bps: float = 0.0
+    maker_fill_ratio: float = 0.5
 
 class AppConfig(BaseModel):
     exchange: ExchangeCfg
@@ -234,21 +321,19 @@ class AppConfig(BaseModel):
     risk: RiskCfg
     paths: PathsCfg
     logging: LoggingCfg
-
+    costs: CostsCfg = CostsCfg()
 
 # -----------------------------
 # Loader
 # -----------------------------
 
 def _merge_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensures optional nested sections exist so pydantic gets sane defaults.
-    """
     raw = dict(raw or {})
 
     raw.setdefault("strategy", {})
     raw["strategy"].setdefault("regime_filter", {})
     raw["strategy"].setdefault("funding_tilt", {})
+    raw["strategy"].setdefault("funding_trim", {})
     raw["strategy"].setdefault("diversify", {})
     raw["strategy"].setdefault("vol_target", {})
     raw["strategy"].setdefault("entry_throttle", {})
@@ -256,21 +341,33 @@ def _merge_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
     raw["strategy"].setdefault("soft_win_lock", {})
     raw["strategy"].setdefault("adx_filter", {})
     raw["strategy"].setdefault("symbol_filter", {})
+    raw["strategy"]["symbol_filter"].setdefault("score", {})
     raw["strategy"]["symbol_filter"].setdefault("banlist", [])
     raw["strategy"].setdefault("time_of_day_whitelist", {})
+    raw["strategy"].setdefault("liquidity_caps", {})
 
     raw.setdefault("execution", {})
     raw["execution"].setdefault("stale_orders", {})
+    raw["execution"].setdefault("spread_guard", {})
+    raw["execution"].setdefault("dynamic_offset", {})
+    raw["execution"].setdefault("microstructure", {})
 
     raw.setdefault("risk", {})
+    raw["risk"].setdefault("trailing_unlocks", {})
+    raw["risk"].setdefault("exit_on_regime_flip", {})
+    raw["risk"].setdefault("adaptive", {})
+    raw["risk"].setdefault("partial_ladders", {})
+    raw["risk"].setdefault("no_progress", {})
+    raw["risk"].setdefault("profit_lock", {})
+
+    raw.setdefault("paths", {})
+    raw["paths"].setdefault("metrics_path", None)
+
+    raw.setdefault("costs", {})
 
     return raw
 
-
 def load_config(yaml_path: str) -> AppConfig:
-    """
-    Backward-compatible entrypoint used by main.py
-    """
     path = os.path.abspath(yaml_path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Config YAML not found: {path}")
@@ -283,8 +380,6 @@ def load_config(yaml_path: str) -> AppConfig:
     try:
         cfg = AppConfig(**data)
     except ValidationError as e:
-        # Provide a concise error that still helps
         raise RuntimeError(f"Invalid config.yaml: {e}")
 
     return cfg
-
