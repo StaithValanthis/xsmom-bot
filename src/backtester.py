@@ -1,6 +1,6 @@
-# v1.1.0 – 2025-08-21
+# v1.2.0 – 2025-09-04
 import logging
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import numpy as np
 import pandas as pd
 
@@ -38,36 +38,58 @@ def _perf_stats(eq: pd.Series) -> Dict[str, float]:
         "calmar": float(calmar),
     }
 
-def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
+def run_backtest(
+    cfg: AppConfig,
+    symbols: List[str],
+    prefetch_bars: Optional[Dict[str, pd.DataFrame]] = None,
+    return_curve: bool = False,
+) -> Dict[str, float]:
+    """
+    Backtest the cross-sectional momentum strategy.
+    - If `prefetch_bars` is provided, those OHLCV frames will be used directly.
+    - If not, market data will be fetched via ExchangeWrapper using cfg parameters.
+    - When `return_curve=True`, include 'equity_curve' (pd.Series) in the result.
+    """
     log.info("=== BACKTEST (cost-aware) ===")
     log.info(f"Start: {utcnow().isoformat()} | timeframe={cfg.exchange.timeframe}")
 
-    ex = ExchangeWrapper(cfg.exchange)
-    bars = {}
-    for s in symbols:
-        try:
-            raw = ex.fetch_ohlcv(s, timeframe=cfg.exchange.timeframe, limit=cfg.exchange.candles_limit)
-            df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
-            df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-            df.set_index("dt", inplace=True)
-            if len(df) > 0:
-                bars[s] = df
-        except Exception as e:
-            log.warning(f"Failed OHLCV {s}: {e}")
-
-    # Funding tilt snapshot (static in BT)
+    bars: Dict[str, pd.DataFrame] = {}
     funding_map: Dict[str, float] = {}
-    try:
-        if getattr(cfg.strategy.funding_tilt, "enabled", False):
-            funding_map = ex.fetch_funding_rates(list(bars.keys())) or {}
-    except Exception as e:
-        log.debug(f"Funding rates fetch failed in BT: {e}")
-        funding_map = {}
 
-    ex.close()
+    if prefetch_bars is not None:
+        # Use provided data
+        for s, df in (prefetch_bars or {}).items():
+            if isinstance(df, pd.DataFrame) and len(df) > 0:
+                bars[s] = df.copy()
+    else:
+        ex = ExchangeWrapper(cfg.exchange)
+        try:
+            for s in symbols:
+                try:
+                    raw = ex.fetch_ohlcv(s, timeframe=cfg.exchange.timeframe, limit=cfg.exchange.candles_limit)
+                    df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+                    df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+                    df.set_index("dt", inplace=True)
+                    if len(df) > 0:
+                        bars[s] = df
+                except Exception as e:
+                    log.warning(f"Failed OHLCV {s}: {e}")
+
+            # Funding tilt snapshot (static in BT)
+            try:
+                if getattr(cfg.strategy.funding_tilt, "enabled", False):
+                    funding_map = ex.fetch_funding_rates(list(bars.keys())) or {}
+            except Exception as e:
+                log.debug(f"Funding rates fetch failed in BT: {e}")
+                funding_map = {}
+        finally:
+            try:
+                ex.close()
+            except Exception:
+                pass
 
     if not bars:
-        log.error("No bars fetched; backtest aborted.")
+        log.error("No bars available; backtest aborted.")
         return {}
 
     closes = pd.concat({s: bars[s]["close"] for s in bars}, axis=1).dropna(how="all")
@@ -117,8 +139,13 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
             cfg.strategy.lookbacks,
             cfg.strategy.lookback_weights,
             cfg.strategy.vol_lookback,
-            k_func=dynamic_k if bool(getattr(cfg.strategy, "use_dynamic_k", False)) else None,
-            funding_map=funding_map,
+            k_min=cfg.strategy.k_min,
+            k_max=cfg.strategy.k_max,
+            market_neutral=cfg.strategy.market_neutral,
+            gross_leverage=cfg.strategy.gross_leverage,
+            max_weight_per_asset=cfg.strategy.max_weight_per_asset,
+            dynamic_k_fn=dynamic_k if bool(getattr(cfg.strategy, "use_dynamic_k", False)) else None,
+            funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, "enabled", False) else None,
             funding_weight=float(getattr(cfg.strategy.funding_tilt, "weight", 0.0)) if getattr(cfg.strategy.funding_tilt, "enabled", False) else 0.0,
             entry_zscore_min=float(getattr(cfg.strategy, "entry_zscore_min", 0.0)),
             diversify_enabled=bool(getattr(cfg.strategy.diversify, "enabled", False)),
@@ -128,6 +155,7 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
             target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, "target_daily_vol_bps", 0.0)),
             vol_target_min_scale=float(getattr(cfg.strategy.vol_target, "min_scale", 0.5)),
             vol_target_max_scale=float(getattr(cfg.strategy.vol_target, "max_scale", 2.0)),
+            signal_power=float(getattr(cfg.strategy, "signal_power", 1.35)),
         ).reindex(closes.columns).fillna(0.0)
 
         prev_w = weights_hist[-1] if len(weights_hist) else pd.Series(0.0, index=closes.columns)
@@ -145,7 +173,7 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
         pnl = equity[-1] * port_ret
         costs = _costs(turnover_notional * equity[-1], maker_ratio, cfg)
         funding = 0.0
-        if getattr(cfg.strategy.funding_tilt, "enabled", False):
+        if getattr(cfg.strategy.funding_tilt, "enabled", False) and funding_map:
             # crude: apply symbol funding weighted by exposure
             funding = float((w * pd.Series(funding_map).reindex(closes.columns).fillna(0.0)).sum()) / (365*24*10_000.0)
             funding *= equity[-1]
@@ -159,5 +187,11 @@ def run_backtest(cfg: AppConfig, symbols: List[str]) -> Dict[str, float]:
     log.info(f"Samples: {len(eq)} bars  |  Universe size: {len(closes.columns)}")
     log.info(f"Total Return: {stats['total_return']:.2%} | Annualized: {stats['annualized']:.2%} | Sharpe: {stats['sharpe']:.2f}")
     log.info(f"Max Drawdown: {stats['max_drawdown']:.2%} | Calmar: {stats['calmar']:.2f}")
+
+    if return_curve:
+        # Attach the equity curve for callers who want it
+        # Note: this is a pandas Series indexed by bar time
+        stats = dict(stats)
+        stats["equity_curve"] = eq
 
     return stats

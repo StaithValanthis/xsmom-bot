@@ -1,4 +1,4 @@
-# v1.6.2 – 2025-08-22 (CCXT-only; cleaned; startup-safe helpers kept)
+# v1.6.3 – 2025-09-04 (CCXT-only; cleaned; startup-safe helpers kept)
 from __future__ import annotations
 import logging
 import os
@@ -255,6 +255,11 @@ class ExchangeWrapper:
         except Exception as e:
             log.debug(f"cancel_order_safe({order_id}, {symbol}) failed: {e}")
             raise
+
+    # --- Compatibility alias for live.py (which calls ex.cancel_order) ---
+    def cancel_order(self, order_id: str, symbol: str) -> None:
+        """Alias for backward compatibility with live.py and maintenance scripts."""
+        return self.cancel_order_safe(order_id, symbol)
 
     def cancel_all_orders(self, symbol: Optional[str] = None) -> Any:
         try:
