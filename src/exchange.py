@@ -270,3 +270,4 @@ class ExchangeWrapper:
             self.x.close()
         except Exception:
             pass
+
