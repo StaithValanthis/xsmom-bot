@@ -1,5 +1,5 @@
 exchange:
-  id: mexc
+  id: bybit
   margin_mode: cross
   account_type: swap
   quote: USDT
