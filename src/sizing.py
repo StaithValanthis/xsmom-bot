@@ -1,3 +1,4 @@
+
 # sizing.py — v1.4 (2025-09-02)
 # - Explicit ffill + pct_change(fill_method=None) to silence pandas FutureWarning
 # - Confidence-weighted (|z|^p) sizing with market-neutral long/short buckets
@@ -173,7 +174,11 @@ def build_targets(
 
     # 6) Funding tilt (reduce exposure against dear funding)
     if funding_tilt and funding_weight != 0.0:
-        f = pd.Series(funding_tilt).reindex(w.index).fillna(0.0)
+        f = (pd.Series(funding_tilt)
+            .reindex(w.index)
+            .fillna(0.0)
+            .infer_objects(copy=False)
+            .astype(float))
         # positive funding -> longs pay -> down-weight longs; negative -> shorts pay -> down-weight shorts
         adj = pd.Series(1.0, index=w.index, dtype=float)
         adj.loc[w > 0] = 1.0 - funding_weight * (f.clip(lower=0.0) / 10000.0)

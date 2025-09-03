@@ -1,3 +1,4 @@
+
 # v1.7.0 – 2025-08-26
 # - Adaptive TP/SL multipliers by volatility regime (ATR% tiers)
 # - FAST exit on regime flip (configurable confirmation bars)
@@ -918,6 +919,7 @@ def _reconcile_open_orders(
 # -------------------- MAIN LOOP --------------------
 
 def run_live(cfg: AppConfig, dry: bool = False):
+    log.info("Starting live loop (mode=%s)", "DRY" if dry else "LIVE")
     log.info(f"Fast SL/TP loop starting: check every {cfg.risk.fast_check_seconds}s on timeframe={cfg.risk.stop_timeframe}")
 
     state_path = cfg.paths.state_path
@@ -935,7 +937,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
     day_start_equity = float(state.get("day_start_equity", 0.0))
     day_high_equity = float(state.get("day_high_equity", 0.0))
     disable_until_ts = float(state.get("disable_until_ts", 0.0))
-    soft_block_until_ts = (_tmp := state.get("soft_block_until_ts")) if isinstance(state.get("soft_block_until_ts"), (int, float, str)) and str(state.get("soft_block_until_ts")).strip() not in ("", "None") and not isinstance(state.get("soft_block_until_ts"), bool) else 0.0 if False else float(state.get("soft_block_until_ts") or 0.0)
+    soft_block_until_ts = float((state or {}).get("soft_block_until_ts") or 0.0)
     current_stepdown_tier = int(state.get("risk_stepdown_tier", 0))
 
     ex = ExchangeWrapper(cfg.exchange)
@@ -1062,7 +1064,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     allow_new_entries = False
                     soft_resume = resume_time_after_kill(utcnow(), cfg.strategy.soft_kill.resume_after_minutes)
                     state["soft_block_until_ts"] = soft_resume.timestamp()
-                    soft_block_until_ts = state["soft_block_until_ts"]
+                    soft_block_until_ts = float((state or {}).get("soft_block_until_ts") or 0.0)
                     write_json(state_path, state)
                     log.warning(f"SOFT KILL: dd_from_start={dd_start:.2f}% ; blocking new entries until {soft_resume.isoformat()}")
 
@@ -1507,3 +1509,5 @@ def run_live(cfg: AppConfig, dry: bool = False):
             ex.close()
         except Exception:
             pass
+
+

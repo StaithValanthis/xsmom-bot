@@ -1,3 +1,4 @@
+
 # v1.2.1 – 2025-08-21
 from __future__ import annotations
 import logging
@@ -87,3 +88,18 @@ def regime_ok(
     except Exception:
         # Any calc error → don't block trading
         return True
+
+
+def regime_ok_with_reason(close: pd.Series, ema_len: int, slope_min_bps_per_day: float, use_abs: bool=False):
+    """
+    Wrapper over regime_ok that also returns a human-readable reason.
+    Returns (ok: bool, reason: Optional[str]).
+    """
+    try:
+        ok = regime_ok(close, ema_len, slope_min_bps_per_day, use_abs=use_abs)
+        if ok:
+            return True, None
+        return False, f"EMA{ema_len} slope below {slope_min_bps_per_day} bps/day"
+    except Exception as e:
+        # Fail-open
+        return True, None
