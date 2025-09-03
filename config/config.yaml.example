@@ -1,13 +1,14 @@
 exchange:
-  id: bybit
+  id: mexc
+  margin_mode: cross
   account_type: swap
   quote: USDT
   only_perps: true
-  unified_margin: true
+  unified_margin: false
   testnet: false
-  max_symbols: 100
-  min_usd_volume_24h: 30000000
-  min_price: 0.03
+  max_symbols: 30
+  min_usd_volume_24h: 2000000
+  min_price: 0.01
   timeframe: 1h
   candles_limit: 1500
 strategy:
