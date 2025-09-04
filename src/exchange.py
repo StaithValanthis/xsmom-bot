@@ -1,4 +1,4 @@
-# v1.6.3 – 2025-09-04 (CCXT-only; cleaned; startup-safe helpers kept)
+# v1.6.4 – 2025-09-04 (CCXT-only; added fetch_order_book wrapper)
 from __future__ import annotations
 import logging
 import os
@@ -122,6 +122,13 @@ class ExchangeWrapper:
             return self.x.fetch_tickers(syms)
         except Exception as e:
             log.debug(f"fetch_tickers error: {e}")
+            return {}
+
+    def fetch_order_book(self, symbol: str, limit: int = 10) -> dict:
+        try:
+            return self.x.fetch_order_book(symbol, limit=limit)
+        except Exception as e:
+            log.debug(f"fetch_order_book error: {e}")
             return {}
 
     def fetch_funding_rates(self, symbols: List[str]) -> Dict[str, float]:

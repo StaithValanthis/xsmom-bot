@@ -1,15 +1,14 @@
-
-# v1.7.0 – 2025-08-26
-# - Adaptive TP/SL multipliers by volatility regime (ATR% tiers)
-# - FAST exit on regime flip (configurable confirmation bars)
-# - Trailing unlock ladder is now config-driven
-# - Keeps: dynamic banlist & symbol scoring, ADX filter, partial-TP ladders, no-progress exit,
-#          spread guard + dynamic price offset, stale-order cleanup, risk stepdown, funding tilt, diversify, vol target, etc.
+# v1.8.0 – 2025-09-04
+# - Added portfolio-level scaler: VolTarget × DD Stepdown × Fractional-Kelly
+# - Re-cap weights AFTER multipliers (per-asset and per-symbol notional)
+# - Router hardening: whitespace/case tolerant + explicit logging of config mode/raw
+# - Keeps: microstructure gate, ADX, regime, majors downweight/block, MTF confirm,
+#          Kelly per-symbol scaling, ToD boost, symbol scoring/banlist, stale order cleanup,
+#          risk stepdown tiers, funding tilt, diversify, vol target (legacy), etc.
 from __future__ import annotations
 import logging
 import threading
 import time
-from time import perf_counter
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,11 +18,14 @@ from .config import AppConfig
 from .exchange import ExchangeWrapper
 from .signals import compute_atr, regime_ok, dynamic_k
 from .sizing import build_targets, apply_liquidity_caps, apply_kelly_scaling
+from .regime_router import build_targets_auto, decide_mode
 from .risk import kill_switch_should_trigger, resume_time_after_kill
 from .utils import utcnow, read_json, write_json
 
 log = logging.getLogger("live")
 
+
+# -------------------- microstructure / helpers --------------------
 
 def _micro_ok(cfg: AppConfig, tkr: dict, orderbook: dict | None) -> bool:
     mc = getattr(cfg.execution, "microstructure", None)
@@ -67,7 +69,6 @@ def _majors_gate(ex: ExchangeWrapper, cfg: AppConfig, timeframe: str, candles_li
         except Exception:
             ok += 1
     return (ok >= 2), ok
-# -------------------- helpers --------------------
 
 def _normalize_soft_block(value):
     try:
@@ -76,7 +77,6 @@ def _normalize_soft_block(value):
         return float(value)
     except (TypeError, ValueError):
         return 0.0
-
 
 def _state_get_hourstats(state: dict) -> dict:
     return state.setdefault("hour_stats", {})
@@ -87,10 +87,6 @@ def _ema_update(prev: Optional[float], value: float, alpha: float) -> float:
     return float(alpha * value + (1 - alpha) * prev)
 
 def _update_hour_stats_on_close(state: dict, cfg: AppConfig, symbol: str, pnl_usdt: float, entry_time_iso: Optional[str]) -> None:
-    """
-    Update per-UTC-hour profitability stats on each closed trade.
-    Uses entry bar time if available to attribute PnL to the hour the trade was *started*.
-    """
     tod_cfg = getattr(cfg.strategy, "time_of_day_whitelist", None)
     if not tod_cfg or not getattr(tod_cfg, "enabled", False):
         return
@@ -102,12 +98,7 @@ def _update_hour_stats_on_close(state: dict, cfg: AppConfig, symbol: str, pnl_us
         hour = int(et.hour)
         hs = _state_get_hourstats(state)
         rec = hs.get(str(hour)) or {"n": 0, "sum": 0.0, "ema_pnl_bps": None}
-
-        # Convert pnl to bps approximating entry notional from state if present (fallback raw USDT)
-        # We store PnL in "bps-like" by dividing by abs(pnl) proxy? Safer: keep raw USDT and also EMA in USDT.
-        # For gating we can use EMA USDT >= 0 if threshold_bps == 0.
         pnl = float(pnl_usdt or 0.0)
-
         rec["n"] = int(rec["n"]) + 1
         rec["sum"] = float(rec["sum"] or 0.0) + pnl
         alpha = float(getattr(tod_cfg, "ema_alpha", 0.2))
@@ -116,7 +107,6 @@ def _update_hour_stats_on_close(state: dict, cfg: AppConfig, symbol: str, pnl_us
         state["hour_stats"] = hs
     except Exception as e:
         log.debug(f"hour-stats update failed: {e}")
-
 
 def _safe_float(x, default: Optional[float] = None) -> Optional[float]:
     try:
@@ -161,6 +151,7 @@ def _dd_pct(ref: float, noweq: float) -> float:
         return 0.0
     return 100.0 * max(0.0, (ref - noweq) / ref)
 
+
 # -------------------- ADX (Wilder DMI) --------------------
 
 def _compute_adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
@@ -185,9 +176,7 @@ def _compute_adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
     adx = dx.ewm(alpha=1.0 / n, adjust=False).mean()
     return adx
 
-
 def _compute_dmi(df: pd.DataFrame, n: int = 14):
-    """Return ADX, +DI, -DI and whether ADX is rising on the latest bar."""
     high = df["high"].astype("float64")
     low = df["low"].astype("float64")
     close = df["close"].astype("float64")
@@ -213,15 +202,11 @@ def _compute_dmi(df: pd.DataFrame, n: int = 14):
     adx_rising = adx.diff() > 0
     return adx, plus_di, minus_di, adx_rising
 
-# -------------------- DYNAMIC BANLIST / SYMBOL SCORING --------------------
+
+# -------------------- dynamic banlist / symbol scoring --------------------
 
 def _state_get_symstats(state: dict) -> dict:
     return state.setdefault("sym_stats", {})
-
-def _ema_update(prev: Optional[float], value: float, alpha: float) -> float:
-    if prev is None:
-        return value
-    return float(alpha * value + (1 - alpha) * prev)
 
 def _update_symbol_score_on_close(state: dict, cfg: AppConfig, symbol: str, pnl_usdt: float) -> None:
     sf_cfg = getattr(cfg.strategy, "symbol_filter", None)
@@ -317,7 +302,8 @@ def _apply_symbol_filter_to_targets(state: dict, cfg: AppConfig, targets: pd.Ser
     state["sym_stats"] = stats
     return out
 
-# -------------------- FAST EVENT-DRIVEN SL/TP THREAD --------------------
+
+# -------------------- Fast SL/TP thread --------------------
 
 class FastSLTPThread(threading.Thread):
     def __init__(self, ex: ExchangeWrapper, cfg: AppConfig, state: dict, dry: bool, stop_event: threading.Event):
@@ -337,7 +323,6 @@ class FastSLTPThread(threading.Thread):
         self.state.setdefault("enter_bar_time", {})
         self.state.setdefault("locked_r", {})
 
-        # risk knobs
         self.stop_close_only: bool = bool(getattr(self.cfg.risk, "stop_on_close_only", True))
         self.stop_confirm_bars: int = int(getattr(self.cfg.risk, "stop_confirm_bars", 0))
         self.min_hold_minutes: int = int(getattr(self.cfg.risk, "min_hold_minutes", 0))
@@ -345,7 +330,6 @@ class FastSLTPThread(threading.Thread):
         self.stop_buffer_bps: float = float(getattr(self.cfg.risk, "stop_buffer_bps", 0.0))
         self.trail_mult_base: float = float(getattr(self.cfg.risk, "trail_atr_mult", 0.0) or 0.0)
 
-        # ladders/no-progress
         np_cfg = getattr(self.cfg.risk, "no_progress", None)
         self.no_progress_enabled = bool(np_cfg and np_cfg.enabled)
         self.no_progress_min_minutes = int(np_cfg.min_minutes) if np_cfg else 0
@@ -357,43 +341,35 @@ class FastSLTPThread(threading.Thread):
         self.ladd_sizes = list(getattr(ladd, "sizes", []) or [])
         self.ladd_reduce_only = bool(getattr(ladd, "reduce_only", True))
 
-        # trailing unlocks (config-driven)
         tu = getattr(self.cfg.risk, "trailing_unlocks", None)
         self.unlock_enabled = bool(tu and tu.enabled)
         self.unlock_triggers = list(getattr(tu, "triggers_r", []) or [])
         self.unlock_locks = list(getattr(tu, "lock_r", []) or [])
 
-        # fast exit on regime flip
         rx = getattr(self.cfg.risk, "exit_on_regime_flip", None)
         self.exit_regime_enabled = bool(rx and rx.enabled)
         self.exit_regime_confirm = int(getattr(rx, "confirm_bars", 1) or 1)
 
-    # -------- Adaptive scales (per symbol, on latest bar) --------
     def _adaptive_scales(self, symbol: str, last_close: float) -> Tuple[float, float, float]:
-        """Returns (sl_scale, trail_scale, ladder_r_scale)."""
         ad = getattr(self.cfg.risk, "adaptive", None)
         if not ad or not ad.enabled or last_close <= 0:
             return 1.0, 1.0, 1.0
         atr = float(self._atr_cache.get(symbol, 0.0) or 0.0)
         if atr <= 0:
             return 1.0, 1.0, 1.0
-        # ATR% in bps
         atrp_bps = (atr / float(last_close)) * 10_000.0
         low = float(getattr(ad, "low_thr_bps", 40.0))
         high = float(getattr(ad, "high_thr_bps", 120.0))
-
         tier = "mid"
         if atrp_bps <= low:
             tier = "low"
         elif atrp_bps >= high:
             tier = "high"
-
         def _pick(obj, key, default=1.0):
             try:
                 return float(getattr(obj, key).get(tier, default))
             except Exception:
                 return default
-
         sl_scale = _pick(ad, "sl_scale", 1.0)
         trail_scale = _pick(ad, "trail_scale", 1.0)
         ladd_scale = _pick(ad, "ladder_r_scale", 1.0)
@@ -440,9 +416,6 @@ class FastSLTPThread(threading.Thread):
                 pinfo["trail_ll"] = float(min(_safe_float(pinfo.get("trail_ll"), low_v), low_v))
 
     def _compute_stop_px(self, symbol: str, last_closed: pd.Series) -> Tuple[Optional[float], Optional[float], float, float, int]:
-        """
-        Returns: (normal_stop_px, catastrophic_stop_px, entry_price, R_unit, sign)
-        """
         pinfo = self.state.get("perpos", {}).get(symbol) or {}
         sign = int(pinfo.get("sign", 0) or 0)
         entry_price = _safe_float(pinfo.get("entry_price"))
@@ -457,7 +430,6 @@ class FastSLTPThread(threading.Thread):
         trail_k_eff = self.trail_mult_base * trail_scale
         trailing_enabled = bool(getattr(self.cfg.risk, "trailing_enabled", True))
 
-        # base stop from entry
         init_sl = entry_price - atr_mult_sl_eff * entry_atr if sign > 0 else entry_price + atr_mult_sl_eff * entry_atr
 
         cur_atr = self._atr_cache.get(symbol, entry_atr)
@@ -469,7 +441,6 @@ class FastSLTPThread(threading.Thread):
             trail_sl = (hh - trail_k_eff * cur_atr) if sign > 0 else (ll + trail_k_eff * cur_atr)
             stop_px = max(init_sl, trail_sl) if sign > 0 else min(init_sl, trail_sl)
 
-        # R unit uses the effective SL distance
         R_unit = float(entry_atr * atr_mult_sl_eff)
         be_after = float(getattr(self.cfg.risk, "breakeven_after_r", 0.0))
         if be_after > 0 and last_close is not None:
@@ -478,7 +449,6 @@ class FastSLTPThread(threading.Thread):
             elif sign < 0 and last_close <= entry_price - be_after * R_unit:
                 stop_px = min(stop_px, entry_price)
 
-        # configurable trailing unlock ladder
         locked = float(self.state.get("locked_r", {}).get(symbol, 0.0) or 0.0)
         if self.unlock_enabled and self.unlock_triggers and self.unlock_locks:
             for trig, lock in zip(self.unlock_triggers, self.unlock_locks):
@@ -492,7 +462,6 @@ class FastSLTPThread(threading.Thread):
                         stop_px = min(stop_px, entry_price - lock_r * R_unit)
                         locked = lock_r
         else:
-            # fallback to legacy ladder
             for trig, lock in [(0.8, 0.0), (1.5, 0.5), (2.5, 1.2)]:
                 trig_eff = trig * (ladd_scale if ladd_scale else 1.0)
                 if locked < lock:
@@ -506,14 +475,12 @@ class FastSLTPThread(threading.Thread):
         if locked > 0:
             self.state.setdefault("locked_r", {})[symbol] = locked
 
-        # buffer (bps)
         buf = self.stop_buffer_bps / 10_000.0
         if buf > 0:
             stop_px = stop_px * (1.0 - buf) if sign > 0 else stop_px * (1.0 + buf)
 
-        # catastrophic (note: not scaled; intended as hard guard)
         cat_px = entry_price - self.catastrophic_mult * entry_atr if sign > 0 else entry_price + self.catastrophic_mult * entry_atr
-        return float(stop_px), float(cat_px), float(entry_price), float(R_unit), sign
+        return float(stop_px), float(cat_px), float(entry_price), float(R_unit), int(sign)
 
     def _partial_ladders(self, symbol: str, qty: float, rr_now: float, last_close: float):
         if not self.ladd_enabled or qty == 0:
@@ -521,7 +488,6 @@ class FastSLTPThread(threading.Thread):
         pinfo = self.state.get("perpos", {}).get(symbol) or {}
         done = pinfo.get("ladder_done") or [False] * len(self.ladd_levels_base)
 
-        # adapt ladder trigger levels with volatility tier
         _, _, ladd_scale = self._adaptive_scales(symbol, last_close)
         levels_eff = [float(r) * (ladd_scale if ladd_scale else 1.0) for r in self.ladd_levels_base]
 
@@ -559,7 +525,6 @@ class FastSLTPThread(threading.Thread):
                 self.ex.create_order_safe(symbol, side_close, q, None, post_only=False, reduce_only=True)
                 log.info(f"[LIVE-{reason}] {symbol}: {side_close} {q} @ mkt")
         finally:
-            # update symbol performance scoring
             try:
                 pinfo = (self.state.get("perpos", {}) or {}).get(symbol, {})
                 ep = float(pinfo.get("entry_price") or 0.0)
@@ -571,12 +536,10 @@ class FastSLTPThread(threading.Thread):
             except Exception:
                 pass
 
-            # cooldown after stop/exit
             cdm = int(getattr(self.cfg.risk, "cooldown_minutes_after_stop", 0))
             if cdm > 0:
                 until = (pd.Timestamp.utcnow() + pd.Timedelta(minutes=cdm)).isoformat()
                 self.state.setdefault("cooldowns", {})[symbol] = until
-            # clear tracking
             self.state.get("perpos", {}).pop(symbol, None)
             self.state.get("enter_bar_time", {}).pop(symbol, None)
             self.state.get("locked_r", {}).pop(symbol, None)
@@ -631,7 +594,6 @@ class FastSLTPThread(threading.Thread):
                     # FAST exit on regime flip (optional)
                     if self.exit_regime_enabled and getattr(self.cfg.strategy, "regime_filter", None) and self.cfg.strategy.regime_filter.enabled:
                         try:
-                            # use the same 'tf' stream; cheap and consistent
                             ser = closed_tail["close"].dropna()
                             ok = regime_ok(ser, int(self.cfg.strategy.regime_filter.ema_len),
                                            float(self.cfg.strategy.regime_filter.slope_min_bps_per_day),
@@ -648,23 +610,19 @@ class FastSLTPThread(threading.Thread):
                             self._place_exit(sym, qty, "REGIME-FLIP", float(last_closed["close"]))
                             continue
 
-                    # compute R progress
                     pinfo = self.state["perpos"].get(sym, {})
                     ep = float(pinfo.get("entry_price") or entry_px)
                     atr0 = float(pinfo.get("entry_atr") or self._atr_cache.get(sym, 0.0) or 1.0)
                     last_c = float(last_closed["close"])
 
-                    # effective R uses adaptive SL multiplier
                     sl_scale, _, _ = self._adaptive_scales(sym, last_c)
                     R_unit = atr0 * float(getattr(self.cfg.risk, "atr_mult_sl", 2.0)) * sl_scale
                     rr_now = abs(last_c - ep) / (R_unit if R_unit > 1e-12 else 1.0)
                     pinfo["max_rr"] = float(max(float(pinfo.get("max_rr", 0.0)), rr_now))
                     self.state["perpos"][sym] = pinfo
 
-                    # partial ladders (vol-aware)
                     self._partial_ladders(sym, qty, rr_now, last_c)
 
-                    # time-based exit
                     max_hours = int(getattr(self.cfg.risk, "max_hours_in_trade", 0) or 0)
                     if max_hours > 0:
                         enter_iso = self.state.get("enter_bar_time", {}).get(sym)
@@ -674,21 +632,18 @@ class FastSLTPThread(threading.Thread):
                                 self._place_exit(sym, qty, "TIME-EXIT", last_c)
                                 continue
 
-                    # no-progress exit
-                    if self.no_progress_enabled and self._minutes_held(sym) >= self.no_progress_min_minutes:
-                        if float(pinfo.get("max_rr", 0.0)) < self.no_progress_min_rr:
+                    np_cfg = getattr(self.cfg.risk, "no_progress", None)
+                    if np_cfg and np_cfg.enabled and self._minutes_held(sym) >= float(np_cfg.min_minutes or 0):
+                        if float(pinfo.get("max_rr", 0.0)) < float(np_cfg.min_rr or 0.0):
                             self._place_exit(sym, qty, "NO-PROGRESS", last_c)
                             continue
 
-                    # compute stops
                     normal_px, cat_px, ep, R_unit_eff, sign = self._compute_stop_px(sym, last_closed)
                     if sign == 0:
                         continue
 
-                    # hold gate for NORMAL stop (catastrophic always live)
                     allow_normal = (self.min_hold_minutes <= 0) or (self._minutes_held(sym) >= self.min_hold_minutes)
 
-                    # confirm logic on CLOSED bars
                     hit_normal = False
                     hit_cat = False
                     if normal_px is not None and allow_normal:
@@ -706,11 +661,8 @@ class FastSLTPThread(threading.Thread):
                         if (sign > 0 and last_closed["low"] <= cat_px) or (sign < 0 and last_closed["high"] >= cat_px):
                             hit_cat = True
 
-                    # trailing breach (closed price)
                     if bool(getattr(self.cfg.risk, "trailing_enabled", True)) and self.trail_mult_base > 0 and not hit_cat and not hit_normal:
-                        # use adaptive trail multiplier inside compute_stop_px (already applied)
                         if sign > 0:
-                            # recompute trail using current adaptive values
                             sl_scale, trail_scale, _ = self._adaptive_scales(sym, last_c)
                             cur_atr = self._atr_cache.get(sym, atr0) or atr0
                             trail_k_eff = self.trail_mult_base * trail_scale
@@ -735,7 +687,8 @@ class FastSLTPThread(threading.Thread):
             except Exception as e:
                 log.debug(f"Fast thread loop error: {e}")
 
-# -------------------- STARTUP RECONCILE --------------------
+
+# -------------------- startup reconcile --------------------
 
 def _reconcile_positions_on_start(ex: ExchangeWrapper, cfg: AppConfig, state: dict) -> None:
     try:
@@ -780,7 +733,6 @@ def _reconcile_positions_on_start(ex: ExchangeWrapper, cfg: AppConfig, state: di
         except Exception as e:
             log.warning(f"Startup reconcile: OHLCV/ATR failed for {sym}: {e}")
 
-    # prune stale
     stale = []
     for sym in list(state.get("perpos", {}).keys()):
         if sym not in positions or float(positions.get(sym, {}).get("net_qty") or 0.0) == 0.0:
@@ -796,7 +748,8 @@ def _reconcile_positions_on_start(ex: ExchangeWrapper, cfg: AppConfig, state: di
     else:
         log.info("Startup reconcile: no live positions found on exchange.")
 
-# -------------------- ORDER CLEANUP (reconciliation) --------------------
+
+# -------------------- order maintenance --------------------
 
 def _reconcile_open_orders(
     ex: ExchangeWrapper,
@@ -872,7 +825,6 @@ def _reconcile_open_orders(
                 to_cancel.append(od.get("id"))
                 continue
 
-            # age
             age_bad = False
             created = od.get("timestamp") or od.get("time") or od.get("created")
             if created:
@@ -882,7 +834,6 @@ def _reconcile_open_orders(
                 except Exception:
                     age_bad = False
 
-            # distance from mid
             far_bad = False
             if far_bps > 0 and mid:
                 try:
@@ -916,7 +867,8 @@ def _reconcile_open_orders(
 
     state["last_stale_cleanup_ts"] = now_ts
 
-# -------------------- MAIN LOOP --------------------
+
+# -------------------- main loop --------------------
 
 def run_live(cfg: AppConfig, dry: bool = False):
     log.info("Starting live loop (mode=%s)", "DRY" if dry else "LIVE")
@@ -942,7 +894,6 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
     ex = ExchangeWrapper(cfg.exchange)
 
-    # Safety: cancel all open orders on boot if configured
     if getattr(cfg.execution, "cancel_open_orders_on_start", False):
         try:
             ex.cancel_all_orders(None)
@@ -950,7 +901,6 @@ def run_live(cfg: AppConfig, dry: bool = False):
         except Exception as e:
             log.warning(f"Startup safety: cancel_all_orders failed (continuing): {e}")
 
-    # Reconcile with live positions
     try:
         _reconcile_positions_on_start(ex, cfg, state)
     except Exception as e:
@@ -993,7 +943,6 @@ def run_live(cfg: AppConfig, dry: bool = False):
         last_align_log = 0.0
 
         while True:
-            # pause handling
             if disable_until_ts and time.time() < disable_until_ts:
                 if time.time() - last_pause_log > 30:
                     resume_dt = pd.to_datetime(disable_until_ts, unit="s", utc=True)
@@ -1018,7 +967,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
             log.info(f"=== Cycle start {cycle_started_at.isoformat()} ===")
             did_first_cycle = True
 
-            # Day rollover (UTC)
+            # Day rollover (UTC) and equity high tracking
             eq = ex.get_equity_usdt()
             cur_day = utcnow().date().isoformat()
             if state.get("day_date") != cur_day and eq > 0:
@@ -1030,13 +979,11 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 write_json(state_path, state)
                 log.info(f"New UTC day: reset day_start_equity and day_high_equity to {eq:.2f}")
 
-            # Update intraday equity high
             if eq > 0 and eq > day_high_equity:
                 day_high_equity = eq
                 state["day_high_equity"] = day_high_equity
                 write_json(state_path, state)
 
-            # Kill switch (supports trailing from config)
             use_trailing = bool(getattr(cfg.risk, "use_trailing_killswitch", True))
             if eq > 0 and (day_start_equity > 0 or day_high_equity > 0):
                 if kill_switch_should_trigger(day_start_equity, day_high_equity, eq, cfg.risk.max_daily_loss_pct, use_trailing=use_trailing):
@@ -1050,7 +997,6 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     time.sleep(5)
                     continue
 
-            # SOFT kill (optional; blocks new entries only)
             allow_new_entries = True
             if getattr(cfg.strategy, "soft_kill", None) and cfg.strategy.soft_kill.enabled and eq > 0 and day_start_equity > 0:
                 dd_start = _dd_pct(day_start_equity, eq)
@@ -1084,48 +1030,43 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
             if not bars:
                 log.error("No bars fetched this cycle; sleeping.")
-            # Microstructure pre-gate (per symbol, on entries)
+                time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
+                continue
+
+            # Microstructure pre-gate (entries only)
+            keep = list(bars.keys())
             if getattr(cfg.execution, "microstructure", None) and getattr(cfg.execution.microstructure, "enabled", False):
                 tkr_map = ex.fetch_tickers(list(bars.keys())) or {}
                 keep = []
                 for s in list(bars.keys()):
                     tkr = tkr_map.get(s, {}) or {}
-                    ob = None
-                    try:
-                        ob = ex.fetch_order_book(s, limit=10)
-                    except Exception:
-                        ob = None
+                    ob = ex.fetch_order_book(s, limit=10)
                     if _micro_ok(cfg, tkr, ob):
                         keep.append(s)
                 bars = {k: bars[k] for k in keep if k in bars}
-            try:
                 removed = [s for s in tkr_map.keys() if s not in keep] if isinstance(tkr_map, dict) else []
                 log.info(f"[GATE] Microstructure pre-gate: kept={len(keep)} removed={len(removed)} enabled={getattr(cfg.execution.microstructure, 'enabled', False)}")
-            except Exception:
-                pass
 
-                time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
-                continue
-
-            # ADX filter (per-asset)
+            # ADX filter
             eligible_syms = list(bars.keys())
             adx_cfg = getattr(cfg.strategy, "adx_filter", None)
             if adx_cfg and adx_cfg.enabled:
                 blocked = 0
-                keep = []
+                keep2 = []
                 for s, df in bars.items():
                     try:
                         adx = _compute_adx(df[["high","low","close"]], int(adx_cfg.len)).iloc[-1]
                         if float(adx) >= float(adx_cfg.min_adx):
-                            keep.append(s)
+                            keep2.append(s)
                         else:
                             blocked += 1
                     except Exception:
-                        keep.append(s)  # fail-open
-                eligible_syms = keep
+                        keep2.append(s)
+                eligible_syms = keep2
                 if blocked > 0:
                     log.info(f"ADX gate: {blocked}/{len(bars)} symbols blocked this cycle.")
-            # Time-of-day whitelist gate (UTC hours)
+
+            # Time-of-day whitelist
             tod_cfg = getattr(cfg.strategy, "time_of_day_whitelist", None)
             if tod_cfg and tod_cfg.enabled:
                 hour_now = int(pd.Timestamp.utcnow().hour)
@@ -1138,7 +1079,6 @@ def run_live(cfg: AppConfig, dry: bool = False):
                         ema_usdt = float(rec.get("ema_usdt") or 0.0)
                         if n >= int(tod_cfg.min_trades_per_hour or 0):
                             if bool(tod_cfg.use_ema):
-                                # threshold in USDT per trade; if threshold_bps=0, we use non-negative EMA
                                 if ema_usdt >= float(getattr(tod_cfg, "threshold_bps", 0.0)):
                                     allowed.append(int(h))
                             else:
@@ -1150,18 +1090,18 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     log.info(f"Time-of-day gate: hour {hour_now} not in allowed {sorted(list(allowed_hours))}; pausing new entries this cycle.")
                     eligible_syms = []
                 if not eligible_syms:
-                    log.info("ADX gate blocked all symbols; staying flat.")
+                    log.info("Time gates blocked entries; staying flat.")
                     time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                     continue
 
-            # Regime (per-asset)
+            # Regime filter
             closes = pd.concat({s: bars[s]["close"] for s in bars}, axis=1).dropna(how="all")
             if cfg.strategy.regime_filter.enabled:
                 ema_len = int(cfg.strategy.regime_filter.ema_len)
                 thr = float(cfg.strategy.regime_filter.slope_min_bps_per_day)
                 use_abs = bool(getattr(cfg.strategy.regime_filter, "use_abs", False))
                 blocked = 0
-                keep = []
+                keep3 = []
                 for s in list(eligible_syms):
                     ser = closes[s].dropna()
                     try:
@@ -1169,10 +1109,10 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     except Exception:
                         ok = True
                     if ok:
-                        keep.append(s)
+                        keep3.append(s)
                     else:
                         blocked += 1
-                eligible_syms = keep
+                eligible_syms = keep3
                 if blocked > 0:
                     log.info(f"Regime gate: {blocked}/{len(closes.columns)} symbols blocked this cycle.")
                 if len(eligible_syms) == 0:
@@ -1180,8 +1120,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
                     continue
 
-            
-            # Majors regime (BTC/ETH) overall gate or downweight
+            # Majors regime overall gate/downweight
             mj = getattr(cfg.strategy, "majors_regime", None)
             majors_ok, okc = _majors_gate(ex, cfg, cfg.exchange.timeframe, cfg.exchange.candles_limit)
             majors_downweight = 1.0
@@ -1190,10 +1129,10 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 if not majors_ok:
                     if getattr(mj, "action", "block") == "block":
                         log.info("Majors regime gate blocked entries this cycle.")
-                        eligible_syms = []  # block new entries
+                        eligible_syms = []
                     else:
                         majors_downweight = float(getattr(mj, "downweight_factor", 0.6))
-    
+
             closes_used = closes[eligible_syms]
 
             # 2) Risk step-down with drawdown
@@ -1223,42 +1162,60 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     gl_mult = float(gl_m[idx]) if idx < len(gl_m) else gl_mult
                     max_new_mult = float(new_m[idx]) if idx < len(new_m) else max_new_mult
 
-            # 3) Targets
+            # 3) Targets (router or legacy)
             funding_map: Dict[str, float] = {}
             if getattr(cfg.strategy.funding_tilt, "enabled", False):
                 try:
                     funding_map = ex.fetch_funding_rates(list(bars.keys())) or {}
                 except Exception:
                     pass
-            targets = build_targets(
-                closes_used,
-                cfg.strategy.lookbacks,
-                cfg.strategy.lookback_weights,
-                cfg.strategy.vol_lookback,
-                cfg.strategy.k_min,
-                cfg.strategy.k_max,
-                cfg.strategy.market_neutral,
-                cfg.strategy.gross_leverage * gl_mult,   # step-down applied here
-                cfg.strategy.max_weight_per_asset,
-                dynamic_k_fn=dynamic_k,
-                funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, 'enabled', False) else None,
-                funding_weight=float(getattr(cfg.strategy.funding_tilt, 'weight', 0.0)) if getattr(cfg.strategy.funding_tilt, 'enabled', False) else 0.0,
-                entry_zscore_min=float(getattr(cfg.strategy, 'entry_zscore_min', 0.0)),
-                diversify_enabled=bool(getattr(cfg.strategy.diversify, 'enabled', False)),
-                corr_lookback=int(getattr(cfg.strategy.diversify, 'corr_lookback', 48)),
-                max_pair_corr=float(getattr(cfg.strategy.diversify, 'max_pair_corr', 0.9)),
-                vol_target_enabled=bool(getattr(cfg.strategy.vol_target, 'enabled', False)),
-                target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, 'target_daily_vol_bps', 0.0)),
-                vol_target_min_scale=float(getattr(cfg.strategy.vol_target, 'min_scale', 0.5)),
-                vol_target_max_scale=float(getattr(cfg.strategy.vol_target, 'max_scale', 1.2)),
-                signal_power=float(getattr(cfg.strategy, 'signal_power', 1.35)),
-            )
-            try:
-                metrics['nonzero_before_cooldowns'] = int((targets != 0).sum())
-            except Exception:
-                pass
 
-            # Reindex to full universe so blocked symbols have 0 weight
+            router_mode_raw = getattr(getattr(cfg, "strategy", object()), "mode", None)
+            router_mode = str(router_mode_raw or "auto").strip().lower()
+            log.info(f"[ROUTER] config strategy.mode={router_mode!r} (raw={router_mode_raw!r})")
+            use_router = router_mode in ("auto", "xsmom", "tsmom")
+
+            try:
+                if use_router:
+                    targets = build_targets_auto(closes_used, cfg)  # regime_router handles object/dict cfg
+                    chosen_mode = decide_mode(cfg, closes_used)
+                    log.info(f"[ROUTER] signal_mode={chosen_mode}, gross={float(targets.abs().sum()):.4f}")
+                else:
+                    raise RuntimeError("Router disabled")
+            except Exception as e:
+                log.info(f"[ROUTER] disabled or failed ({e}); using legacy build_targets pipeline.")
+                targets = build_targets(
+                    closes_used,
+                    cfg.strategy.lookbacks,
+                    cfg.strategy.lookback_weights,
+                    cfg.strategy.vol_lookback,
+                    cfg.strategy.k_min,
+                    cfg.strategy.k_max,
+                    cfg.strategy.market_neutral,
+                    cfg.strategy.gross_leverage * gl_mult,   # apply stepdown here for legacy path
+                    cfg.strategy.max_weight_per_asset,
+                    dynamic_k_fn=dynamic_k,
+                    funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, 'enabled', False) else None,
+                    funding_weight=float(getattr(cfg.strategy.funding_tilt, 'weight', 0.0)) if getattr(cfg.strategy.funding_tilt, 'enabled', False) else 0.0,
+                    entry_zscore_min=float(getattr(cfg.strategy, 'entry_zscore_min', 0.0)),
+                    diversify_enabled=bool(getattr(cfg.strategy.diversify, 'enabled', False)),
+                    corr_lookback=int(getattr(cfg.strategy.diversify, 'corr_lookback', 48)),
+                    max_pair_corr=float(getattr(cfg.strategy.diversify, 'max_pair_corr', 0.9)),
+                    vol_target_enabled=bool(getattr(cfg.strategy.vol_target, 'enabled', False)),
+                    target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, 'target_daily_vol_bps', 0.0)),
+                    vol_target_min_scale=float(getattr(cfg.strategy.vol_target, 'min_scale', 0.5)),
+                    vol_target_max_scale=float(getattr(cfg.strategy.vol_target, 'max_scale', 1.2)),
+                    signal_power=float(getattr(cfg.strategy, 'signal_power', 1.35)),
+                )
+            else:
+                # If router path succeeded, apply stepdown multiplier after targets
+                try:
+                    if gl_mult != 1.0:
+                        targets *= float(gl_mult)
+                except Exception:
+                    pass
+
+            # Reindex to full universe (blocked symbols → 0)
             targets = targets.reindex(closes.columns).fillna(0.0)
             try:
                 longs = int((targets > 0).sum()); shorts = int((targets < 0).sum()); gross = float(targets.abs().sum())
@@ -1266,54 +1223,48 @@ def run_live(cfg: AppConfig, dry: bool = False):
             except Exception:
                 pass
 
-            # --- MTF CONFIRM ---
+            # --- MTF confirmation gate ---
             if bool(getattr(cfg.strategy, "require_mtf_alignment", True)):
-                tf = getattr(cfg.strategy, "confirmation_timeframe", "4h")
+                tf2 = getattr(cfg.strategy, "confirmation_timeframe", "4h")
                 lb = int(getattr(cfg.strategy, "confirmation_lookback", 6))
-                keep = []
+                keep4 = []
                 for s in list(targets.index):
                     try:
-                        raw = ex.fetch_ohlcv(s, timeframe=tf, limit=max(60, lb+2))
+                        raw = ex.fetch_ohlcv(s, timeframe=tf2, limit=max(60, lb+2))
                         if not raw:
-                            keep.append(s); continue
+                            keep4.append(s); continue
                         dfc = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
                         dfc["dt"] = pd.to_datetime(dfc["ts"], unit="ms", utc=True); dfc.set_index("dt", inplace=True)
-                        pc = closes_used[s].dropna()
+                        pc = closes_used[s].dropna() if s in closes_used.columns else pd.Series(dtype=float)
                         hc = dfc["close"].dropna()
                         if len(pc) > lb and len(hc) > lb:
                             p_ret = float(pc.iloc[-1] / pc.iloc[-lb] - 1.0)
                             c_ret = float(hc.iloc[-1] / hc.iloc[-lb] - 1.0)
                             if (targets.loc[s] > 0 and c_ret >= 0) or (targets.loc[s] < 0 and c_ret <= 0):
-                                keep.append(s)
+                                keep4.append(s)
                         else:
-                            keep.append(s)
+                            keep4.append(s)
                     except Exception:
-                        keep.append(s)
-                targets = targets.reindex(keep).fillna(0.0)
-                try:
-                    log.info(f"[GATE] MTF confirm: kept={len(keep)}")
-                except Exception:
-                    pass
+                        keep4.append(s)
+                targets = targets.reindex(keep4).fillna(0.0)
+                log.info(f"[GATE] MTF confirm: kept={len(keep4)}")
 
-            # --- KELLY SCALING ---
+            # --- Kelly per-symbol scaling (tiny) ---
             if getattr(cfg.strategy, "kelly", None) and getattr(cfg.strategy.kelly, "enabled", False):
                 sym_stats = state.get("sym_stats")
                 if isinstance(sym_stats, dict) and len(sym_stats) > 0:
                     targets = apply_kelly_scaling(targets, sym_stats, cfg.strategy.kelly)
-                    try:
-                        nz = targets.replace(0.0, float('nan')).abs()
-                        log.info(f"[SIZING] KELLY scaling applied: nonzero={int(nz.count())} gross={float(nz.sum()):.4f}")
-                    except Exception:
-                        pass
+                    nz = targets.replace(0.0, float('nan')).abs()
+                    log.info(f"[SIZING] KELLY scaling applied: nonzero={int(nz.count())} gross={float(nz.sum()):.4f}")
 
-            # --- MAJORS DOWNWEIGHT (if used) ---
+            # --- Majors downweight (if action=downweight and majors weak) ---
             try:
                 if majors_downweight < 0.999:
                     targets *= float(majors_downweight)
             except Exception:
                 pass
 
-            # --- TIME-OF-DAY BOOST ---
+            # --- Time-of-day boost ---
             tod = getattr(cfg.strategy, "time_of_day_whitelist", None)
             if tod and getattr(tod, "enabled", False) and bool(getattr(tod, "boost_good_hours", False)):
                 cur_h = pd.Timestamp.utcnow().hour
@@ -1323,9 +1274,8 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     if bf != 1.0:
                         targets *= bf
                     log.info(f"[SIZING] ToD boost applied: hour={cur_h} factor={bf}")
-    
 
-            # 3.3) Apply cooldowns to weights
+            # --- Cooldowns to zero weight while active ---
             try:
                 cds = state.get("cooldowns", {}) if isinstance(state, dict) else {}
                 if cds:
@@ -1343,10 +1293,77 @@ def run_live(cfg: AppConfig, dry: bool = False):
             except Exception:
                 pass
 
-            # 3.4) Apply dynamic symbol filter (banlist/downsizing)
+            # --- Dynamic symbol filter (banlist/downsizing) ---
             targets = _apply_symbol_filter_to_targets(state, cfg, targets)
 
-            # 4) Liquidity caps
+            # === Portfolio-level scaler: VolTarget × DD Stepdown × Fractional-Kelly ===
+            def _portfolio_returns(closes_df: pd.DataFrame, weights: pd.Series, lookback: int = 20) -> pd.Series:
+                rets = closes_df.pct_change().dropna()
+                w = weights.reindex(closes_df.columns).fillna(0.0)
+                pr = (rets @ w).tail(lookback)
+                return pr
+
+            vt_target_bps = float(getattr(getattr(cfg, "sizing", object()), "portfolio_target_daily_vol_bps", 60.0))
+            vt_lb = int(getattr(getattr(cfg, "sizing", object()), "portfolio_vol_lookback", 20))
+            vt_lo = float(getattr(getattr(cfg, "sizing", object()), "portfolio_vol_min_mult", 0.6))
+            vt_hi = float(getattr(getattr(cfg, "sizing", object()), "portfolio_vol_max_mult", 1.3))
+
+            try:
+                pr = _portfolio_returns(closes_used, targets, lookback=vt_lb)
+                rv = float(pr.std()) if len(pr) > 2 else 0.0
+                tgt = vt_target_bps / 1e4
+                s_vol = (tgt / rv) if rv > 1e-9 else 1.0
+                s_vol = float(max(vt_lo, min(vt_hi, s_vol)))
+            except Exception:
+                s_vol = 1.0
+
+            # Drawdown stepdown on equity vs trailing high
+            def _dd_abs(ref_high: float, noweq: float) -> float:
+                if ref_high <= 0 or noweq <= 0: return 0.0
+                return max(0.0, (ref_high - noweq) / ref_high)
+
+            dd2, dd4, dd6 = 0.02, 0.04, 0.06
+            m2, m4, m6 = 0.90, 0.75, 0.60
+            ref_h = float(state.get("day_high_equity") or eq or 0.0)
+            eq_now2 = float(eq or ref_h)
+            dd_abs = _dd_abs(ref_h, eq_now2)
+            s_dd = 1.0
+            if dd_abs >= dd6: s_dd = m6
+            elif dd_abs >= dd4: s_dd = m4
+            elif dd_abs >= dd2: s_dd = m2
+
+            # Fractional-Kelly overlay using portfolio SR proxy (very small)
+            try:
+                mu = float(pr.mean()) if len(pr) else 0.0
+                sd = float(pr.std()) if len(pr) else 0.0
+                sr = (mu / sd) if sd > 1e-9 else 0.0
+                kelly_tilt = 1.0 + 0.20 * max(-1.0, min(1.0, sr))  # ±20% at |SR|=1
+                s_kelly = float(max(0.8, min(1.2, kelly_tilt)))
+            except Exception:
+                s_kelly = 1.0
+
+            gross_mult = float(s_vol * s_dd * s_kelly)
+            targets *= gross_mult
+            log.info(f"[SIZING] portfolio scaler: vol_mult={s_vol:.2f} dd_mult={s_dd:.2f} kelly_mult={s_kelly:.2f} → gross_mult={gross_mult:.2f}")
+
+            # --- HARDENING: re-apply per-asset cap AFTER all multipliers ---
+            try:
+                max_w = float(getattr(getattr(cfg, "sizing", object()), "max_weight_per_asset", 0.14))
+                if max_w > 0:
+                    targets = targets.clip(lower=-max_w, upper=max_w)
+            except Exception:
+                pass
+
+            # --- HARDENING: enforce per-symbol notional cap in weights (if set) ---
+            try:
+                cap_usdt = float(getattr(getattr(cfg, "liquidity", object()), "notional_cap_usdt", 0.0) or 0.0)
+                if cap_usdt > 0 and eq > 0:
+                    cap_w = cap_usdt / eq
+                    targets = targets.apply(lambda w: np.sign(w) * min(abs(w), cap_w))
+            except Exception:
+                pass
+
+            # 4) Liquidity caps (ADV %, per-symbol notional)
             tickers = ex.fetch_tickers(list(targets.index))
             eq = ex.get_equity_usdt()
             targets = apply_liquidity_caps(
@@ -1357,7 +1374,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 notional_cap_usdt=cfg.liquidity.notional_cap_usdt,
             )
 
-            # 4.5) Reconcile & clean stale/open orders BEFORE creating new ones
+            # 4.5) Stale/open order cleanup BEFORE creating new ones
             positions = ex.fetch_positions() or {}
             _reconcile_open_orders(
                 ex=ex,
@@ -1381,117 +1398,83 @@ def run_live(cfg: AppConfig, dry: bool = False):
             base_new_per_cycle = int(getattr(cfg.strategy.entry_throttle, "max_new_positions_per_cycle", 999))
             new_entries_cap = min(int(round(base_new_per_cycle * max_new_mult)), remaining_slots)
 
-            now_ts_fn = time.time
-            last_ts_map: Dict[str, float] = state.get("last_trade_ts", {})
+            order_syms = list(targets.index)
+            try:
+                order_syms = sorted(order_syms, key=lambda s: abs(float(targets.loc[s])), reverse=True)
+            except Exception:
+                pass
+            if allow_new_entries and new_entries_cap < len(order_syms):
+                existing = [s for s in order_syms if s in open_symbols]
+                fresh = [s for s in order_syms if s not in open_symbols][:max(0, new_entries_cap)]
+                order_syms = existing + fresh
 
-            candidates: List[Tuple[str, float]] = []
-            for s, w in targets.items():
-                pos = positions.get(s, {}) or {}
-                if _is_new_position(pos) and w != 0.0:
-                    last_t = float(last_ts_map.get(s, 0.0))
-                    if (now_ts_fn() - last_t) < 60.0 * getattr(cfg.strategy.entry_throttle, "per_symbol_trade_cooldown_min", 0):
+            # Preview top intended notionals (sanity)
+            try:
+                preview = []
+                for s in order_syms:
+                    notional = abs(float(targets.loc[s])) * float(eq)
+                    if notional > 0:
+                        preview.append((s, float(targets.loc[s]), notional))
+                preview.sort(key=lambda x: x[2], reverse=True)
+                if preview:
+                    msg = ", ".join(f"{s}:{n:.2f}USDT(w={w:+.3f})" for s, w, n in preview[:5])
+                    log.info(f"[PREVIEW] top intended notionals: {msg}")
+            except Exception:
+                pass
+
+            created = 0
+            for s in order_syms:
+                tgt_w = float(targets.loc[s])
+                tkr = (tickers or {}).get(s, {}) or {}
+                mid = _mid_price(tkr)
+                if mid is None or mid <= 0:
+                    continue
+
+                notional = abs(tgt_w) * eq
+                if notional < min_notional:
+                    continue
+
+                cur_qty = float(positions.get(s, {}).get("net_qty") or 0.0)
+                desired_contracts = tgt_w * eq / mid
+                delta = desired_contracts - cur_qty
+                if abs(delta) <= 0:
+                    continue
+
+                if min_delta_bps > 0 and eq > 0:
+                    cur_notional = abs(cur_qty) * mid
+                    step_bps = (abs(delta) * mid) / max(cur_notional, 1e-9) * 10_000.0 if cur_notional > 0 else 10_000.0
+                    if cur_notional > 0 and step_bps < min_delta_bps:
                         continue
-                    candidates.append((s, abs(float(w))))
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            allow_syms_new = set([s for s, _ in candidates[: new_entries_cap]])
 
-            orders: List[Dict] = []
-            for s, w in targets.items():
-                t = (tickers.get(s, {}) or {})
-                px_last = t.get("last") or t.get("close")
-                if px_last is None:
-                    continue
-                px_last = float(px_last)
-                target_notional = w * eq
+                px = None
+                if getattr(cfg.execution, "order_type", "limit") == "limit":
+                    base_off = float(getattr(cfg.execution, "price_offset_bps", 2.0))
+                    dyn = getattr(cfg.execution, "dynamic_offset", None)
+                    off_bps = base_off
+                    if dyn and getattr(dyn, "enabled", False):
+                        sp = _spread_bps(tkr) or 0.0
+                        off_bps = min(float(dyn.max_offset_bps), float(dyn.base_bps) + float(dyn.per_spread_coeff) * sp)
+                    px = mid * (1.0 - off_bps / 10_000.0) if delta > 0 else mid * (1.0 + off_bps / 10_000.0)
 
-                pos = positions.get(s, {}) or {}
-                long_qty = float(pos.get("long_qty") or 0.0)
-                short_qty = float(pos.get("short_qty") or 0.0)
-                net_qty = float(pos.get("net_qty") or 0.0)
-                cur_notional = net_qty * px_last
-                delta_notional = target_notional - cur_notional
-
-                if abs(delta_notional) < min_notional:
-                    continue
-                if eq > 0 and (abs(delta_notional) / eq * 10_000.0) < min_delta_bps:
-                    continue
-
-                # Spread guard & dynamic offset
                 sg = getattr(cfg.execution, "spread_guard", None)
-                dyn = getattr(cfg.execution, "dynamic_offset", None)
-                mid = _mid_price(t)
-                spr_bps = _spread_bps(t) or 0.0
-                if sg and sg.enabled and sg.max_spread_bps and spr_bps > float(sg.max_spread_bps):
-                    if bool(getattr(sg, "skip_if_wider", True)):
-                        if _is_new_position(pos):
-                            continue
-
-                want_buy = delta_notional > 0
-                want_sell = delta_notional < 0
-
-                is_new = _is_new_position(pos)
-                if is_new:
-                    if not allow_new_entries:
-                        continue
-                    if s not in allow_syms_new:
+                if sg and getattr(sg, "enabled", False):
+                    sp = _spread_bps(tkr) or 0.0
+                    if sp > float(getattr(sg, "max_spread_bps", 15.0)) and bool(getattr(sg, "skip_if_wider", True)):
+                        log.info(f"[SPREAD-GUARD] Skip {s}: spread {sp:.2f}bps > max {sg.max_spread_bps}bps")
                         continue
 
-                # close opposite first
-                if want_buy and short_qty > 0:
-                    qty_to_close = min(abs(delta_notional) / px_last, short_qty)
-                    if qty_to_close > 0:
-                        orders.append({"symbol": s, "side": "buy", "qty": qty_to_close, "price": None, "reduceOnly": True})
-                    delta_notional -= min(abs(delta_notional), qty_to_close * px_last)
-
-                if want_sell and long_qty > 0:
-                    qty_to_close = min(abs(delta_notional) / px_last, long_qty)
-                    if qty_to_close > 0:
-                        orders.append({"symbol": s, "side": "sell", "qty": qty_to_close, "price": None, "reduceOnly": True})
-                    delta_notional += min(abs(delta_notional), qty_to_close * px_last)
-
-                if abs(delta_notional) >= min_notional:
-                    side = "buy" if delta_notional > 0 else "sell"
-                    size = abs(delta_notional) / px_last
-                    price = None
-                    if getattr(cfg.execution, "order_type", "market").lower() == "limit":
-                        off_bps = float(getattr(cfg.execution, "price_offset_bps", 0.0))
-                        if dyn and dyn.enabled:
-                            base = float(getattr(dyn, "base_bps", off_bps))
-                            coeff = float(getattr(dyn, "per_spread_coeff", 0.0))
-                            max_off = float(getattr(dyn, "max_offset_bps", 50.0))
-                            off_bps = min(max_off, base + coeff * float(spr_bps or 0.0))
-                        off = (off_bps / 10_000.0) * (mid or px_last)
-                        price = ((mid or px_last) - off) if side == "buy" else ((mid or px_last) + off)
-                    orders.append({"symbol": s, "side": side, "qty": size, "price": price, "reduceOnly": False})
-
-            t_ord_start = perf_counter()
-            for od in orders:
-                s = od["symbol"]; side = od["side"]; q = float(od["qty"]); px = od["price"]; ro = bool(od.get("reduceOnly", False))
-                tkr = (tickers.get(s, {}) or {})
-                notional = q * float(tkr.get("last") or tkr.get("close") or 0.0)
                 try:
                     if dry:
-                        tag = "REDUCE" if ro else "OPEN"
-                        log.info(f"[DRY] {tag} {s}: {side} {q} @ {px or 'mkt'} (~{notional:.2f} USDT)")
+                        log.info(f"[DRY] {s}: {'buy' if delta>0 else 'sell'} {abs(delta)} @ {px or 'mkt'} (tgt_w={tgt_w:+.4f})")
                     else:
-                        ex.create_order_safe(s, side, q, px, post_only=(getattr(cfg.execution, "post_only", False) and not ro), reduce_only=ro)
-                        tag = "REDUCE" if ro else "OPEN"
-                        log.info(f"[LIVE] {tag} {s}: {side} {q} @ {px or 'mkt'} (~{notional:.2f} USDT)")
-                        state.setdefault("last_trade_ts", {})[s] = time.time()
+                        post_only = bool(getattr(cfg.execution, "post_only", True))
+                        ex.create_order_safe(s, "buy" if delta > 0 else "sell", abs(delta), px, post_only=post_only, reduce_only=False)
+                        created += 1
                 except Exception as e:
-                    log.error(f"Order error {s} {side} {q}: {e}")
-            t_ord = perf_counter() - t_ord_start
-            log.info(f"Orders processed (n={len(orders)}) in {t_ord:.2f}s")
+                    log.warning(f"order {s} failed: {e}")
 
-            try:
-                state["last_targets"] = {k: float(v) for k, v in targets.items()}
-                write_json(state_path, state)
-            except Exception as e:
-                log.warning(f"State persist failed: {e}")
-
-            cycle_time = (utcnow() - cycle_started_at).total_seconds()
-            log.info(f"Cycle complete in {cycle_time:.2f}s")
-            log.info(f"=== Cycle end {utcnow().isoformat()} ===")
+            if created:
+                log.info(f"Placed {created} orders this cycle.")
 
             time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
 
@@ -1509,5 +1492,3 @@ def run_live(cfg: AppConfig, dry: bool = False):
             ex.close()
         except Exception:
             pass
-
-

@@ -11,22 +11,47 @@ exchange:
   min_price: 0.01
   timeframe: 1h
   candles_limit: 1500
+sizing:
+  market_neutral_xsmom: true
+  market_neutral_tsmom: false
+  gross_leverage: 2.0
+  max_weight_per_asset: 0.14
+  portfolio_target_daily_vol_bps: 60
+  portfolio_vol_lookback: 20
+  portfolio_vol_min_mult: 0.6
+  portfolio_vol_max_mult: 1.3
+  kelly_sr_lookback: 60
 strategy:
+  mode: auto
   signal_power: 1.35
   lookbacks:
   - 1
   - 6
   - 24
+  - 96
   lookback_weights:
   - 1.0
   - 1.0
   - 1.0
+  - 0.5
   vol_lookback: 72
   k_min: 2
   k_max: 6
   market_neutral: true
   gross_leverage: 2.0
   max_weight_per_asset: 0.14
+  entry_zscore_min: 0.8
+  dispersion_gate:
+    enabled: true
+    lookback: 24
+    metric: std
+    threshold_bps: 35.0
+    min_breadth: 6
+  regime_switch:
+    corr_lookback: 96
+    corr_high: 0.6
+    majors_ema: 200
+    slope_min_bps_per_day: 2.0
   adx_filter:
     enabled: true
     len: 14
@@ -47,7 +72,7 @@ strategy:
       pf_downweight_threshold: 0.9
       downweight_factor: 0.6
       block_below_win_rate_pct: 40.0
-      pf_block_threshold: 0.90
+      pf_block_threshold: 0.9
       pnl_block_threshold_usdt_per_trade: -0.1
       ban_minutes: 720
       grace_trades_after_unban: 3
@@ -71,7 +96,11 @@ strategy:
   funding_tilt:
     enabled: true
     weight: 0.15
-  entry_zscore_min: 0.8
+  funding_trim:
+    enabled: true
+    threshold_bps: 3.0
+    slope_per_bps: 0.01
+    max_reduction: 0.4
   diversify:
     enabled: true
     corr_lookback: 48
@@ -97,12 +126,36 @@ strategy:
     min_trades_per_hour: 8
     min_hours_allowed: 12
     threshold_bps: 0.0
-    fixed_hours: null
-  funding_trim:
+    fixed_hours: []
+    boost_good_hours: true
+    fixed_good_hours:
+    - 7
+    - 14
+    - 3
+    - 2
+    boost_factor: 1.25
+  require_mtf_alignment: true
+  confirmation_timeframe: 4h
+  confirmation_lookback: 6
+  majors_regime:
     enabled: true
-    threshold_bps: 3.0
-    slope_per_bps: 0.01
-    max_reduction: 0.4
+    majors:
+    - BTC/USDT:USDT
+    - ETH/USDT:USDT
+    ema_len: 200
+    slope_bps_per_day: 1.0
+    action: downweight
+    downweight_factor: 0.7
+  kelly:
+    enabled: true
+    base_frac: 0.5
+    half_kelly: true
+    min_scale: 0.5
+    max_scale: 1.6
+    max_tilt: 0.15
+    ema_alpha: 0.15
+    wr_floor_pct: 35
+    pf_floor: 0.9
 liquidity:
   adv_cap_pct: 0.002
   notional_cap_usdt: 70
@@ -132,6 +185,11 @@ execution:
     base_bps: 3.0
     per_spread_coeff: 0.5
     max_offset_bps: 20.0
+  microstructure:
+    enabled: true
+    min_obi: 0.15
+    max_spread_bps: 10.0
+  bump_to_exchange_min: true
   stale_orders:
     enabled: true
     cleanup_interval_sec: 45
@@ -139,12 +197,6 @@ execution:
     reprice_if_far_bps: 15.0
     cancel_if_not_targeted: true
     keep_reduce_only: true
-  max_spread_bps: 12.0
-  base_offset_bps: 3.0
-  microstructure:
-    enabled: false
-    min_obi: 0.15
-    max_spread_bps: 8.0
 risk:
   atr_len: 28
   atr_mult_sl: 2.2
@@ -250,6 +302,10 @@ risk_stepdown:
   - 0.6
   - 0.4
   recover_hysteresis_pct: 1.0
+liquidity_caps:
+  enabled: false
+  max_weight_low_liq: 0.02
+  symbols_low_liq: []
 paths:
   state_path: state/state.json
   logs_dir: logs
@@ -258,41 +314,9 @@ logging:
   level: INFO
   file_max_mb: 20
   file_backups: 5
-
-# --- New feature toggles (added) ---
-strategy:
-  require_mtf_alignment: true
-  confirmation_timeframe: 4h
-  confirmation_lookback: 6
-  majors_regime:
-    enabled: true
-    majors: ["BTC/USDT:USDT","ETH/USDT:USDT"]
-    ema_len: 200
-    slope_bps_per_day: 1.0
-    action: downweight        # or downweight
-    downweight_factor: 0.7
-  kelly:
-    enabled: true
-    base_frac: 0.5
-    half_kelly: true
-    min_scale: 0.5
-    max_scale: 1.6
-  time_of_day_whitelist:
-    boost_good_hours: true
-    fixed_good_hours: [7,14,3,2]
-    boost_factor: 1.25
-execution:
-  microstructure:
-    enabled: true
-    min_obi: 0.15
-    max_spread_bps: 10.0
-  bump_to_exchange_min: true
-  spread_guard:
-    enabled: true
-    max_spread_bps: 15
-    skip_if_wider: true
-  dynamic_offset:
-    enabled: true
-    base_bps: 3.0
-    per_spread_coeff: 0.5
-    max_offset_bps: 20.0
+costs:
+  maker_fee_bps: 1.0
+  taker_fee_bps: 5.0
+  slippage_bps: 2.0
+  borrow_bps: 0.0
+  maker_fill_ratio: 0.7
