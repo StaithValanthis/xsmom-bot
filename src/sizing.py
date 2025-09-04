@@ -1,323 +1,529 @@
-# sizing.py — v1.5 (2025-09-04)
-# Enhancements:
-# - Optional residual momentum (beta-neutral vs BTC/ETH) and sector-neutralization
-# - Piecewise funding-tilt overlay with neutral band
-# - Correlation-based diversify (greedy) kept, cleaned
-# - Optional hysteresis on weight deltas (exported helper)
-# - Soft vol targeting preserved
-from __future__ import annotations
+# =========================
+# XSMOM-BOT — sizing.py (SAFE SIZING HARDENED)
+# Implements:
+# - Dynamic K selection
+# - Portfolio volatility target scaling (true scaling; no post-renorm inflation)
+# - No-trade bands with hysteresis
+# - Tighter notional / weight caps (both % of equity and absolute USDT)
+# - ADV% cap (optional) using exchange tickers
+# - Hard gross cap & numeric sanitization
+# - Back-compat: apply_kelly_scaling(), apply_liquidity_caps(..., equity_usdt=..., notional_cap_usdt=..., adv_cap_pct=..., tickers=...)
+# - FIX: dataclass mutable defaults via default_factory
+# =========================
 
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 import math
-from typing import Iterable, Optional, Callable, Dict, Tuple, List
 import numpy as np
 import pandas as pd
 
-# ---------------------------- helpers ----------------------------
 
-def _pct_change(df: pd.DataFrame) -> pd.DataFrame:
-    """Safe percentage change (forward-filled, no chained warnings)."""
-    df = df.ffill()
-    return df.pct_change(fill_method=None)
+# ----------------------------
+# Utilities
+# ----------------------------
 
-def _zscore_last(x: pd.Series) -> float:
-    """Z-score of the last value vs cross-section of last row of series vector."""
-    mu = float(x.mean())
-    sd = float(x.std(ddof=0))
-    if sd <= 1e-12:
-        return 0.0
-    return (float(x.iloc[-1]) - mu) / sd
+def _finite(v):
+    return np.isfinite(v)
 
-def _rolling_vol(rets: pd.DataFrame, n: int) -> pd.Series:
-    v = rets.rolling(n).std(ddof=0).iloc[-1]
-    v = v.replace([np.inf, -np.inf], np.nan).fillna(v.median() if np.isfinite(v.median()) else 0.0)
-    v = v.clip(lower=1e-8)
-    return v
+def _sanitize_vec(x: np.ndarray) -> np.ndarray:
+    x = np.where(np.isfinite(x), x, 0.0)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    return x
 
-def _portfolio_vol(w: pd.Series, rets: pd.DataFrame) -> float:
-    # approximate daily vol from bar returns matrix rets (columns symbols)
-    wv = w.reindex(rets.columns).fillna(0.0).values
-    cov = np.cov(rets.fillna(0.0).values.T)
-    pv = float(np.sqrt(np.maximum(0.0, wv @ cov @ wv)))
-    return pv
+def _zscore_power(arr: np.ndarray, power: float) -> np.ndarray:
+    """
+    Cross-sectional z-score each row then apply signed |z|^power.
+    arr shape: (T, N)
+    """
+    m = np.nanmean(arr, axis=1, keepdims=True)
+    s = np.nanstd(arr, axis=1, keepdims=True) + 1e-12
+    z = (arr - m) / s
+    return np.sign(z) * (np.abs(z) ** power)
 
-def _regress_residuals(y: pd.Series, X: pd.DataFrame) -> pd.Series:
-    """OLS residuals of y on X (with intercept)."""
-    yv = y.values.astype(float)
-    X_ = X.copy()
-    X_["intercept"] = 1.0
-    Xm = X_.values.astype(float)
-    # Solve beta = argmin ||X beta - y||
-    beta, *_ = np.linalg.lstsq(Xm, yv, rcond=None)
-    yhat = Xm @ beta
-    resid = yv - yhat
-    return pd.Series(resid, index=y.index)
 
-def _residualize_returns(
-    rets: pd.DataFrame,
-    benchmark_rets: Dict[str, pd.Series] | None,
-    sector_map: Dict[str, str] | None,
-    lookback: int,
-    sector_neutral: bool,
-) -> pd.DataFrame:
-    """Return residualized returns (vs BTC/ETH + optional sector index)."""
-    if benchmark_rets:
-        # align benchmarks
-        X = pd.DataFrame({k: v for k, v in benchmark_rets.items()}).reindex(rets.index).fillna(0.0)
-    else:
-        X = pd.DataFrame(index=rets.index)
-    # sector indices
-    if sector_neutral and sector_map:
-        df = rets.copy()
-        sec_df = {}
-        for sec, cols in _group_by_value(sector_map).items():
-            cols = [c for c in cols if c in df.columns]
-            if len(cols) >= 2:
-                sec_df[f"sec_{sec}"] = df[cols].mean(axis=1)
-        if sec_df:
-            X = pd.concat([X, pd.DataFrame(sec_df)], axis=1)
-    if X.shape[1] == 0:
-        return rets
+def _cs_std(row: np.ndarray) -> float:
+    return float(np.nanstd(row))
 
-    # use last `lookback` rows for regression
-    Xlb = X.tail(lookback)
-    out = {}
-    for s in rets.columns:
-        y = rets[s].tail(lookback)
-        if y.notna().sum() < max(20, lookback // 3):
-            out[s] = rets[s]  # not enough data
+
+def _select_topk(row: np.ndarray, k: int) -> np.ndarray:
+    """
+    Long top k, short bottom k, zero others. Returns weight vector (N,).
+    """
+    N = row.shape[0]
+    if k <= 0 or k * 2 > N:
+        return np.zeros(N, dtype=float)
+
+    # argpartition for efficiency
+    longs = np.argpartition(row, -k)[-k:]
+    shorts = np.argpartition(row, k)[:k]
+    w = np.zeros(N, dtype=float)
+    w[longs] = 1.0 / k
+    w[shorts] = -1.0 / k
+    return w
+
+
+def _normalize_gross(w: np.ndarray, gross: float) -> np.ndarray:
+    s = float(np.sum(np.abs(w))) + 1e-12
+    if s == 0.0:
+        return w
+    return w * (gross / s)
+
+
+def _hard_cap_gross(w: np.ndarray, gross: float) -> np.ndarray:
+    """Uniform down-scale so sum|w| <= gross. Never scales UP."""
+    s = float(np.sum(np.abs(w)))
+    if s <= gross or s <= 1e-12:
+        return w
+    return w * (gross / s)
+
+
+def _apply_no_trade_bands(z: np.ndarray,
+                          prev_w: Optional[np.ndarray],
+                          z_entry: float,
+                          z_exit: float) -> np.ndarray:
+    """
+    Hysteresis: if flat and |z| < z_entry -> stay flat.
+    If already positioned, keep sign until |z| < z_exit.
+    Works per-asset on the latest row only.
+    """
+    if prev_w is None:
+        prev_w = np.zeros_like(z)
+
+    out = np.zeros_like(z)
+    for i in range(z.shape[0]):
+        zi = z[i]
+        wi = prev_w[i]
+        mag = abs(zi)
+
+        if wi == 0.0:
+            out[i] = np.sign(zi) if mag >= z_entry else 0.0
         else:
-            r = _regress_residuals(y, Xlb.reindex(y.index))
-            # stitch residual tail into full index (pad with original earlier data)
-            full = rets[s].copy()
-            full.loc[r.index] = r
-            out[s] = full
-    return pd.DataFrame(out).reindex_like(rets).fillna(0.0)
+            out[i] = np.sign(zi) if mag >= z_exit else 0.0
+    return out
 
-def _group_by_value(m: Dict[str, str]) -> Dict[str, List[str]]:
-    d: Dict[str, List[str]] = {}
-    for k, v in m.items():
-        d.setdefault(v, []).append(k)
-    return d
 
-def _greedy_diversify(scores: pd.Series, corr: pd.DataFrame, max_pair_corr: float, k: int) -> List[str]:
+def _dynamic_k(z_row: np.ndarray, k_min: int, k_max: int, kappa: float, fallback_k: int) -> int:
+    if not np.isfinite(z_row).all():
+        return fallback_k
+    disp = _cs_std(z_row)
+    k = int(round(kappa * disp))
+    return max(k_min, min(k_max, k))
+
+
+def _realized_port_vol_ann(w_hist: np.ndarray, ret_hist: np.ndarray, bars_per_year: float = 8760.0) -> float:
     """
-    Greedy pick by |score| while skipping names correlated > threshold
-    to any already-selected name.
+    Estimate realized portfolio annualized vol using mid-weight approximation.
+    Default assumes hourly bars (8760/yr). Pass bars_per_year=365 if using daily.
     """
-    chosen: List[str] = []
-    for s in scores.abs().sort_values(ascending=False).index:
-        if len(chosen) >= k:
-            break
-        if all(abs(float(corr.loc[s, c])) <= max_pair_corr for c in chosen if (s in corr.index and c in corr.columns)):
-            chosen.append(s)
-    return chosen
+    if w_hist.shape[0] != ret_hist.shape[0]:
+        T = min(w_hist.shape[0], ret_hist.shape[0])
+        w_hist = w_hist[-T:, :]
+        ret_hist = ret_hist[-T:, :]
 
-# ---------------------------- API ----------------------------
+    w_prev = np.roll(w_hist, 1, axis=0)
+    w_prev[0, :] = 0.0
+    pnl = np.sum(0.5 * (w_hist + w_prev) * ret_hist, axis=1)
+    vol = float(np.std(pnl, ddof=0))
+    ann_vol = vol * math.sqrt(bars_per_year)
+    return ann_vol
 
-def build_targets(
-    closes: pd.DataFrame,
-    lookbacks: Iterable[int],
-    lookback_weights: Iterable[float],
-    vol_lookback: int,
-    k_min: int,
-    k_max: int,
-    market_neutral: bool,
-    gross_leverage: float,
-    max_weight_per_asset: float,
-    dynamic_k_fn: Optional[Callable[[pd.Series, int, int], Tuple[int,int]]] = None,
-    # funding / carry
-    funding_tilt: Optional[Dict[str, float]] = None,
-    funding_weight: float = 0.0,
-    entry_zscore_min: float = 0.0,
-    # diversify
-    diversify_enabled: bool = False,
-    corr_lookback: int = 48,
-    max_pair_corr: float = 0.85,
-    # residual momentum
-    use_residuals: bool = False,
-    benchmark_rets: Optional[Dict[str, pd.Series]] = None,  # e.g., {"BTC": rets, "ETH": rets}
-    sector_neutral: bool = False,
-    sector_map: Optional[Dict[str, str]] = None,
-    weight_power: float = 1.0,
-    # vol targeting
-    vol_target_enabled: bool = False,
-    target_daily_vol_bps: float = 0.0,
-    vol_target_min_scale: float = 0.6,
-    vol_target_max_scale: float = 1.6,
-    # funding-tilt band
-    funding_neutral_band_bps: float = 5.0,
-) -> pd.Series:
+
+def _clip(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _round_weights(w: np.ndarray, digits: int = 8) -> np.ndarray:
+    return np.round(w, digits)
+
+
+def _try_get(d: dict, *keys, default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+
+def _infer_adv_quote_usdt(tkr: dict) -> Optional[float]:
     """
-    Build cross-sectional momentum targets (weights by symbol).
-    Returns pd.Series of weights summing to +/- gross leverage.
+    Best-effort extraction of 24h quote turnover (USDT) from CCXT-style ticker dicts.
+    Works with Bybit/Binance-style fields.
     """
-    closes = closes.sort_index()
-    closes = closes.ffill()
-
-    # 1) Raw returns & residualization (optional)
-    rets = _pct_change(closes).fillna(0.0)
-    if use_residuals:
-        lb = max(int(vol_lookback), max(lookbacks) * 2 if lookbacks else 60)
-        rets = _residualize_returns(
-            rets,
-            benchmark_rets=benchmark_rets or {},
-            sector_map=sector_map or {},
-            lookback=lb,
-            sector_neutral=sector_neutral,
-        )
-
-    # 2) Momentum score: weighted sum of multi-horizon simple returns
-    lw = np.array(list(lookback_weights), dtype=float)
-    lw = lw / lw.sum() if lw.sum() != 0 else lw
-    score = pd.Series(0.0, index=closes.columns)
-    for L, w in zip(lookbacks, lw):
-        if L <= 0: 
-            continue
-        rL = (closes / closes.shift(L) - 1.0).iloc[-1]
-        score = score.add(float(w) * rL, fill_value=0.0)
-    score = score.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    # 3) Cross-sectional z-scores (last bar)
-    last_vals = score.copy()
-    mu = float(last_vals.mean())
-    sd = float(last_vals.std(ddof=0)) or 1.0
-    z = (last_vals - mu) / sd
-
-    # 4) Entry threshold
-    z_mask = z.abs() >= float(entry_zscore_min)
-    z = z.where(z_mask, other=0.0)
-
-    # 5) Dynamic K (optional) or clamp
-    k_lo, k_hi = int(k_min), int(k_max)
-    if dynamic_k_fn is not None:
+    if not isinstance(tkr, dict):
+        return None
+    # Direct common fields
+    for key in ("quoteVolume", "baseVolumeQuote", "24hQuoteVolume", "quote_volume"):
+        v = tkr.get(key)
         try:
-            k_lo, k_hi = dynamic_k_fn(z, int(k_min), int(k_max))
+            if v is not None:
+                return float(v)
         except Exception:
             pass
-    k = max(k_lo, min(k_hi, (z.abs() > 0).sum()))
+    # Nested vendor info
+    info = tkr.get("info") or {}
+    for key in ("turnover24h", "quote_volume", "quote_turnover_24h", "value"):
+        v = info.get(key)
+        try:
+            if v is not None:
+                return float(v)
+        except Exception:
+            pass
+    return None
 
-    # 6) Diversify by correlation (optional)
-    if diversify_enabled and k > 0:
-        corr = rets.tail(int(corr_lookback)).corr().fillna(0.0)
-        chosen = _greedy_diversify(z, corr, float(max_pair_corr), int(k))
-        z = z.reindex(chosen).fillna(0.0)
-        k = len(z)
 
-    # 7) Size within long/short buckets: inverse-vol risk parity * |z|^p
-    vol = _rolling_vol(rets, int(vol_lookback))
-    inv_vol = (1.0 / vol).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    mag = (z.abs() ** float(weight_power)) * inv_vol.reindex(z.index).fillna(0.0)
-    w = mag.where(z >= 0, -mag)
+# ----------------------------
+# Config dataclasses
+# ----------------------------
 
-    # normalize within buckets
-    if market_neutral:
-        long_sum = float(mag[z >= 0].sum())
-        short_sum = float(mag[z < 0].sum())
-        if long_sum > 0:
-            w.loc[z >= 0] *= (0.5 * float(gross_leverage)) / long_sum
-        if short_sum > 0:
-            w.loc[z < 0] *= (0.5 * float(gross_leverage)) / short_sum
+@dataclass
+class SelectionCfg:
+    k_min: int = 2
+    k_max: int = 8
+    kappa: float = 5.0
+    fallback_k: int = 6
+    enabled: bool = True
+
+
+@dataclass
+class BandsCfg:
+    enabled: bool = True
+    z_entry: float = 0.65
+    z_exit: float = 0.45
+
+
+@dataclass
+class VolTargetCfg:
+    enabled: bool = True
+    target_ann_vol: float = 0.35
+    lookback_hours: int = 72
+    min_scale: float = 0.5
+    max_scale: float = 1.6
+    bars_per_year: float = 8760.0  # set 365.0 if using daily returns
+
+
+@dataclass
+class StrategyCfg:
+    lookbacks: Tuple[int, int, int] = (1, 6, 24)
+    lookback_weights: Tuple[float, float, float] = (1.0, 1.5, 2.0)
+    z_power: float = 1.35
+    market_neutral: bool = True
+    gross_leverage: float = 1.20
+    max_weight_per_asset: float = 0.14
+    per_symbol_notional_cap_pct: float = 0.20  # percent of equity per symbol (legacy)
+
+    # FIX: use default_factory for nested configs (mutable default issue)
+    selection: SelectionCfg = field(default_factory=SelectionCfg)
+    no_trade_bands: BandsCfg = field(default_factory=BandsCfg)
+    portfolio_vol_target: VolTargetCfg = field(default_factory=VolTargetCfg)
+
+    # NOTE: We don't add new required fields here to keep back-compat.
+    # We will detect optional attributes dynamically (e.g., per_symbol_notional_cap_usdt).
+
+
+# ----------------------------
+# Core computations
+# ----------------------------
+
+def compute_signal_scores(prices: pd.DataFrame,
+                          lookbacks: List[int],
+                          weights: List[float],
+                          z_power: float) -> pd.DataFrame:
+    """
+    Build momentum scores as weighted sum of multi-lookback returns, then z^power.
+    """
+    assert len(lookbacks) == len(weights), "lookbacks/weights length mismatch"
+    prices = prices.sort_index()
+    T, N = prices.shape
+
+    scores = np.zeros((T, N), dtype=float)
+    vals = prices.values
+
+    for lb, w in zip(lookbacks, weights):
+        rr = np.zeros((T, N), dtype=float)
+        if lb < T:
+            rr[lb:, :] = vals[lb:, :] / vals[:-lb, :] - 1.0
+        scores += w * rr
+
+    scores = _zscore_power(scores, z_power)
+    return pd.DataFrame(scores, index=prices.index, columns=prices.columns)
+
+
+def build_targets(
+    prices: pd.DataFrame,
+    equity: float,
+    strategy_cfg: StrategyCfg,
+    prev_weights: Optional[pd.Series] = None,
+    returns: Optional[pd.DataFrame] = None,
+    weights_history: Optional[pd.DataFrame] = None
+) -> pd.Series:
+    """
+    Main entry: compute target weights for the latest bar using:
+    - multi-lookback momentum with z^power
+    - market-neutral centering (optional)
+    - no-trade bands (hysteresis)
+    - dynamic K selection (dispersion-driven)
+    - gross leverage normalization (never scales UP past target)
+    - per-asset cap and per-symbol notional caps (both % of equity and absolute USDT)
+    - portfolio vol-target scaling (true scaling; keep caps AFTER)
+    - hard gross cap & rounding
+    """
+
+    prices = prices.sort_index()
+    symbols = list(prices.columns)
+    latest_ts = prices.index[-1]
+
+    # Compute scores (z^power)
+    scores = compute_signal_scores(
+        prices,
+        list(strategy_cfg.lookbacks),
+        list(strategy_cfg.lookback_weights),
+        strategy_cfg.z_power
+    )
+
+    z = scores.iloc[-1].values.copy()
+    z = _sanitize_vec(z)
+
+    # Market neutral: de-mean cross-section before ranking
+    if strategy_cfg.market_neutral:
+        z = z - float(np.nanmean(z))
+
+    # Apply no-trade bands (hysteresis) per symbol
+    prev_w_vec = None
+    if prev_weights is not None:
+        prev_w_vec = prev_weights.reindex(symbols).fillna(0.0).values
+        prev_w_vec = _sanitize_vec(prev_w_vec)
+
+    if strategy_cfg.no_trade_bands.enabled:
+        z_dir = _apply_no_trade_bands(
+            z,
+            prev_w_vec,
+            strategy_cfg.no_trade_bands.z_entry,
+            strategy_cfg.no_trade_bands.z_exit
+        )
     else:
-        tot = float(mag.abs().sum())
-        if tot > 0:
-            w *= float(gross_leverage) / tot
+        z_dir = np.sign(z)
 
-    # 8) Funding tilt (piecewise with neutral band)
-    if funding_tilt and float(funding_weight) != 0.0:
-        band = float(funding_neutral_band_bps)
-        adj = {}
-        for s, wt in w.items():
-            f_bps = float(funding_tilt.get(s, 0.0) or 0.0)
-            # positive f_bps means LONG pays; negative means LONG receives
-            if abs(f_bps) <= band:
-                factor = 1.0
-            else:
-                pays_long = f_bps > 0
-                # if we are long and paying -> downweight; if long and receiving -> upweight
-                # for shorts, invert
-                if wt >= 0:
-                    factor = (1.0 - float(funding_weight)) if pays_long else (1.0 + float(funding_weight))
-                else:
-                    # short pays when f_bps < 0
-                    pays_short = f_bps < 0
-                    factor = (1.0 - float(funding_weight)) if pays_short else (1.0 + float(funding_weight))
-            adj[s] = float(wt) * float(factor)
-        w = pd.Series(adj).reindex(w.index).fillna(0.0)
+    # Dynamic K selection
+    if strategy_cfg.selection.enabled:
+        k = _dynamic_k(
+            z,
+            strategy_cfg.selection.k_min,
+            strategy_cfg.selection.k_max,
+            strategy_cfg.selection.kappa,
+            strategy_cfg.selection.fallback_k
+        )
+    else:
+        k = strategy_cfg.selection.fallback_k
 
-    # 9) Per-asset caps
-    max_w = float(max_weight_per_asset or 0.0)
+    # Build raw long/short mask using the scores but respect banded direction
+    masked_scores = z.copy()
+    masked_scores[z_dir == 0.0] = 0.0
+
+    raw_w = _select_topk(masked_scores, k)
+
+    # Normalize toward target gross, but never increase above target if raw gross is lower.
+    gross_tgt = float(strategy_cfg.gross_leverage)
+    raw_sum_abs = float(np.sum(np.abs(raw_w)))
+    if raw_sum_abs > 1e-12:
+        scale = min(1.0, gross_tgt / raw_sum_abs)  # never scale UP above target
+        w = raw_w * scale
+    else:
+        w = raw_w.copy()
+
+    # Per-asset cap FIRST (do not renormalize upward after clipping)
+    max_w = float(strategy_cfg.max_weight_per_asset)
     if max_w > 0:
-        w = w.clip(lower=-max_w, upper=max_w)
+        w = np.clip(w, -max_w, max_w)
 
-    # 10) Soft vol targeting (scale)
-    if vol_target_enabled and target_daily_vol_bps > 0:
-        T = int(max(vol_lookback, max(lookbacks) if lookbacks else 60))
-        pv = _portfolio_vol(w.fillna(0.0), _pct_change(closes).tail(T).fillna(0.0))
-        if pv > 1e-9:
-            target = float(target_daily_vol_bps) / 10000.0
-            scale = float(target / pv)
-            scale = float(np.clip(scale, float(vol_target_min_scale), float(vol_target_max_scale)))
-            w *= scale
+    # Per-symbol notional caps:
+    # (1) percentage of equity (legacy field)
+    cap_pct = float(getattr(strategy_cfg, "per_symbol_notional_cap_pct", 0.0) or 0.0)
+    # (2) absolute USDT cap (optional, detected dynamically)
+    cap_abs = float(getattr(strategy_cfg, "per_symbol_notional_cap_usdt", 0.0) or 0.0)
 
-    return w.reindex(closes.columns).fillna(0.0)
+    if equity and equity > 0:
+        for i in range(len(symbols)):
+            wi = float(w[i])
+            if wi == 0.0:
+                continue
+            notional = abs(wi) * float(equity)
 
-# ---------------------------- Liquidity caps ----------------------------
+            # Percentage-of-equity cap
+            if cap_pct > 0:
+                limit_pct = cap_pct * float(equity)
+                if notional > limit_pct:
+                    w[i] = np.sign(wi) * (limit_pct / float(equity))
+                    notional = abs(w[i]) * float(equity)
+
+            # Absolute-USDT cap
+            if cap_abs > 0 and notional > cap_abs:
+                w[i] = np.sign(wi) * (cap_abs / float(equity))
+
+    # Portfolio volatility target scaling (based on realized vol)
+    if strategy_cfg.portfolio_vol_target.enabled and returns is not None and weights_history is not None:
+        L = int(strategy_cfg.portfolio_vol_target.lookback_hours)
+        w_hist = weights_history.reindex(prices.index).fillna(0.0).values[-L:]
+        r_hist = returns.reindex(prices.index).fillna(0.0).values[-L:]
+        if w_hist.size and r_hist.size:
+            ann_vol = _realized_port_vol_ann(
+                w_hist, r_hist, bars_per_year=float(strategy_cfg.portfolio_vol_target.bars_per_year)
+            )
+            tgt = float(strategy_cfg.portfolio_vol_target.target_ann_vol)
+            if ann_vol > 1e-12 and tgt > 0:
+                scaler = _clip(tgt / ann_vol,
+                               float(strategy_cfg.portfolio_vol_target.min_scale),
+                               float(strategy_cfg.portfolio_vol_target.max_scale))
+                # True scaling (no renorm-to-gross here)
+                w = w * scaler
+                # Re-apply per-asset and per-symbol caps AFTER scaling
+                if max_w > 0:
+                    w = np.clip(w, -max_w, max_w)
+                if equity and equity > 0:
+                    for i in range(len(symbols)):
+                        wi = float(w[i])
+                        if wi == 0.0:
+                            continue
+                        notional = abs(wi) * float(equity)
+                        if cap_pct > 0:
+                            limit_pct = cap_pct * float(equity)
+                            if notional > limit_pct:
+                                w[i] = np.sign(wi) * (limit_pct / float(equity))
+                                notional = abs(w[i]) * float(equity)
+                        if cap_abs > 0 and notional > cap_abs:
+                            w[i] = np.sign(wi) * (cap_abs / float(equity))
+
+    # FINAL SAFETY: hard gross cap (only downscale if needed), sanitize & round
+    w = _sanitize_vec(w)
+    w = _hard_cap_gross(w, gross_tgt)
+    if max_w > 0:
+        w = np.clip(w, -max_w, max_w)
+    w = _round_weights(w, digits=8)
+
+    return pd.Series(w, index=symbols, name=latest_ts)
+
+
+# ----------------------------
+# Liquidity/Cap helpers (Back-compat extended)
+# ----------------------------
 
 def apply_liquidity_caps(
     targets: pd.Series,
-    *,
-    equity_usdt: float,
-    tickers: Dict[str, dict],
-    adv_cap_pct: float,
-    notional_cap_usdt: float,
+    max_weight_per_asset: Optional[float] = None,
+    # Extended / back-compat:
+    equity_usdt: Optional[float] = None,
+    equity: Optional[float] = None,
+    per_symbol_notional_cap_pct: Optional[float] = None,
+    cap_pct: Optional[float] = None,
+    notional_cap_pct: Optional[float] = None,
+    notional_cap_usdt: Optional[float] = None,
+    adv_cap_pct: Optional[float] = None,
+    tickers: Optional[Dict[str, dict]] = None,
+    price_map: Optional[Dict[str, float]] = None,   # accepted but unused
+    last_prices: Optional[Dict[str, float]] = None, # accepted but unused
+    **kwargs
 ) -> pd.Series:
     """
-    Cap per-symbol notional by (ADV * pct) and absolute USDT cap.
-    Then renormalize to preserve original gross exposure.
+    Liquidity/weight caps applied to an existing weight vector.
+    - Clips per-asset weights to max_weight_per_asset if provided.
+    - Enforces per-symbol notional caps by:
+        (a) % of equity (per_symbol_notional_cap_pct / cap_pct / notional_cap_pct)
+        (b) absolute USDT (notional_cap_usdt)
+        (c) ADV% cap if tickers & adv_cap_pct provided (uses 24h quote turnover)
+    Does NOT renormalize gross; call sites can choose whether to renorm later.
     """
-    w = targets.copy().fillna(0.0)
-    eq = float(equity_usdt)
-    new_w = w.copy()
+    out = targets.copy()
+    out = out.astype(float)
 
-    for s, wt in w.items():
-        t = tickers.get(s, {}) or {}
-        last = t.get("last") or t.get("close") or 0.0
-        qv = t.get("quoteVolume", 0.0) or 0.0  # 24h quote volume
-        adv_usdt = float(qv) / 24.0  # rough hourly ADV in USDT
-        cap_adv = float(adv_usdt) * float(adv_cap_pct)
-        cap_abs = float(notional_cap_usdt)
+    # 1) Weight cap
+    if max_weight_per_asset is not None:
+        out = out.clip(lower=-float(max_weight_per_asset), upper=float(max_weight_per_asset))
 
-        cap = min(cap_adv, cap_abs) if cap_abs > 0 else cap_adv
-        if cap < float('inf'):
-            desired = abs(wt) * eq
-            if desired > cap and desired > 0:
-                scale = cap / desired
-                new_w.loc[s] = math.copysign(abs(wt) * scale, wt)
+    # Equity resolution
+    eq = None
+    for v in (equity_usdt, equity):
+        if v is not None:
+            try:
+                eq = float(v)
+                break
+            except Exception:
+                pass
 
-    # Renormalize to preserve gross leverage
-    gross_old = float(w.abs().sum())
-    gross_new = float(new_w.abs().sum())
-    if gross_new > 0 and gross_old > 0:
-        new_w *= gross_old / gross_new
-    return new_w.fillna(0.0)
+    # 2) % of equity notional cap
+    pct = None
+    for v in (per_symbol_notional_cap_pct, cap_pct, notional_cap_pct):
+        if v is not None:
+            try:
+                pct = float(v)
+                break
+            except Exception:
+                pass
 
-# ---------------------------- Hysteresis helper ----------------------------
+    if eq is not None and pct is not None and pct > 0:
+        limit = pct * float(eq)
+        if limit > 0:
+            for sym, w in out.items():
+                notional = abs(float(w)) * float(eq)
+                if notional > limit and notional > 0:
+                    scale = limit / notional
+                    out.loc[sym] = float(w) * scale
 
-def apply_hysteresis(
-    new_w: pd.Series,
-    old_w: Optional[pd.Series],
-    min_change_bps: float = 10.0
-) -> pd.Series:
-    """
-    Suppress tiny weight changes to reduce churn.
-    Keep changes whose absolute delta >= min_change_bps (i.e., 10 bps = 0.001).
-    """
-    if old_w is None or len(old_w) == 0:
-        return new_w
-    thresh = float(min_change_bps) / 10000.0
-    old_w = old_w.reindex(new_w.index).fillna(0.0)
-    delta = (new_w - old_w).fillna(0.0)
-    keep = delta.abs() >= thresh
-    out = old_w.copy()
-    out.loc[keep] = new_w.loc[keep]
+    # 3) Absolute USDT notional cap
+    if eq is not None and notional_cap_usdt is not None:
+        try:
+            abs_lim = float(notional_cap_usdt)
+        except Exception:
+            abs_lim = 0.0
+        if abs_lim > 0:
+            for sym, w in out.items():
+                notional = abs(float(w)) * float(eq)
+                if notional > abs_lim and notional > 0:
+                    scale = abs_lim / notional
+                    out.loc[sym] = float(w) * scale
+
+    # 4) ADV% cap (best-effort from tickers)
+    if eq is not None and adv_cap_pct is not None and tickers:
+        try:
+            adv_pct = float(adv_cap_pct)
+        except Exception:
+            adv_pct = 0.0
+        if adv_pct > 0:
+            for sym, w in out.items():
+                tkr = (tickers or {}).get(sym) or {}
+                adv_usdt = _infer_adv_quote_usdt(tkr)
+                if adv_usdt and adv_usdt > 0:
+                    limit = adv_pct * float(adv_usdt)
+                    notional = abs(float(w)) * float(eq)
+                    if notional > limit and notional > 0:
+                        scale = limit / notional
+                        out.loc[sym] = float(w) * scale
+
+    # Final sanitize/round
+    out = out.astype(float).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    out = out.apply(lambda x: float(np.round(x, 8)))
     return out
+
+
+def apply_kelly_scaling(targets: pd.Series, *args, **kwargs) -> pd.Series:
+    """
+    Back-compat shim so legacy live.py imports don't break.
+    Accepts fraction/kelly_fraction/scale or kelly={fraction|f|scale}.
+    """
+    frac = 1.0
+    for key in ("fraction", "kelly_fraction", "scale"):
+        if key in kwargs:
+            try:
+                frac = float(kwargs[key]); break
+            except Exception:
+                pass
+
+    kelly = kwargs.get("kelly")
+    if isinstance(kelly, dict):
+        for key in ("fraction", "f", "scale"):
+            if key in kelly:
+                try:
+                    frac = float(kelly[key]); break
+                except Exception:
+                    pass
+
+    frac = max(0.0, min(2.0, frac))
+    return targets * frac

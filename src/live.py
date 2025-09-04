@@ -9,10 +9,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import math
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import re
 
 from .config import AppConfig
 from .exchange import ExchangeWrapper
@@ -21,8 +23,48 @@ from .sizing import build_targets, apply_liquidity_caps, apply_kelly_scaling
 from .regime_router import build_targets_auto, decide_mode
 from .risk import kill_switch_should_trigger, resume_time_after_kill
 from .utils import utcnow, read_json, write_json
+from .carry import (
+    parse_carry_cfg,
+    build_funding_carry_weights,
+    build_basis_carry_weights,
+    combine_sleeves,
+)
 
 log = logging.getLogger("live")
+
+# -------------------- config bridge for carry --------------------
+
+def _cfg_to_dict(cfg: AppConfig) -> dict:
+    """Convert pydantic AppConfig to a plain dict for parse_carry_cfg, with fallbacks."""
+    try:
+        return cfg.model_dump()  # pydantic v2
+    except Exception:
+        pass
+    try:
+        import json as _json
+        return _json.loads(cfg.model_dump_json())
+    except Exception:
+        pass
+    def _obj_to_dict(x):
+        if isinstance(x, dict):
+            return {k: _obj_to_dict(v) for k, v in x.items()}
+        if hasattr(x, 'model_dump'):
+            try:
+                return _obj_to_dict(x.model_dump())
+            except Exception:
+                pass
+        if hasattr(x, 'dict'):
+            try:
+                return _obj_to_dict(x.dict())
+            except Exception:
+                pass
+        if hasattr(x, '__dict__'):
+            try:
+                return _obj_to_dict(vars(x))
+            except Exception:
+                pass
+        return x
+    return _obj_to_dict(cfg)
 
 
 # -------------------- microstructure / helpers --------------------
@@ -150,6 +192,105 @@ def _dd_pct(ref: float, noweq: float) -> float:
     if ref is None or ref <= 0 or noweq is None or noweq <= 0:
         return 0.0
     return 100.0 * max(0.0, (ref - noweq) / ref)
+
+# -------- New helpers: pending orders & precision / limits ----------
+
+def _sum_pending_same_side(open_orders: List[dict] | None, side: str) -> float:
+    """Sum remaining qty for non-reduce-only open orders on the same side."""
+    q = 0.0
+    for od in open_orders or []:
+        if od.get("reduceOnly") or od.get("reduce_only"):
+            continue
+        st = (od.get("status") or "").lower()
+        if st in ("closed", "canceled"):
+            continue
+        if (od.get("side") or "").lower() == (side or "").lower():
+            rem = od.get("remaining", od.get("amount", 0.0))
+            try:
+                q += float(rem or 0.0)
+            except Exception:
+                pass
+    return q
+
+def _get_symbol_specs(ex, sym: str, state: dict | None = None) -> dict:
+    """
+    Best-effort limits/precision from wrapper/ccxt + learned cache from prior rejections.
+    Returns: {amount_step, amount_min, min_notional, integer_amount}
+    """
+    # Learned cache from prior rejections
+    cache_min = None
+    try:
+        if isinstance(state, dict):
+            cache_min = float((state.get("min_qty_cache", {}) or {}).get(sym))
+    except Exception:
+        cache_min = None
+
+    # Prefer wrapper helper if available
+    if hasattr(ex, "get_symbol_specs"):
+        try:
+            specs = ex.get_symbol_specs(sym) or {}
+            if cache_min and (not specs.get("amount_min") or specs["amount_min"] < cache_min):
+                specs["amount_min"] = cache_min
+            return specs
+        except Exception:
+            pass
+    # Fallback to ccxt market metadata
+    m = None
+    if hasattr(ex, "exchange"):
+        try:
+            m = ex.exchange.market(sym)
+        except Exception:
+            m = None
+    specs = {"amount_step": 0.0, "amount_min": 0.0, "min_notional": 0.0, "integer_amount": False}
+    if m:
+        limits = m.get("limits", {}) or {}
+        amt = limits.get("amount", {}) or {}
+        cost = limits.get("cost", {}) or {}
+        prec = m.get("precision", {}) or {}
+        info = m.get("info", {}) or {}
+
+        # CCXT normalized (if present)
+        if amt.get("step") is not None:
+            try: specs["amount_step"] = float(amt["step"])
+            except Exception: pass
+        if amt.get("min") is not None:
+            try: specs["amount_min"]  = float(amt["min"])
+            except Exception: pass
+        if cost.get("min") is not None:
+            try: specs["min_notional"] = float(cost["min"])
+            except Exception: pass
+
+        # Bybit native lot filter
+        lsf = info.get("lotSizeFilter") or {}
+        for k in ("qtyStep", "minOrderQty"):
+            v = lsf.get(k)
+            if v is not None:
+                try:
+                    v = float(v)
+                    if k == "qtyStep" and (specs["amount_step"] == 0.0 or v > specs["amount_step"]):
+                        specs["amount_step"] = v
+                    if k == "minOrderQty" and (specs["amount_min"] == 0.0 or v > specs["amount_min"]):
+                        specs["amount_min"] = v
+                except Exception:
+                    pass
+
+        # Some listings are integer contracts (e.g., 1000BTT)
+        specs["integer_amount"] = bool(prec.get("amount") == 0 or m.get("contractSize") == 1)
+
+    # Apply learned cache if larger
+    if cache_min and (specs["amount_min"] == 0.0 or specs["amount_min"] < cache_min):
+        specs["amount_min"] = cache_min
+
+    return specs
+
+def _quantize_amount(qty: float, step: float, integer_amount: bool) -> float:
+    if qty <= 0:
+        return 0.0
+    if integer_amount:
+        return float(int(math.floor(qty)))
+    if step and step > 0:
+        return math.floor(qty / step) * step
+    return qty
 
 
 # -------------------- ADX (Wilder DMI) --------------------
@@ -512,6 +653,7 @@ class FastSLTPThread(threading.Thread):
         if changed:
             pinfo["ladder_done"] = done
             self.state.setdefault("perpos", {})[symbol] = pinfo
+
 
     def _place_exit(self, symbol: str, qty: float, reason: str, exit_px: Optional[float]):
         side_close = "sell" if qty > 0 else "buy"
@@ -1296,6 +1438,76 @@ def run_live(cfg: AppConfig, dry: bool = False):
             # --- Dynamic symbol filter (banlist/downsizing) ---
             targets = _apply_symbol_filter_to_targets(state, cfg, targets)
 
+            # >>> CARRY/BASIS SLEEVE: build after momentum gates, before portfolio scaler
+            try:
+                carry_cfg = parse_carry_cfg(_cfg_to_dict(cfg))
+                if carry_cfg.enabled:
+                    w_mom = targets.copy()
+
+                    # Defaults for micro gates if wrapper lacks helpers
+                    try:
+                        spread_bps_map = ex.get_spread_bps_map(list(closes.columns)) if hasattr(ex, 'get_spread_bps_map') else {s: 5.0 for s in closes.columns}
+                    except Exception:
+                        spread_bps_map = {s: 5.0 for s in closes.columns}
+                    try:
+                        depth_usd_map = ex.get_depth_usd_map(list(closes.columns)) if hasattr(ex, 'get_depth_usd_map') else {s: 5000.0 for s in closes.columns}
+                    except Exception:
+                        depth_usd_map = {s: 5000.0 for s in closes.columns}
+                    try:
+                        percentile_30d_map = ex.get_funding_percentile_30d(list(closes.columns)) if hasattr(ex, 'get_funding_percentile_30d') else {s: 0.5 for s in closes.columns}
+                    except Exception:
+                        percentile_30d_map = {s: 0.5 for s in closes.columns}
+
+                    # Funding-carry sleeve (perps)
+                    w_carry = pd.Series(0.0, index=w_mom.index, name='carry')
+                    if carry_cfg.funding.enabled:
+                        w_fc, meta_fc = build_funding_carry_weights(
+                            ex=ex,
+                            universe=list(closes.columns),
+                            equity=float(eq or 0.0),
+                            cfg=carry_cfg,
+                            spread_bps_map=spread_bps_map,
+                            depth_usd_map=depth_usd_map,
+                            percentile_30d_map=percentile_30d_map,
+                        )
+                        w_carry = w_carry.add(w_fc.reindex(w_carry.index).fillna(0.0), fill_value=0.0)
+                        kept_fc = [k for k,v in meta_fc.items() if v.get('chosen')]
+                        log.info(f"[CARRY] funding: chosen={len(kept_fc)} {kept_fc[:6]}...")
+
+                    # Basis cash-and-carry (requires spot+dated futures quotes)
+                    if carry_cfg.basis.enabled and hasattr(ex, 'get_dated_futures_quotes'):
+                        try:
+                            futs_quotes = ex.get_dated_futures_quotes(list(closes.columns))  # {sym: {'F','S','dte_days'}}
+                        except Exception:
+                            futs_quotes = {}
+                        if futs_quotes:
+                            w_bc, meta_bc = build_basis_carry_weights(
+                                ex=ex,
+                                universe_spot=list(closes.columns),
+                                equity=float(eq or 0.0),
+                                cfg=carry_cfg,
+                                futs_quotes=futs_quotes,
+                            )
+                            w_carry = w_carry.add(w_bc.reindex(w_carry.index).fillna(0.0), fill_value=0.0)
+                            kept_bc = [k for k,v in meta_bc.items() if v.get('chosen')]
+                            log.info(f"[CARRY] basis: chosen={len(kept_bc)} {kept_bc[:6]}...")
+
+                    # Blend sleeves by budget fraction into combined targets
+                    targets = combine_sleeves(
+                        w_momentum=w_mom,
+                        w_carry=w_carry,
+                        carry_budget_frac=float(getattr(carry_cfg, 'budget_frac', 0.35)),
+                        total_gross_leverage=float(getattr(cfg.strategy, 'gross_leverage', 1.2)),
+                        per_asset_cap=float(getattr(cfg.strategy, 'max_weight_per_asset', 0.14)),
+                    )
+                    try:
+                        g = float(targets.abs().sum())
+                        log.info(f"[CARRY] combined gross after blend: {g:.4f}")
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"[CARRY] sleeve integration failed (non-fatal): {e}")
+
             # === Portfolio-level scaler: VolTarget × DD Stepdown × Fractional-Kelly ===
             def _portfolio_returns(closes_df: pd.DataFrame, weights: pd.Series, lookback: int = 20) -> pd.Series:
                 rets = closes_df.pct_change().dropna()
@@ -1387,9 +1599,25 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 now_ts=time.time(),
             )
 
+            # Build open orders map to avoid double-placing while pending
+            open_by_sym: Dict[str, List[dict]] = {}
+            try:
+                all_open = ex.fetch_open_orders(None)
+                for od in (all_open or []):
+                    s = od.get("symbol")
+                    if s:
+                        open_by_sym.setdefault(s, []).append(od)
+            except Exception:
+                for s in list(targets.index):
+                    try:
+                        open_by_sym[s] = ex.fetch_open_orders(s) or []
+                    except Exception:
+                        pass
+
             # 5) Orders
             min_notional = float(getattr(cfg.execution, "min_notional_per_order_usdt", 5.0))
             min_delta_bps = float(getattr(cfg.execution, "min_rebalance_delta_bps", 1.0))
+            per_sym_cool = int(getattr(getattr(cfg.execution, "throttle", object()), "min_seconds_between_entries_per_symbol", 12))
 
             open_symbols = [s for s, p in positions.items() if not _is_new_position(p)]
             base_slots = int(getattr(cfg.strategy.entry_throttle, "max_open_positions", 999))
@@ -1423,11 +1651,18 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 pass
 
             created = 0
+            last_trade_ts = state.setdefault("last_trade_ts", {})
+
             for s in order_syms:
                 tgt_w = float(targets.loc[s])
                 tkr = (tickers or {}).get(s, {}) or {}
                 mid = _mid_price(tkr)
                 if mid is None or mid <= 0:
+                    continue
+
+                # Per-symbol cooldown to avoid spam
+                lt = float(last_trade_ts.get(s, 0.0) or 0.0)
+                if per_sym_cool > 0 and (time.time() - lt) < per_sym_cool:
                     continue
 
                 notional = abs(tgt_w) * eq
@@ -1436,16 +1671,60 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
                 cur_qty = float(positions.get(s, {}).get("net_qty") or 0.0)
                 desired_contracts = tgt_w * eq / mid
-                delta = desired_contracts - cur_qty
-                if abs(delta) <= 0:
-                    continue
 
+                # Decide side vs current qty
+                raw_delta = desired_contracts - cur_qty
+                if abs(raw_delta) <= 0:
+                    continue
+                side = "buy" if raw_delta > 0 else "sell"
+
+                # === NO-PYRAMID GUARD ===
+                pyr = getattr(getattr(cfg.execution, "pyramiding", object()), "enabled", False)
+                if not pyr:
+                    # If same direction and we would be INCREASING absolute size → skip (no add)
+                    if (cur_qty > 0 and desired_contracts > cur_qty) or (cur_qty < 0 and desired_contracts < cur_qty):
+                        continue
+                else:
+                    rr_gate = float(getattr(getattr(cfg.execution, "pyramiding", object()), "allow_when_rr_ge", 0.0) or 0.0)
+                    if rr_gate > 0 and ((cur_qty > 0 and desired_contracts > cur_qty) or (cur_qty < 0 and desired_contracts < cur_qty)):
+                        locked_r = float(state.get("locked_r", {}).get(s, 0.0) or 0.0)
+                        if locked_r < rr_gate:
+                            continue
+                # === END NO-PYRAMID ===
+
+                # Subtract pending same-side qty to avoid duplicate placement every cycle
+                pend = _sum_pending_same_side(open_by_sym.get(s), side)
+                abs_delta = max(0.0, abs(raw_delta) - pend)
+                if abs_delta <= 0:
+                    continue
+                delta = math.copysign(abs_delta, raw_delta)
+
+                # Require a minimal rebalance change in bps of current notional (if any)
                 if min_delta_bps > 0 and eq > 0:
                     cur_notional = abs(cur_qty) * mid
-                    step_bps = (abs(delta) * mid) / max(cur_notional, 1e-9) * 10_000.0 if cur_notional > 0 else 10_000.0
-                    if cur_notional > 0 and step_bps < min_delta_bps:
-                        continue
+                    if cur_notional > 0:
+                        step_bps = (abs(delta) * mid) / cur_notional * 10_000.0
+                        if step_bps < min_delta_bps:
+                            continue
 
+                # Quantize to exchange constraints
+                specs = _get_symbol_specs(ex, s, state)
+                step = float(specs.get("amount_step") or 0.0)
+                min_qty = float(specs.get("amount_min") or 0.0)
+                min_cost = float(specs.get("min_notional") or 0.0)
+                integer_amt = bool(specs.get("integer_amount", False))
+
+                q_to_send = _quantize_amount(abs(delta), step, integer_amt)
+
+                # Respect min qty and min notional (Bybit precision errors)
+                if min_qty > 0 and q_to_send < min_qty:
+                    continue
+                if min_cost > 0 and (q_to_send * mid) < min_cost:
+                    continue
+                if q_to_send <= 0:
+                    continue
+
+                # Price (limit w/ dynamic offset) or market
                 px = None
                 if getattr(cfg.execution, "order_type", "limit") == "limit":
                     base_off = float(getattr(cfg.execution, "price_offset_bps", 2.0))
@@ -1454,8 +1733,9 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     if dyn and getattr(dyn, "enabled", False):
                         sp = _spread_bps(tkr) or 0.0
                         off_bps = min(float(dyn.max_offset_bps), float(dyn.base_bps) + float(dyn.per_spread_coeff) * sp)
-                    px = mid * (1.0 - off_bps / 10_000.0) if delta > 0 else mid * (1.0 + off_bps / 10_000.0)
+                    px = mid * (1.0 - off_bps / 10_000.0) if side == "buy" else mid * (1.0 + off_bps / 10_000.0)
 
+                # Spread guard
                 sg = getattr(cfg.execution, "spread_guard", None)
                 if sg and getattr(sg, "enabled", False):
                     sp = _spread_bps(tkr) or 0.0
@@ -1465,12 +1745,28 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
                 try:
                     if dry:
-                        log.info(f"[DRY] {s}: {'buy' if delta>0 else 'sell'} {abs(delta)} @ {px or 'mkt'} (tgt_w={tgt_w:+.4f})")
+                        log.info(f"[DRY] {s}: {side} {q_to_send} @ {px or 'mkt'} (tgt_w={tgt_w:+.4f}, pend={pend:.4f})")
                     else:
                         post_only = bool(getattr(cfg.execution, "post_only", True))
-                        ex.create_order_safe(s, "buy" if delta > 0 else "sell", abs(delta), px, post_only=post_only, reduce_only=False)
+                        ex.create_order_safe(s, side, q_to_send, px, post_only=post_only, reduce_only=False)
                         created += 1
+                        last_trade_ts[s] = time.time()
                 except Exception as e:
+                    msg = str(e)
+                    # Learn min qty from error strings like:
+                    # "amount ... must be greater than minimum amount precision of 100"
+                    mobj = re.search(r"(minimum .*?(?:amount|qty).*?of\s+)([0-9]+(?:\.[0-9]+)?)", msg, re.I)
+                    if mobj:
+                        try:
+                            learned = float(mobj.group(2))
+                            state.setdefault("min_qty_cache", {})
+                            old = float(state["min_qty_cache"].get(s, 0.0) or 0.0)
+                            if learned > old:
+                                state["min_qty_cache"][s] = learned
+                                write_json(getattr(cfg.paths, "state_path", "state/state.json"), state)
+                                log.info(f"[LEARN] Updated {s} min qty to {learned} from exchange error.")
+                        except Exception:
+                            pass
                     log.warning(f"order {s} failed: {e}")
 
             if created:
@@ -1491,4 +1787,5 @@ def run_live(cfg: AppConfig, dry: bool = False):
         try:
             ex.close()
         except Exception:
+
             pass

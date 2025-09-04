@@ -1,322 +1,128 @@
+# =========================
+# XSMOM-BOT — CONFIG (COMPATIBLE)
+# =========================
+
+paths:
+  state_path: /opt/xsmom-bot/state/state.json
+  logs_dir: /opt/xsmom-bot/logs
+  metrics_path: /opt/xsmom-bot/metrics/metrics.prom
+
 exchange:
   id: bybit
-  margin_mode: cross
   account_type: swap
   quote: USDT
   only_perps: true
-  unified_margin: false
+  unified_margin: true
   testnet: false
-  max_symbols: 30
-  min_usd_volume_24h: 2000000
-  min_price: 0.01
-  timeframe: 1h
+  timeframe: "1h"
   candles_limit: 1500
-sizing:
-  market_neutral_xsmom: true
-  market_neutral_tsmom: false
-  gross_leverage: 2.0
-  max_weight_per_asset: 0.14
-  portfolio_target_daily_vol_bps: 60
-  portfolio_vol_lookback: 20
-  portfolio_vol_min_mult: 0.6
-  portfolio_vol_max_mult: 1.3
-  kelly_sr_lookback: 60
+
+liquidity:
+  max_symbols: 50
+  min_usd_volume_24h: 30000000
+  min_price: 0.03
+
+execution:
+  maker_first: true
+  maker_ttl_secs: 10
+  taker_on_strong_signal: true
+  strong_signal_band: 0.90      # allow taker if |z| >= strong band
+  max_spread_bps: 8             # skip if spread wider than this
+  max_slippage_bps: 12          # skip if implied slippage worse than this
+  pyramiding:
+    enabled: true            # default: do NOT add to an existing position
+    allow_when_rr_ge: 1.0     # optional: only add if locked/trailing R ≥ this (used if enabled)
+
+costs:
+  taker_bps: 5
+  maker_bps: 1
+  slippage_bps: 2
+
 strategy:
-  mode: auto
-  signal_power: 1.35
-  lookbacks:
-  - 1
-  - 6
-  - 24
-  - 96
-  lookback_weights:
-  - 1.0
-  - 1.0
-  - 1.0
-  - 0.5
-  vol_lookback: 72
-  k_min: 2
-  k_max: 6
+  # === Momentum / signals ===
+  lookbacks: [1, 6, 24]
+  lookback_weights: [1.0, 1.5, 2.0]
+  z_power: 1.35
   market_neutral: true
-  gross_leverage: 2.0
-  max_weight_per_asset: 0.14
-  entry_zscore_min: 0.8
-  dispersion_gate:
+  carry:
     enabled: true
-    lookback: 24
-    metric: std
-    threshold_bps: 35.0
-    min_breadth: 6
-  regime_switch:
-    corr_lookback: 96
-    corr_high: 0.6
-    majors_ema: 200
-    slope_min_bps_per_day: 2.0
+
+    # How much of portfolio gross to reserve for the carry sleeve (rest for momentum)
+    budget_frac: 0.35        # 35% to carry, 65% to momentum
+
+    # Global sleeve caps (applied on top of your main caps)
+    per_symbol_notional_cap_pct: 0.20   # ≤20% of equity per carry pair
+    max_weight_per_asset: 0.12          # hard weight cap within the carry sleeve
+    gross_leverage: 0.90                # intra-sleeve gross; combined book still obeys main gross
+
+    # If your ExchangeWrapper supports only perps, the sleeve falls back to a *small* directional tilt
+    # instead of true delta-neutral pairs.
+    allow_directional_fallback: true
+    fallback_weight_scale: 0.35         # scale on directional tilt (keeps it small & safe)
+
+    funding:
+      enabled: true
+      intervals_for_mean: 6             # use last 6 intervals (e.g., 8h funding → 2 days)
+      min_entry_apy: 0.15               # 15% APY hurdle (net, ex-fees/borrow assumptions)
+      min_exit_apy: 0.08                # 8% APY exit
+      min_percentile_30d: 0.80          # only enter if funding is in top 20% of last 30d
+      sign_stability_k: 5               # ≥5 of last 6 intervals have same sign
+      spread_gate_bps: 10               # skip if spreads wider than 10 bps
+      depth_usd_min: 2000               # skip if insufficient depth at top of book
+      hedge_preference: ["spot", "dated_future", "perp_proxy"]
+
+    basis:
+      enabled: true
+      min_entry_apy: 0.15               # 15% APY net basis to enter
+      min_exit_apy: 0.08                # 8% APY to keep/exit
+      roll_threshold_days: 5            # roll if DTE < 5d
+      dte_min_days: 10                  # prefer contracts with ≥10d remaining
+      spread_gate_bps: 10
+      depth_usd_min: 3000
+      hedge_preference: ["spot", "perp"]  # if spot unavailable, hedge with perp (basis vs perp)  
+
+  # === No-trade bands (hysteresis) ===
+  no_trade_bands:
+    enabled: true
+    z_entry: 0.65
+    z_exit: 0.45
+
+  # === Selection: Dynamic K ===
+  selection:
+    dynamic_k:
+      enabled: true
+      k_min: 2
+      k_max: 8
+      kappa: 5.0
+      fallback_k: 6
+
+  # === Sizing / caps ===
+  gross_leverage: 1.20
+  max_weight_per_asset: 0.14          # hard per-asset weight cap
+  per_symbol_notional_cap_pct: 0.20   # |notional_i| <= 20% of equity
+
+  # === Portfolio Volatility Target Scaling ===
+  portfolio_vol_target:
+    enabled: true
+    target_ann_vol: 0.35              # 35% annualized portfolio vol
+    lookback_hours: 72
+    min_scale: 0.50
+    max_scale: 1.60
+
+  # === ADX/DI filter ===
   adx_filter:
     enabled: true
     len: 14
-    min_adx: 20
+    min_adx: 25
     require_rising: true
     use_di_alignment: true
-    min_di_separation: 0.0
-    di_hysteresis_bps: 0.0
-  symbol_filter:
-    enabled: true
-    banlist: []
-    whitelist: []
-    score:
-      enabled: true
-      min_sample_trades: 5
-      ema_alpha: 0.2
-      min_win_rate_pct: 40.0
-      pf_downweight_threshold: 0.9
-      downweight_factor: 0.6
-      block_below_win_rate_pct: 40.0
-      pf_block_threshold: 0.9
-      pnl_block_threshold_usdt_per_trade: -0.1
-      ban_minutes: 720
-      grace_trades_after_unban: 3
-      decay_days: 14
-      pf_warn_threshold: 1.2
-    ban_minutes_after_loss: 0
-  regime_filter:
-    enabled: true
-    ema_len: 200
-    slope_min_bps_per_day: 2.0
-    use_abs: true
-    hurst:
-      enabled: true
-      lags:
-      - 2
-      - 4
-      - 8
-      - 16
-      - 32
-      min_h: 0.5
-  funding_tilt:
-    enabled: true
-    weight: 0.15
-  funding_trim:
-    enabled: true
-    threshold_bps: 3.0
-    slope_per_bps: 0.01
-    max_reduction: 0.4
-  diversify:
-    enabled: true
-    corr_lookback: 48
-    max_pair_corr: 0.85
-  vol_target:
-    enabled: true
-    target_daily_vol_bps: 60
-    min_scale: 0.6
-    max_scale: 1.2
-  entry_throttle:
-    max_new_positions_per_cycle: 3
-    max_open_positions: 12
-    per_symbol_trade_cooldown_min: 30
-    min_entry_zscore: 0.6
-  soft_kill:
-    enabled: true
-    soft_daily_loss_pct: 1.5
-    resume_after_minutes: 240
-  time_of_day_whitelist:
-    enabled: true
-    use_ema: true
-    ema_alpha: 0.2
-    min_trades_per_hour: 8
-    min_hours_allowed: 12
-    threshold_bps: 0.0
-    fixed_hours: []
-    boost_good_hours: true
-    fixed_good_hours:
-    - 7
-    - 14
-    - 3
-    - 2
-    boost_factor: 1.25
-  require_mtf_alignment: true
-  confirmation_timeframe: 4h
-  confirmation_lookback: 6
-  majors_regime:
-    enabled: true
-    majors:
-    - BTC/USDT:USDT
-    - ETH/USDT:USDT
-    ema_len: 200
-    slope_bps_per_day: 1.0
-    action: downweight
-    downweight_factor: 0.7
-  kelly:
-    enabled: true
-    base_frac: 0.5
-    half_kelly: true
-    min_scale: 0.5
-    max_scale: 1.6
-    max_tilt: 0.15
-    ema_alpha: 0.15
-    wr_floor_pct: 35
-    pf_floor: 0.9
-liquidity:
-  adv_cap_pct: 0.002
-  notional_cap_usdt: 70
-execution:
-  reload_positions_on_start: true
-  order_type: limit
-  post_only: true
-  price_offset_bps: 3
-  slippage_bps_guard: 25
-  set_leverage: 3
-  rebalance_minute: 5
-  poll_seconds: 15
-  align_after_funding_minutes: 0
-  funding_hours_utc:
-  - 0
-  - 8
-  - 16
-  min_notional_per_order_usdt: 15
-  min_rebalance_delta_bps: 30
-  cancel_open_orders_on_start: true
-  spread_guard:
-    enabled: true
-    max_spread_bps: 15
-    skip_if_wider: true
-  dynamic_offset:
-    enabled: true
-    base_bps: 3.0
-    per_spread_coeff: 0.5
-    max_offset_bps: 20.0
-  microstructure:
-    enabled: true
-    min_obi: 0.15
-    max_spread_bps: 10.0
-  bump_to_exchange_min: true
-  stale_orders:
-    enabled: true
-    cleanup_interval_sec: 45
-    max_age_sec: 180
-    reprice_if_far_bps: 15.0
-    cancel_if_not_targeted: true
-    keep_reduce_only: true
+
 risk:
-  atr_len: 28
-  atr_mult_sl: 2.2
-  atr_mult_tp: 3.0
-  use_tp: true
-  fast_check_seconds: 2
-  stop_timeframe: 5m
-  trailing_enabled: true
-  trail_atr_mult: 1.2
-  breakeven_after_r: 2.0
-  stop_on_close_only: true
-  stop_confirm_bars: 1
-  min_hold_minutes: 12
-  catastrophic_atr_mult: 3.5
-  stop_buffer_bps: 10
-  cooldown_minutes_after_stop: 90
-  partial_tp_enabled: true
-  partial_tp_r: 2.5
-  partial_tp_size: 0.5
-  partial_ladders:
-    enabled: true
-    r_levels:
-    - 1.0
-    - 1.8
-    - 2.6
-    sizes:
-    - 0.34
-    - 0.33
-    - 0.33
-    reduce_only: true
-  no_progress:
-    enabled: true
-    min_minutes: 20
-    min_rr: 0.3
-    min_close_pnl_pct: 0.0
-    tiers:
-      minutes:
-      - 20
-      - 40
-      - 80
-      - 160
-      min_rr:
-      - 0.3
-      - 0.45
-      - 0.6
-      - 0.8
-  exit_on_regime_flip:
-    enabled: true
-    confirm_bars: 1
-  trailing_unlocks:
-    enabled: true
-    triggers_r:
-    - 0.8
-    - 1.3
-    - 2.0
-    lock_r:
-    - 0.0
-    - 0.5
-    - 1.2
-  adaptive:
-    enabled: true
-    low_thr_bps: 40
-    high_thr_bps: 120
-    sl_scale:
-      low: 1.4
-      mid: 1.0
-      high: 0.8
-    trail_scale:
-      low: 1.2
-      mid: 1.0
-      high: 0.8
-    ladder_r_scale:
-      low: 1.1
-      mid: 1.0
-      high: 0.9
-  max_daily_loss_pct: 3.0
-  trade_disable_minutes: 360
-  use_trailing_killswitch: true
-  min_close_pnl_pct: 2.0
-  max_hours_in_trade: 48
-  profit_lock:
-    enabled: true
-    triggers_r:
-    - 1.0
-    - 1.3
-    - 2.0
-    lock_to_r:
-    - 0.1
-    - 0.5
-    - 1.0
-risk_stepdown:
-  enabled: true
-  dd_levels_pct:
-  - 2.0
-  - 4.0
-  - 6.0
-  gross_leverage_multipliers:
-  - 0.9
-  - 0.75
-  - 0.6
-  max_new_positions_multipliers:
-  - 0.8
-  - 0.6
-  - 0.4
-  recover_hysteresis_pct: 1.0
-liquidity_caps:
-  enabled: false
-  max_weight_low_liq: 0.02
-  symbols_low_liq: []
-paths:
-  state_path: state/state.json
-  logs_dir: logs
-  metrics_path: state/metrics.json
+  kill_switch:
+    daily_loss_pct: 6.0
+    resume_after_minutes: 180
+
 logging:
   level: INFO
-  file_max_mb: 20
-  file_backups: 5
-costs:
-  maker_fee_bps: 1.0
-  taker_fee_bps: 5.0
-  slippage_bps: 2.0
-  borrow_bps: 0.0
-  maker_fill_ratio: 0.7
+  to_file: true
+  file: /opt/xsmom-bot/logs/live.log
