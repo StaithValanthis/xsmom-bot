@@ -32,6 +32,16 @@ execution:
   pyramiding:
     enabled: true            # default: do NOT add to an existing position
     allow_when_rr_ge: 1.0     # optional: only add if locked/trailing R ≥ this (used if enabled)
+  cancel_open_orders_on_start: true   # one-time cleanup on restart
+  min_notional_per_order_usdt: 5.0    # prevents <$5 tickets like $0.18
+  min_rebalance_delta_bps: 1.0
+  stale_orders:
+    enabled: true
+    cleanup_interval_sec: 60          # run the janitor every minute
+    max_age_sec: 600                  # cancel/reprice anything >10 minutes old
+    reprice_if_far_bps: 10            # if order drifts >10 bps from mid, cancel/reprice
+    cancel_if_not_targeted: true      # kill orders that no longer match target side
+    keep_reduce_only: true
 
 costs:
   taker_bps: 5
