@@ -1,12 +1,7 @@
-# =========================
-# XSMOM-BOT — CONFIG (COMPATIBLE)
-# =========================
-
 paths:
   state_path: /opt/xsmom-bot/state/state.json
   logs_dir: /opt/xsmom-bot/logs
   metrics_path: /opt/xsmom-bot/metrics/metrics.prom
-
 exchange:
   id: bybit
   account_type: swap
@@ -14,90 +9,94 @@ exchange:
   only_perps: true
   unified_margin: true
   testnet: false
-  timeframe: "1h"
+  timeframe: 1h
   candles_limit: 1500
-
 liquidity:
   max_symbols: 50
   min_usd_volume_24h: 30000000
   min_price: 0.03
-
 execution:
   maker_first: true
-  maker_ttl_secs: 10
-  taker_on_strong_signal: true
-  strong_signal_band: 0.90      # allow taker if |z| >= strong band
-  max_spread_bps: 8             # skip if spread wider than this
-  max_slippage_bps: 12          # skip if implied slippage worse than this
+  maker_ttl_secs: 45
+  taker_on_strong_signal: false
+  strong_signal_band: 1.75
+  max_spread_bps: 8
+  max_slippage_bps: 12
   pyramiding:
-    enabled: true            # default: do NOT add to an existing position
-    allow_when_rr_ge: 1.0     # optional: only add if locked/trailing R ≥ this (used if enabled)
-  cancel_open_orders_on_start: true   # one-time cleanup on restart
-  min_notional_per_order_usdt: 5.0    # prevents <$5 tickets like $0.18
-  min_rebalance_delta_bps: 1.0
+    enabled: true
+    allow_when_rr_ge: 1.0
+  cancel_open_orders_on_start: true
+  min_notional_per_order_usdt: 33.5
+  min_rebalance_delta_bps: 3.47
   stale_orders:
     enabled: true
-    cleanup_interval_sec: 60          # run the janitor every minute
-    max_age_sec: 600                  # cancel/reprice anything >10 minutes old
-    reprice_if_far_bps: 10            # if order drifts >10 bps from mid, cancel/reprice
-    cancel_if_not_targeted: true      # kill orders that no longer match target side
+    cleanup_interval_sec: 30
+    max_age_sec: 600
+    reprice_if_far_bps: 5
+    cancel_if_not_targeted: true
     keep_reduce_only: true
-
+  price_offset_bps: 2.0
+  spread_guard:
+    enabled: true
+    max_spread_bps: 8.2
+    skip_if_wider: true
+  microstructure:
+    enabled: true
+    min_top_depth_usd: 2000.0
+    min_obi: 0.05
+  throttle:
+    min_seconds_between_entries_per_symbol: 4
 costs:
   taker_bps: 5
   maker_bps: 1
   slippage_bps: 2
-
 strategy:
-  # === Momentum / signals ===
-  lookbacks: [1, 6, 24]
-  lookback_weights: [1.0, 1.5, 2.0]
+  lookbacks:
+  - 1
+  - 6
+  - 24
+  lookback_weights:
+  - 1.0
+  - 1.5
+  - 2.0
   z_power: 1.35
   market_neutral: true
   carry:
     enabled: true
-
-    # How much of portfolio gross to reserve for the carry sleeve (rest for momentum)
-    budget_frac: 0.35        # 35% to carry, 65% to momentum
-
-    # Global sleeve caps (applied on top of your main caps)
-    per_symbol_notional_cap_pct: 0.20   # ≤20% of equity per carry pair
-    max_weight_per_asset: 0.12          # hard weight cap within the carry sleeve
-    gross_leverage: 0.90                # intra-sleeve gross; combined book still obeys main gross
-
-    # If your ExchangeWrapper supports only perps, the sleeve falls back to a *small* directional tilt
-    # instead of true delta-neutral pairs.
+    budget_frac: 0.35
+    per_symbol_notional_cap_pct: 0.2
+    max_weight_per_asset: 0.12
+    gross_leverage: 0.9
     allow_directional_fallback: true
-    fallback_weight_scale: 0.35         # scale on directional tilt (keeps it small & safe)
-
+    fallback_weight_scale: 0.35
     funding:
       enabled: true
-      intervals_for_mean: 6             # use last 6 intervals (e.g., 8h funding → 2 days)
-      min_entry_apy: 0.15               # 15% APY hurdle (net, ex-fees/borrow assumptions)
-      min_exit_apy: 0.08                # 8% APY exit
-      min_percentile_30d: 0.80          # only enter if funding is in top 20% of last 30d
-      sign_stability_k: 5               # ≥5 of last 6 intervals have same sign
-      spread_gate_bps: 10               # skip if spreads wider than 10 bps
-      depth_usd_min: 2000               # skip if insufficient depth at top of book
-      hedge_preference: ["spot", "dated_future", "perp_proxy"]
-
+      intervals_for_mean: 6
+      min_entry_apy: 0.15
+      min_exit_apy: 0.08
+      min_percentile_30d: 0.8
+      sign_stability_k: 5
+      spread_gate_bps: 10
+      depth_usd_min: 2000
+      hedge_preference:
+      - spot
+      - dated_future
+      - perp_proxy
     basis:
       enabled: true
-      min_entry_apy: 0.15               # 15% APY net basis to enter
-      min_exit_apy: 0.08                # 8% APY to keep/exit
-      roll_threshold_days: 5            # roll if DTE < 5d
-      dte_min_days: 10                  # prefer contracts with ≥10d remaining
+      min_entry_apy: 0.15
+      min_exit_apy: 0.08
+      roll_threshold_days: 5
+      dte_min_days: 10
       spread_gate_bps: 10
       depth_usd_min: 3000
-      hedge_preference: ["spot", "perp"]  # if spot unavailable, hedge with perp (basis vs perp)  
-
-  # === No-trade bands (hysteresis) ===
+      hedge_preference:
+      - spot
+      - perp
   no_trade_bands:
     enabled: true
     z_entry: 0.65
     z_exit: 0.45
-
-  # === Selection: Dynamic K ===
   selection:
     dynamic_k:
       enabled: true
@@ -105,34 +104,37 @@ strategy:
       k_max: 8
       kappa: 5.0
       fallback_k: 6
-
-  # === Sizing / caps ===
-  gross_leverage: 1.20
-  max_weight_per_asset: 0.14          # hard per-asset weight cap
-  per_symbol_notional_cap_pct: 0.20   # |notional_i| <= 20% of equity
-
-  # === Portfolio Volatility Target Scaling ===
+  gross_leverage: 1.2
+  max_weight_per_asset: 0.14
+  per_symbol_notional_cap_pct: 0.2
   portfolio_vol_target:
     enabled: true
-    target_ann_vol: 0.35              # 35% annualized portfolio vol
+    target_ann_vol: 0.35
     lookback_hours: 72
-    min_scale: 0.50
-    max_scale: 1.60
-
-  # === ADX/DI filter ===
+    min_scale: 0.5
+    max_scale: 1.6
   adx_filter:
     enabled: true
     len: 14
     min_adx: 25
     require_rising: true
     use_di_alignment: true
-
+  gross: 1.5
+  cap: 0.164
+  max_gross: 1.38
+  per_asset_cap: 0.136
 risk:
   kill_switch:
     daily_loss_pct: 6.0
     resume_after_minutes: 180
-
+  risk_per_trade: 0.00842
+  atr_len: 28
+  atr_mult_sl: 1.78
 logging:
   level: INFO
   to_file: true
   file: /opt/xsmom-bot/logs/live.log
+fees:
+  maker_bps: 2.0
+  taker_bps: 5.5
+  slip_bps: 2.0

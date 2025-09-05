@@ -913,6 +913,8 @@ def _reconcile_open_orders(
 
     max_age = int(getattr(st, "max_age_sec", 180))
     far_bps = float(getattr(st, "reprice_if_far_bps", 15.0))
+    maker_ttl = int(getattr(cfg.execution, "maker_ttl_secs", 0) or 0)
+
     cancel_if_not_targeted = bool(getattr(st, "cancel_if_not_targeted", True))
     keep_reduce_only = bool(getattr(st, "keep_reduce_only", True))
 
@@ -1566,7 +1568,35 @@ def run_live(cfg: AppConfig, dry: bool = False):
             except Exception:
                 pass
 
-            # --- HARDENING: enforce per-symbol notional cap in weights (if set) ---
+            
+            # --- RISK-BASED NOTIONAL CAP (ATR stop sizing) ---
+            # Limit each symbol's weight so loss at initial SL ≤ risk_per_trade × equity.
+            try:
+                atr_len_rb = int(getattr(cfg.risk, "atr_len", 28))
+                atr_mult_sl_rb = float(getattr(cfg.risk, "atr_mult_sl", 2.0))
+                risk_per_trade_rb = float(getattr(cfg.risk, "risk_per_trade", 0.0))
+                if risk_per_trade_rb > 0 and atr_mult_sl_rb > 0 and eq and eq > 0:
+                    for _s in list(targets.index):
+                        try:
+                            df_b = bars.get(_s)
+                            if df_b is None or df_b.empty:
+                                continue
+                            close_last = float(df_b["close"].iloc[-1])
+                            if close_last <= 0:
+                                continue
+                            atr_val = float(compute_atr(df_b, n=atr_len_rb, method="rma").iloc[-1])
+                            stop_pct = (atr_val * atr_mult_sl_rb) / max(close_last, 1e-12)
+                            if stop_pct <= 0:
+                                continue
+                            cap_w_risk = risk_per_trade_rb / stop_pct
+                            w_old = float(targets.loc[_s])
+                            targets.loc[_s] = float((cap_w_risk if w_old >= 0 else -cap_w_risk)) if abs(w_old) > cap_w_risk else w_old
+                        except Exception:
+                            continue
+            except Exception as _e_rb:
+                log.debug(f"risk-based cap skipped: {_e_rb}")
+
+            # --- HARDENING: enforce per-symbol notional cap in weights \(if set\) ---
             try:
                 cap_usdt = float(getattr(getattr(cfg, "liquidity", object()), "notional_cap_usdt", 0.0) or 0.0)
                 if cap_usdt > 0 and eq > 0:
@@ -1698,6 +1728,12 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 if abs_delta <= 0:
                     continue
                 delta = math.copysign(abs_delta, raw_delta)
+
+                # Absolute delta-notional floor (prevents tiny dribbler orders)
+                delta_notional = abs(delta) * mid
+                if delta_notional < min_notional:
+                    continue
+
 
                 # Require a minimal rebalance change in bps of current notional (if any)
                 if min_delta_bps > 0 and eq > 0:
