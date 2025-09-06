@@ -446,7 +446,25 @@ def _apply_symbol_filter_to_targets(state: dict, cfg: AppConfig, targets: pd.Ser
 
 # -------------------- Fast SL/TP thread --------------------
 
+
 class FastSLTPThread(threading.Thread):
+    """
+    Fast stop/TP management thread.
+
+    New: Supports MA-ATR trailing stop when configured under cfg.risk.trailing_sl:
+      risk:
+        trailing_sl:
+          enabled: true
+          type: "ma_atr"
+          ma_len: 34
+          atr_length: 28
+          multiplier: 1.5
+          cooldown_bars: 0
+
+    Fallback: if trailing_sl absent or type != "ma_atr", continues using the
+    chandelier-style ATR trail (HH/LL ± trail_atr_mult × ATR) defined by legacy keys:
+        risk.trailing_enabled, risk.trail_atr_mult, risk.atr_len, etc.
+    """
     def __init__(self, ex: ExchangeWrapper, cfg: AppConfig, state: dict, dry: bool, stop_event: threading.Event):
         super().__init__(daemon=True)
         self.ex = ex
@@ -458,19 +476,40 @@ class FastSLTPThread(threading.Thread):
         self._last_ohlcv_ts: Dict[str, float] = {}
         self._last_closed_tail: Dict[str, pd.DataFrame] = {}
         self._atr_cache: Dict[str, float] = {}
+        self._ema_cache: Dict[str, float] = {}   # NEW: for MA-ATR trailing
 
         self.state.setdefault("perpos", {})
         self.state.setdefault("cooldowns", {})
         self.state.setdefault("enter_bar_time", {})
         self.state.setdefault("locked_r", {})
 
+        # General risk params
         self.stop_close_only: bool = bool(getattr(self.cfg.risk, "stop_on_close_only", True))
         self.stop_confirm_bars: int = int(getattr(self.cfg.risk, "stop_confirm_bars", 0))
         self.min_hold_minutes: int = int(getattr(self.cfg.risk, "min_hold_minutes", 0))
         self.catastrophic_mult: float = float(getattr(self.cfg.risk, "catastrophic_atr_mult", 3.5))
         self.stop_buffer_bps: float = float(getattr(self.cfg.risk, "stop_buffer_bps", 0.0))
+
+        # Legacy trailing (chandelier/HHLL)-style
         self.trail_mult_base: float = float(getattr(self.cfg.risk, "trail_atr_mult", 0.0) or 0.0)
 
+        # New trailing_sl block (optional)
+        tsl = getattr(self.cfg.risk, "trailing_sl", None)
+        self.ts_enabled = bool(tsl and getattr(tsl, "enabled", False))
+        self.ts_type = (getattr(tsl, "type", "") or "").strip().lower() if tsl else ""
+        if self.ts_type == "ma_atr":
+            self.ts_ma_len = int(getattr(tsl, "ma_len", 34))
+            self.ts_atr_len = int(getattr(tsl, "atr_length", 28))
+            self.ts_mult   = float(getattr(tsl, "multiplier", 1.5))
+            self.ts_cooldown_bars = int(getattr(tsl, "cooldown_bars", 0))
+        else:
+            # Fallback to legacy lengths
+            self.ts_ma_len = int(getattr(self.cfg.risk, "ema_len_for_trail", 34))
+            self.ts_atr_len = int(getattr(self.cfg.risk, "atr_len", 28))
+            self.ts_mult = float(self.trail_mult_base or 0.0)
+            self.ts_cooldown_bars = 0
+
+        # No-progress and partial ladders
         np_cfg = getattr(self.cfg.risk, "no_progress", None)
         self.no_progress_enabled = bool(np_cfg and np_cfg.enabled)
         self.no_progress_min_minutes = int(np_cfg.min_minutes) if np_cfg else 0
@@ -568,20 +607,26 @@ class FastSLTPThread(threading.Thread):
         sl_scale, trail_scale, ladd_scale = self._adaptive_scales(symbol, last_close or entry_price)
 
         atr_mult_sl_eff = float(getattr(self.cfg.risk, "atr_mult_sl", 2.0)) * sl_scale
-        trail_k_eff = self.trail_mult_base * trail_scale
-        trailing_enabled = bool(getattr(self.cfg.risk, "trailing_enabled", True))
-
         init_sl = entry_price - atr_mult_sl_eff * entry_atr if sign > 0 else entry_price + atr_mult_sl_eff * entry_atr
 
-        cur_atr = self._atr_cache.get(symbol, entry_atr)
-        hh = _safe_float(pinfo.get("trail_hh"), _safe_float(last_closed.get("high")))
-        ll = _safe_float(pinfo.get("trail_ll"), _safe_float(last_closed.get("low")))
+        cur_atr = float(self._atr_cache.get(symbol, entry_atr) or entry_atr)
 
+        # Trailing stop computation (new MA-ATR vs legacy HH/LL)
         stop_px = init_sl
-        if trailing_enabled and trail_k_eff > 1e-12 and cur_atr > 0:
-            trail_sl = (hh - trail_k_eff * cur_atr) if sign > 0 else (ll + trail_k_eff * cur_atr)
-            stop_px = max(init_sl, trail_sl) if sign > 0 else min(init_sl, trail_sl)
+        if self.ts_enabled and self.ts_type == "ma_atr" and self.ts_mult > 0 and cur_atr > 0:
+            ema_val = float(self._ema_cache.get(symbol, last_close) or last_close)
+            trail = (ema_val - (self.ts_mult * trail_scale) * cur_atr) if sign > 0 else (ema_val + (self.ts_mult * trail_scale) * cur_atr)
+            stop_px = max(init_sl, trail) if sign > 0 else min(init_sl, trail)
+        else:
+            # Legacy chandelier style (HH/LL ± k*ATR)
+            trail_k_eff = float(self.trail_mult_base or 0.0) * trail_scale
+            if trail_k_eff > 0 and cur_atr > 0:
+                hh = _safe_float(pinfo.get("trail_hh"), _safe_float(last_closed.get("high")))
+                ll = _safe_float(pinfo.get("trail_ll"), _safe_float(last_closed.get("low")))
+                trail_sl = (hh - trail_k_eff * cur_atr) if sign > 0 else (ll + trail_k_eff * cur_atr)
+                stop_px = max(init_sl, trail_sl) if sign > 0 else min(init_sl, trail_sl)
 
+        # R-unit and breakeven/locks
         R_unit = float(entry_atr * atr_mult_sl_eff)
         be_after = float(getattr(self.cfg.risk, "breakeven_after_r", 0.0))
         if be_after > 0 and last_close is not None:
@@ -612,7 +657,6 @@ class FastSLTPThread(threading.Thread):
                     elif sign < 0 and last_close <= entry_price - trig_eff * R_unit:
                         stop_px = min(stop_px, entry_price - lock * R_unit)
                         locked = lock
-
         if locked > 0:
             self.state.setdefault("locked_r", {})[symbol] = locked
 
@@ -654,7 +698,6 @@ class FastSLTPThread(threading.Thread):
             pinfo["ladder_done"] = done
             self.state.setdefault("perpos", {})[symbol] = pinfo
 
-
     def _place_exit(self, symbol: str, qty: float, reason: str, exit_px: Optional[float]):
         side_close = "sell" if qty > 0 else "buy"
         q = abs(qty)
@@ -691,7 +734,8 @@ class FastSLTPThread(threading.Thread):
         if fast_s <= 0:
             return
         tf = getattr(self.cfg.risk, "stop_timeframe", "5m")
-        atr_len = int(getattr(self.cfg.risk, "atr_len", 28))
+        # Use MA-ATR-specified ATR length when enabled, else legacy
+        atr_len = int(self.ts_atr_len if (self.ts_enabled and self.ts_type == "ma_atr") else getattr(self.cfg.risk, "atr_len", 28))
 
         while not self.stop_event.is_set():
             try:
@@ -711,7 +755,7 @@ class FastSLTPThread(threading.Thread):
                     nowts = float(time.time())
                     if nowts - float(self._last_ohlcv_ts.get(sym, 0.0)) > 55.0:
                         try:
-                            raw = self.ex.fetch_ohlcv(sym, tf, limit=max(60, atr_len + 10))
+                            raw = self.ex.fetch_ohlcv(sym, tf, limit=max(60, atr_len + 10, self.ts_ma_len + 10))
                             if not raw:
                                 continue
                             df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
@@ -719,7 +763,15 @@ class FastSLTPThread(threading.Thread):
                             df.set_index("dt", inplace=True)
                             tail = df.tail(max(3, self.stop_confirm_bars + 2)).copy()
                             self._last_closed_tail[sym] = tail
+
+                            # Cache ATR (Wilder RMA via signals.compute_atr)
                             self._atr_cache[sym] = float(_safe_float(compute_atr(df, n=atr_len, method="rma").iloc[-1], np.nan))
+
+                            # Cache EMA for MA-ATR if enabled
+                            if self.ts_enabled and self.ts_type == "ma_atr":
+                                ema_ser = df["close"].ewm(span=int(self.ts_ma_len), adjust=False).mean()
+                                self._ema_cache[sym] = float(_safe_float(ema_ser.iloc[-1], np.nan))
+
                             self._last_ohlcv_ts[sym] = nowts
                         except Exception as e:
                             log.debug(f"fast fetch_ohlcv {sym} failed: {e}")
@@ -780,6 +832,7 @@ class FastSLTPThread(threading.Thread):
                             self._place_exit(sym, qty, "NO-PROGRESS", last_c)
                             continue
 
+                    # Compute stops
                     normal_px, cat_px, ep, R_unit_eff, sign = self._compute_stop_px(sym, last_closed)
                     if sign == 0:
                         continue
@@ -803,7 +856,8 @@ class FastSLTPThread(threading.Thread):
                         if (sign > 0 and last_closed["low"] <= cat_px) or (sign < 0 and last_closed["high"] >= cat_px):
                             hit_cat = True
 
-                    if bool(getattr(self.cfg.risk, "trailing_enabled", True)) and self.trail_mult_base > 0 and not hit_cat and not hit_normal:
+                    # Additional real-time trailing guard (legacy path only)
+                    if (not (self.ts_enabled and self.ts_type == "ma_atr")) and bool(getattr(self.cfg.risk, "trailing_enabled", True)) and self.trail_mult_base > 0 and not hit_cat and not hit_normal:
                         if sign > 0:
                             sl_scale, trail_scale, _ = self._adaptive_scales(sym, last_c)
                             cur_atr = self._atr_cache.get(sym, atr0) or atr0
@@ -828,6 +882,7 @@ class FastSLTPThread(threading.Thread):
 
             except Exception as e:
                 log.debug(f"Fast thread loop error: {e}")
+
 
 
 # -------------------- startup reconcile --------------------

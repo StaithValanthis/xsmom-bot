@@ -26,8 +26,8 @@ execution:
     enabled: true
     allow_when_rr_ge: 1.0
   cancel_open_orders_on_start: true
-  min_notional_per_order_usdt: 33.5
-  min_rebalance_delta_bps: 3.47
+  min_notional_per_order_usdt: 34.0
+  min_rebalance_delta_bps: 4.0
   stale_orders:
     enabled: true
     cleanup_interval_sec: 30
@@ -38,14 +38,19 @@ execution:
   price_offset_bps: 2.0
   spread_guard:
     enabled: true
-    max_spread_bps: 8.2
+    max_spread_bps: 8.0
     skip_if_wider: true
   microstructure:
     enabled: true
     min_top_depth_usd: 2000.0
-    min_obi: 0.05
+    min_obi: 0.081
   throttle:
-    min_seconds_between_entries_per_symbol: 4
+    min_seconds_between_entries_per_symbol: 10
+  fees:
+    maker_fee_pct: 0.0002
+    taker_fee_pct: 0.00055
+    slippage_pct: 0.0002
+    maker_first: true
 costs:
   taker_bps: 5
   maker_bps: 1
@@ -119,22 +124,33 @@ strategy:
     min_adx: 25
     require_rising: true
     use_di_alignment: true
-  gross: 1.5
-  cap: 0.164
-  max_gross: 1.38
-  per_asset_cap: 0.136
 risk:
   kill_switch:
     daily_loss_pct: 6.0
     resume_after_minutes: 180
-  risk_per_trade: 0.00842
+  risk_per_trade: 0.00533
   atr_len: 28
-  atr_mult_sl: 1.78
+  atr_mult_sl: 1.65
+  trailing_sl:
+    enabled: true
+    type: ma_atr
+    ma_len: 34
+    atr_length: 28
+    multiplier: 1.5
+    cooldown_bars: 0
+    presets:
+      default:
+        ma_len: 34
+        multiplier: 1.5
+      fast:
+        ma_len: 30
+        multiplier: 1.4
+      conservative:
+        ma_len: 45
+        multiplier: 1.6
 logging:
   level: INFO
   to_file: true
   file: /opt/xsmom-bot/logs/live.log
-fees:
-  maker_bps: 2.0
-  taker_bps: 5.5
-  slip_bps: 2.0
+notes:
+- 'Trailing SL set to MA-ATR (EMA 34, ATR 28, x1.5). Presets: default/fast/conservative.'
