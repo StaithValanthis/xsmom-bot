@@ -216,6 +216,10 @@ def decide_mode(cfg: Any, closes_window: pd.DataFrame) -> str:
     if explicit in ("xsmom", "tsmom"):
         return explicit
 
+    # Defensive early-out on empty/none
+    if closes_window is None or getattr(closes_window, "empty", True) or closes_window.shape[1] == 0:
+        return "xsmom"
+
     # regime switch (correlation + majors trend)
     corr_lb = _as_int(_cfg_get(cfg, "strategy", "regime_switch", "corr_lookback", default=96), 96)
     corr_hi = _as_float(_cfg_get(cfg, "strategy", "regime_switch", "corr_high", default=0.60), 0.60)
@@ -224,11 +228,14 @@ def decide_mode(cfg: Any, closes_window: pd.DataFrame) -> str:
 
     corr = average_pairwise_correlation(closes_window, lb=corr_lb)
 
-    # Majors proxy: mean of first 2 cols if available
-    if closes_window.shape[1] >= 2:
+    # Majors proxy: mean of first 2 cols if available; single col if only 1
+    ncols = closes_window.shape[1]
+    if ncols >= 2:
         majors = closes_window.iloc[:, :2].mean(axis=1)
-    else:
+    elif ncols == 1:
         majors = closes_window.iloc[:, 0]
+    else:
+        return "xsmom"
 
     trending = majors_trend_ok(majors, ema_len=majors_ema, slope_min_bps_per_day=slope_min)
 
@@ -248,8 +255,6 @@ def decide_mode(cfg: Any, closes_window: pd.DataFrame) -> str:
     # Low dispersion fallback → TSMOM
     return "tsmom"
 
-
-# --------------------------- target builder ---------------------------
 
 def build_targets_auto(closes_window: pd.DataFrame, cfg: Any) -> pd.Series:
     """

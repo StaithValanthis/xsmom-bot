@@ -1383,15 +1383,32 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     raise RuntimeError("Router disabled")
             except Exception as e:
                 log.info(f"[ROUTER] disabled or failed ({e}); using legacy build_targets pipeline.")
-                strat_cfg = _strategy_cfg_from_app(cfg)
                 if getattr(closes_used, 'empty', True) or getattr(closes_used, 'shape', (0,0))[1] == 0:
                     targets = pd.Series(0.0, index=closes.columns)
                 else:
                     targets = build_targets(
                         closes_used,
-                        float(eq or 0.0),
-                        strat_cfg
-                    )
+                        getattr(cfg.strategy, "lookbacks", [1, 6, 24]),
+                        getattr(cfg.strategy, "lookback_weights", [1.0, 1.0, 1.0]),
+                        getattr(cfg.strategy, "vol_lookback", 72),
+                        k_min=getattr(cfg.strategy, "k_min", 2),
+                        k_max=getattr(cfg.strategy, "k_max", 6),
+                        market_neutral=getattr(cfg.strategy, "market_neutral", True),
+                        gross_leverage=getattr(cfg.strategy, "gross_leverage", 1.10),
+                        max_weight_per_asset=getattr(cfg.strategy, "max_weight_per_asset", 0.14),
+                        dynamic_k_fn=dynamic_k if bool(getattr(cfg.strategy, "use_dynamic_k", False)) else None,
+                        funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, "enabled", False) else None,
+                        funding_weight=float(getattr(cfg.strategy.funding_tilt, "weight", 0.0)) if getattr(cfg.strategy.funding_tilt, "enabled", False) else 0.0,
+                        entry_zscore_min=float(getattr(cfg.strategy, "entry_zscore_min", 0.0)),
+                        diversify_enabled=bool(getattr(cfg.strategy.diversify, "enabled", False)),
+                        corr_lookback=int(getattr(cfg.strategy.diversify, "corr_lookback", 48)),
+                        max_pair_corr=float(getattr(cfg.strategy.diversify, "max_pair_corr", 0.9)),
+                        vol_target_enabled=bool(getattr(cfg.strategy.vol_target, "enabled", False)),
+                        target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, "target_daily_vol_bps", 0.0)),
+                        vol_target_min_scale=float(getattr(cfg.strategy.vol_target, "min_scale", 0.5)),
+                        vol_target_max_scale=float(getattr(cfg.strategy.vol_target, "max_scale", 2.0)),
+                        signal_power=float(getattr(cfg.strategy, "signal_power", 1.35)),
+                    ).reindex(closes.columns).fillna(0.0)
             else:
                 # If router path succeeded, apply stepdown multiplier after targets
                 try:

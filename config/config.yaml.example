@@ -12,7 +12,7 @@ exchange:
   timeframe: 1h
   candles_limit: 1500
 liquidity:
-  max_symbols: 50
+  max_symbols: 100
   min_usd_volume_24h: 30000000
   min_price: 0.03
 execution:
