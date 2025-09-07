@@ -1383,29 +1383,15 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     raise RuntimeError("Router disabled")
             except Exception as e:
                 log.info(f"[ROUTER] disabled or failed ({e}); using legacy build_targets pipeline.")
-                targets = build_targets(
-                    closes_used,
-                    cfg.strategy.lookbacks,
-                    cfg.strategy.lookback_weights,
-                    cfg.strategy.vol_lookback,
-                    cfg.strategy.k_min,
-                    cfg.strategy.k_max,
-                    cfg.strategy.market_neutral,
-                    cfg.strategy.gross_leverage * gl_mult,   # apply stepdown here for legacy path
-                    cfg.strategy.max_weight_per_asset,
-                    dynamic_k_fn=dynamic_k,
-                    funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, 'enabled', False) else None,
-                    funding_weight=float(getattr(cfg.strategy.funding_tilt, 'weight', 0.0)) if getattr(cfg.strategy.funding_tilt, 'enabled', False) else 0.0,
-                    entry_zscore_min=float(getattr(cfg.strategy, 'entry_zscore_min', 0.0)),
-                    diversify_enabled=bool(getattr(cfg.strategy.diversify, 'enabled', False)),
-                    corr_lookback=int(getattr(cfg.strategy.diversify, 'corr_lookback', 48)),
-                    max_pair_corr=float(getattr(cfg.strategy.diversify, 'max_pair_corr', 0.9)),
-                    vol_target_enabled=bool(getattr(cfg.strategy.vol_target, 'enabled', False)),
-                    target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, 'target_daily_vol_bps', 0.0)),
-                    vol_target_min_scale=float(getattr(cfg.strategy.vol_target, 'min_scale', 0.5)),
-                    vol_target_max_scale=float(getattr(cfg.strategy.vol_target, 'max_scale', 1.2)),
-                    signal_power=float(getattr(cfg.strategy, 'signal_power', 1.35)),
-                )
+                strat_cfg = _strategy_cfg_from_app(cfg)
+                if getattr(closes_used, 'empty', True) or getattr(closes_used, 'shape', (0,0))[1] == 0:
+                    targets = pd.Series(0.0, index=closes.columns)
+                else:
+                    targets = build_targets(
+                        closes_used,
+                        float(eq or 0.0),
+                        strat_cfg
+                    )
             else:
                 # If router path succeeded, apply stepdown multiplier after targets
                 try:

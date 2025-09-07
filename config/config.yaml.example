@@ -30,7 +30,7 @@ execution:
   min_rebalance_delta_bps: 4.0
   stale_orders:
     enabled: true
-    cleanup_interval_sec: 30
+    cleanup_interval_sec: 300
     max_age_sec: 600
     reprice_if_far_bps: 5
     cancel_if_not_targeted: true
@@ -133,7 +133,7 @@ risk:
   atr_mult_sl: 1.65
   trailing_sl:
     enabled: true
-    type: ma_atr
+    type: "ma_atr"
     ma_len: 34
     atr_length: 28
     multiplier: 1.5
@@ -148,6 +148,14 @@ risk:
       conservative:
         ma_len: 45
         multiplier: 1.6
+  fast_check_seconds: 30        # REQUIRED for the fast SL/TP thread to run
+  stop_timeframe: "5m"          # explicit (default is 5m if omitted)
+  stop_on_close_only: false     # let stops trigger intrabar while testing
+  stop_confirm_bars: 0          # no extra confirmation bars
+  min_hold_minutes: 0
+  trailing_debug: true
+  trailing_enabled: true
+  trail_atr_mult: 1.7
 logging:
   level: INFO
   to_file: true
