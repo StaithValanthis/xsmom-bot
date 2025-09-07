@@ -1883,3 +1883,19 @@ def run_live(cfg: AppConfig, dry: bool = False):
         except Exception:
 
             pass
+
+
+# === PATCH: optional momentum+carry combiner ===
+def _combine_momentum_and_carry(cfg, w_mom: "pd.Series", w_carry: "pd.Series") -> "pd.Series":
+    try:
+        from .carry import adaptive_carry_budget, combine_sleeves
+        base_budget = float(getattr(getattr(cfg.strategy, "carry", None), "budget_frac", 0.20))
+        # Placeholder signals to estimate regime — you can wire real carry APYs
+        carry_budget = adaptive_carry_budget([0.9], 0.6, base=base_budget)
+        return combine_sleeves(
+            w_mom, w_carry, carry_budget,
+            total_gross_leverage=float(cfg.strategy.gross_leverage),
+            per_asset_cap=float(cfg.strategy.max_weight_per_asset),
+        )
+    except Exception:
+        return w_mom.fillna(0.0) if hasattr(w_mom, "fillna") else w_mom

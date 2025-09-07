@@ -42,10 +42,12 @@ def _scale_list_hours(hours_list: List[float], tf_minutes: float) -> List[int]:
     return [int(max(1, ceil((h * 60.0) / tf_minutes))) for h in hours_list]
 
 
-def _calmar(stats: Dict[str, float]) -> float:
+def _calmar(stats: Dict[str, float], turnover_penalty: float = 0.0) -> float:
     cagr = float(stats.get("annualized", 0.0))
     dd = float(stats.get("max_drawdown", 0.0))
-    return cagr / abs(dd) if dd < 0 else -1e9
+    base = cagr / abs(dd) if dd < 0 else -1e9
+    gtpy = float(stats.get("gross_turnover_per_year", 0.0))
+    return base - turnover_penalty * gtpy
 
 
 def _hours_from_bars(bars: int, tf_minutes: float) -> float:
@@ -53,7 +55,6 @@ def _hours_from_bars(bars: int, tf_minutes: float) -> float:
 
 
 def _current_hours(cfg: AppConfig) -> Tuple[List[float], float, float]:
-    """Return the 'information horizon' in HOURS for (lookbacks, vol_lookback, ema_len)."""
     base_min = _tf_minutes(cfg.exchange.timeframe)
     lbs_h = [_hours_from_bars(lb, base_min) for lb in cfg.strategy.lookbacks]
     vol_h = _hours_from_bars(cfg.strategy.vol_lookback, base_min)
@@ -78,12 +79,6 @@ def sweep_timeframe_and_regime(
     drawdown_cap: float = 0.40,
     max_rows: int = 200,
 ) -> pd.DataFrame:
-    """
-    Iterate over:
-      - timeframe (with scaled lookbacks/vol/ema to keep 'hours' constant)
-      - EMA length (bars) & slope threshold (bps/day)
-    Select best by Calmar; return full table sorted by score.
-    """
     rows: List[Dict] = []
     lbs_h, vol_h, ema_h = _current_hours(base_cfg)
 
@@ -125,7 +120,9 @@ def sweep_timeframe_and_regime(
                     "annualized": float(stats["annualized"]),
                     "max_drawdown": float(stats["max_drawdown"]),
                 }
-                row["calmar"] = _calmar(row)
+                if "gross_turnover_per_year" in stats:
+                    row["gross_turnover_per_year"] = float(stats["gross_turnover_per_year"])
+                row["calmar"] = _calmar(row, turnover_penalty=1e-3)
                 rows.append(row)
 
                 if len(rows) >= max_rows:
@@ -157,7 +154,6 @@ def main():
     cfg_path = args.config
     cfg = load_config(cfg_path)
 
-    # fixed universe per liquidity gates
     ex = ExchangeWrapper(cfg.exchange)
     try:
         universe = ex.fetch_markets_filtered()
@@ -192,11 +188,9 @@ def main():
     top = df.iloc[0].to_dict()
     log.info("Best config: %s", top)
 
-    # Compare & write back
     changed = False
     new_cfg = AppConfig(**cfg.model_dump())
 
-    # If timeframe changed, scale lookbacks/vol/ema to preserve 'hours' baseline
     if str(cfg.exchange.timeframe).lower() != str(top["timeframe"]).lower():
         lbs_h, vol_h, ema_h = _current_hours(cfg)
         tf_min = _tf_minutes(top["timeframe"])
@@ -206,7 +200,6 @@ def main():
         new_cfg.strategy.regime_filter.ema_len = int(max(10, _scale_bars_from_hours(ema_h, tf_min)))
         changed = True
 
-    # Apply picked regime values (override scaled EMA if different)
     if int(new_cfg.strategy.regime_filter.ema_len) != int(top["ema_len"]):
         new_cfg.strategy.regime_filter.ema_len = int(top["ema_len"])
         changed = True
@@ -220,7 +213,6 @@ def main():
         print(df.head(10).to_string(index=False))
         return
 
-    # Backup & write YAML
     import yaml
     backup = f"{cfg_path}.bak-{ts}"
     try:
@@ -238,7 +230,7 @@ def main():
     if args.restart:
         _try_restart(args.service)
 
-    print("\n=== TOP RESULTS (Calmar) ===")
+    print("\n=== TOP RESULTS (Calmar – λ·turnover) ===")
     print(df.head(10).to_string(index=False))
 
 

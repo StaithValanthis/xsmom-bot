@@ -389,3 +389,17 @@ def combine_sleeves(
     w = _cap_per_asset(w, per_asset_cap)
     w = _renorm_gross(w, total_gross_leverage)
     return w
+
+
+# === PATCH: adaptive carry budget ===
+def adaptive_carry_budget(pct_apys, sign_stability, base: float = 0.20) -> float:
+    import numpy as _np
+    try:
+        if not pct_apys:
+            return float(base)
+        p = float(_np.nanmedian(_np.array(pct_apys, dtype=float)))
+        s = float(max(0.0, min(1.0, sign_stability)))
+        score = 0.6 * p + 0.4 * s
+        return float(max(0.05, min(0.35, 0.05 + 0.30 * score)))
+    except Exception:
+        return float(base)

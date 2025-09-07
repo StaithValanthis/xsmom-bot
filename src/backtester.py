@@ -1,6 +1,6 @@
-# v1.2.0 – 2025-09-04
+# v1.3.0 – turnover-aware stats
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 import numpy as np
 import pandas as pd
 
@@ -44,12 +44,6 @@ def run_backtest(
     prefetch_bars: Optional[Dict[str, pd.DataFrame]] = None,
     return_curve: bool = False,
 ) -> Dict[str, float]:
-    """
-    Backtest the cross-sectional momentum strategy.
-    - If `prefetch_bars` is provided, those OHLCV frames will be used directly.
-    - If not, market data will be fetched via ExchangeWrapper using cfg parameters.
-    - When `return_curve=True`, include 'equity_curve' (pd.Series) in the result.
-    """
     log.info("=== BACKTEST (cost-aware) ===")
     log.info(f"Start: {utcnow().isoformat()} | timeframe={cfg.exchange.timeframe}")
 
@@ -57,7 +51,6 @@ def run_backtest(
     funding_map: Dict[str, float] = {}
 
     if prefetch_bars is not None:
-        # Use provided data
         for s, df in (prefetch_bars or {}).items():
             if isinstance(df, pd.DataFrame) and len(df) > 0:
                 bars[s] = df.copy()
@@ -74,8 +67,6 @@ def run_backtest(
                         bars[s] = df
                 except Exception as e:
                     log.warning(f"Failed OHLCV {s}: {e}")
-
-            # Funding tilt snapshot (static in BT)
             try:
                 if getattr(cfg.strategy.funding_tilt, "enabled", False):
                     funding_map = ex.fetch_funding_rates(list(bars.keys())) or {}
@@ -94,11 +85,9 @@ def run_backtest(
 
     closes = pd.concat({s: bars[s]["close"] for s in bars}, axis=1).dropna(how="all")
     idx = closes.index
-
-    # Return series per symbol
     rets = closes.pct_change().fillna(0.0)
 
-    maker_ratio = float(getattr(cfg.costs, "maker_fill_ratio", 0.5))
+    maker_ratio = float(getattr(cfg.costs, "maker_fill_ratio", 0.6))
 
     equity = [1.0]
     weights_hist = []
@@ -108,7 +97,6 @@ def run_backtest(
     for i in range(warmup, len(idx) - 1):
         window = closes.iloc[:i+1]
 
-        # Regime gating (PER-ASSET)
         eligible_cols = list(window.columns)
         if cfg.strategy.regime_filter.enabled:
             ema_len = int(cfg.strategy.regime_filter.ema_len)
@@ -121,17 +109,15 @@ def run_backtest(
                 try:
                     ok = regime_ok(ser, ema_len, thr, use_abs=use_abs)
                 except Exception:
-                    ok = True  # fail-open per symbol in BT
+                    ok = True
                 if ok:
                     eligible_cols.append(s)
 
             if len(eligible_cols) == 0:
-                # fully flat bar
                 weights_hist.append(pd.Series(0.0, index=closes.columns))
                 equity.append(equity[-1])
                 turnover_hist.append(0.0)
                 continue
-            # shrink window to eligible universe
             window = window[eligible_cols]
 
         w = build_targets(
@@ -161,20 +147,16 @@ def run_backtest(
         prev_w = weights_hist[-1] if len(weights_hist) else pd.Series(0.0, index=closes.columns)
         weights_hist.append(w)
 
-        # one-bar forward return
         port_ret = (rets.iloc[i+1] * w).sum()
 
-        # turnover estimate: sum abs(delta_w)
         delta = (w - prev_w).abs().sum()
-        turnover_notional = delta  # equity assumed 1.0; scale by equity for real
+        turnover_notional = delta
         turnover_hist.append(turnover_notional)
 
-        # apply costs & funding (simple model)
         pnl = equity[-1] * port_ret
         costs = _costs(turnover_notional * equity[-1], maker_ratio, cfg)
         funding = 0.0
         if getattr(cfg.strategy.funding_tilt, "enabled", False) and funding_map:
-            # crude: apply symbol funding weighted by exposure
             funding = float((w * pd.Series(funding_map).reindex(closes.columns).fillna(0.0)).sum()) / (365*24*10_000.0)
             funding *= equity[-1]
 
@@ -183,15 +165,18 @@ def run_backtest(
     eq = pd.Series(equity, index=idx[-len(equity):])
     stats = _perf_stats(eq)
 
+    if turnover_hist:
+        bars_per_year = 24 * 365
+        stats = dict(stats)
+        stats["avg_turnover_per_bar"] = float(np.mean(turnover_hist))
+        stats["gross_turnover_per_year"] = float(np.mean(turnover_hist) * bars_per_year)
+
     log.info("=== BACKTEST (cost-aware) ===")
     log.info(f"Samples: {len(eq)} bars  |  Universe size: {len(closes.columns)}")
-    log.info(f"Total Return: {stats['total_return']:.2%} | Annualized: {stats['annualized']:.2%} | Sharpe: {stats['sharpe']:.2f}")
+    log.info(f"Total Return: {stats['total_return']:.2%} | Annualized: {stats['annualized']:.2%} | Sharpe: {stats.get('sharpe',0):.2f}")
     log.info(f"Max Drawdown: {stats['max_drawdown']:.2%} | Calmar: {stats['calmar']:.2f}")
 
     if return_curve:
-        # Attach the equity curve for callers who want it
-        # Note: this is a pandas Series indexed by bar time
-        stats = dict(stats)
         stats["equity_curve"] = eq
 
     return stats

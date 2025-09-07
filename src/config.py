@@ -421,6 +421,14 @@ def load_config(yaml_path: str) -> AppConfig:
         data = yaml.safe_load(f) or {}
 
     data = _merge_defaults(data)
+    # === PATCH: costs back-compat ===
+    costs = (data.get("costs") or {})
+    if "maker_fee_bps" not in costs and "maker_bps" in costs:
+        costs["maker_fee_bps"] = costs.get("maker_bps")
+    if "taker_fee_bps" not in costs and "taker_bps" in costs:
+        costs["taker_fee_bps"] = costs.get("taker_bps")
+    data["costs"] = costs
+    
 
     try:
         cfg = AppConfig(**data)

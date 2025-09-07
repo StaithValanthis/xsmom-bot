@@ -7,6 +7,7 @@ import logging
 from typing import List, Tuple, Literal, Optional
 import numpy as np
 import pandas as pd
+import re
 
 log = logging.getLogger("signals")
 
@@ -56,3 +57,24 @@ def volatility_tier(atr_pct: float, low_thr_bps: float=40.0, high_thr_bps: float
     if bps > high_thr_bps:
         return "high"
     return "mid"
+
+# === PATCH: added helper confirm_trend_mtf ===
+def confirm_trend_mtf(close: pd.Series, ema_len:int, *, resample_rule:str="4H", lookback:int=6, slope_bps_day_min:float=0.0) -> bool:
+    df = close.to_frame("close").copy()
+    hi = df["close"].resample(resample_rule).last().dropna()
+    if len(hi) < max(lookback, ema_len) + 2:
+        return True
+    ema = hi.ewm(span=int(ema_len), adjust=False).mean()
+    slope = (ema.diff().rolling(int(max(1, lookback))).mean()).iloc[-1]
+    price = float(hi.iloc[-1])
+    if price <= 0 or pd.isna(slope):
+        return True
+    bps_per_bar = (slope / price) * 10_000.0
+    # infer bars per day from resample rule (e.g., '4H' -> 6 bars/day)
+    bars_per_day = 24.0
+    m = re.match(r"(?i)^(\d+)[hH]$", resample_rule or "")
+    if m:
+        h = float(m.group(1))
+        if h > 0:
+            bars_per_day = 24.0 / h
+    return bps_per_bar * bars_per_day >= float(slope_bps_day_min)
