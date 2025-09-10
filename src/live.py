@@ -447,6 +447,7 @@ def _apply_symbol_filter_to_targets(state: dict, cfg: AppConfig, targets: pd.Ser
 # -------------------- Fast SL/TP thread --------------------
 
 
+# Supports MA-ATR trailing stop via cfg.risk.trailing_sl.type == 'ma_atr'
 class FastSLTPThread(threading.Thread):
     """
     Fast stop/TP management thread.
