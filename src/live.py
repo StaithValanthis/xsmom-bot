@@ -17,6 +17,43 @@ import pandas as pd
 import re
 
 from .config import AppConfig
+
+# =============================
+# Execution Alpha Helpers (dynamic limit offset + spread guard)
+# =============================
+def _exec_get_dynamic_offset_bps(spread_bps: float, cfg) -> float:
+    ex = getattr(cfg, "execution", None)
+    d = getattr(ex, "dynamic_offset", None) if ex else None
+    if not (d and getattr(d, "enabled", False)):
+        return float(getattr(ex, "price_offset_bps", 0.0) if ex else 0.0)
+    base = float(getattr(d, "base_bps", 3.0))
+    coeff = float(getattr(d, "per_spread_coeff", 0.5))
+    mx = float(getattr(d, "max_offset_bps", 20.0))
+    return min(mx, base + coeff * max(0.0, float(spread_bps)))
+
+def _exec_price_with_offset(side: str, bid: float, ask: float, cfg) -> float:
+    mid = 0.5 * (float(bid) + float(ask))
+    spread_bps = (float(ask) - float(bid)) / mid * 1e4 if mid > 0 else 0.0
+    off_bps = _exec_get_dynamic_offset_bps(spread_bps, cfg)
+    if side == "buy":
+        p = min(float(bid), mid * (1.0 - off_bps / 1e4))
+        return max(0.0, p)
+    else:
+        p = max(float(ask), mid * (1.0 + off_bps / 1e4))
+        return max(0.0, p)
+
+def _exec_spread_guard_ok(bid: float, ask: float, cfg) -> bool:
+    ex = getattr(cfg, "execution", None)
+    sg = getattr(ex, "spread_guard", None) if ex else None
+    if not (sg and getattr(sg, "enabled", False)):
+        return True
+    mid = 0.5 * (float(bid) + float(ask))
+    if mid <= 0:
+        return False
+    spread_bps = (float(ask) - float(bid)) / mid * 1e4
+    max_spread = float(getattr(sg, "max_spread_bps", 15.0))
+    return spread_bps <= max_spread
+
 from .exchange import ExchangeWrapper
 from .signals import compute_atr, regime_ok, dynamic_k
 from .sizing import build_targets, apply_liquidity_caps, apply_kelly_scaling
@@ -1843,6 +1880,29 @@ def run_live(cfg: AppConfig, dry: bool = False):
                         log.info(f"[DRY] {s}: {side} {q_to_send} @ {px or 'mkt'} (tgt_w={tgt_w:+.4f}, pend={pend:.4f})")
                     else:
                         post_only = bool(getattr(cfg.execution, "post_only", True))
+                        
+                                # --- Exec Alpha: spread guard + dynamic price ---
+                        try:
+                            # best bid/ask from exchange wrapper (prefer a direct method if available)
+                            try:
+                                best_bid, best_ask = ex.best_bid_ask(s)
+                            except Exception:
+                                # fallback: use last known orderbook from tickers/books cache
+                                ob = books.get(s) if 'books' in locals() else None
+                                if ob and isinstance(ob, dict):
+                                    best_bid = float(ob.get("bid") or ob.get("b") or 0.0)
+                                    best_ask = float(ob.get("ask") or ob.get("a") or 0.0)
+                                else:
+                                    t = tickers.get(s) if 'tickers' in locals() else None
+                                    best_bid = float((t or {}).get("bid", 0.0))
+                                    best_ask = float((t or {}).get("ask", 0.0))
+                            if not _exec_spread_guard_ok(best_bid, best_ask, cfg):
+                                log.info(f"[EXEC] {s} spread too wide; skip order this cycle.")
+                                continue
+                            px = _exec_price_with_offset(side, best_bid, best_ask, cfg)
+                        except Exception as _e:
+                            log.warning(f"[EXEC] price offset/guard failed for {s}: {_e}; using previous px")
+                        # --- end exec alpha ---
                         ex.create_order_safe(s, side, q_to_send, px, post_only=post_only, reduce_only=False)
                         created += 1
                         last_trade_ts[s] = time.time()
@@ -1900,3 +1960,5 @@ def _combine_momentum_and_carry(cfg, w_mom: "pd.Series", w_carry: "pd.Series") -
         )
     except Exception:
         return w_mom.fillna(0.0) if hasattr(w_mom, "fillna") else w_mom
+
+

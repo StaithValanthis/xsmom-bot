@@ -13,18 +13,21 @@ exchange:
 strategy:
   ensemble:
     enabled: true
-    weights: {xsec: 0.6, ts: 0.2, breakout: 0.2}
+    weights:
+      xsec: 0.6
+      ts: 0.2
+      breakout: 0.2
     ts_len: 48
     breakout_len: 96
   funding_trim:
-    enabled: true
-    threshold_bps: 1.8
-    slope_per_bps: 0.15
-    max_reduction: 0.5
+    enabled: false
+    threshold_bps: 0.0
+    slope_per_bps: 0.0
+    max_reduction: 0.0
   confirmation:
     enabled: true
     lookback_bars: 2
-    z_boost: 0.00
+    z_boost: 0.0
   signal_power: 1.35
   lookbacks:
   - 12
@@ -41,7 +44,7 @@ strategy:
   k_max: 8
   market_neutral: true
   gross_leverage: 1.8
-  max_weight_per_asset: 0.10
+  max_weight_per_asset: 0.1
   entry_zscore_min: 0.45
   regime_filter:
     enabled: true
@@ -89,11 +92,6 @@ strategy:
   funding_tilt:
     enabled: true
     weight: 0.15
-  funding_trim:
-    enabled: false
-    threshold_bps: 0.0
-    slope_per_bps: 0.0
-    max_reduction: 0.0
   diversify:
     enabled: true
     corr_lookback: 48
@@ -143,13 +141,13 @@ strategy:
     enabled: true
     high_corr:
       threshold: 0.75
-      zmin: 0.70
+      zmin: 0.7
     mid_corr:
       threshold: 0.6
-      zmin: 0.60
+      zmin: 0.6
     low_corr:
       threshold: 0.45
-      zmin: 0.50
+      zmin: 0.5
   selection:
     enabled: true
     k_min: 2
@@ -165,17 +163,33 @@ strategy:
     bars_per_year: 8760.0
   breadth_gate:
     enabled: true
-    min_fraction: 0.20
+    min_fraction: 0.2
     zero_when_blocked: true
   sleeve_constraints:
     meme:
-      symbols: [DOGEUSDT, PEPEUSDT, SHIBUSDT]
+      symbols:
+      - DOGEUSDT
+      - PEPEUSDT
+      - SHIBUSDT
       max_total_weight: 0.25
       sleeve_vol_bps: 60.0
   shock_mode:
     enabled: true
     vol_z_threshold: 2.5
     cap_scale: 0.7
+  cluster_diversify:
+    enabled: true
+    lookback: 240
+    corr_threshold: 0.75
+    max_per_cluster: 2
+  meta_label:
+    enabled: true
+    min_prob: 0.55
+    learning_rate: 0.05
+    l2: 0.001
+    breakout_len: 96
+    vol_len: 48
+    state_path: meta_label_state.json
 liquidity:
   adv_cap_pct: 0.08
   notional_cap_usdt: 20000.0
@@ -287,18 +301,19 @@ risk:
   breakeven_extra_bps: 0.0
   trail_after_partial_mult: 0.0
   age_tighten: null
+optimizer:
+  walk_forward:
+    n_splits: 6
+    embargo_frac: 0.02
+    lookback_bars: 600
+    objective: sharpe
+    max_params: 256
 paths:
-  state_path: state/state.json
-  logs_dir: logs
-  metrics_path: state/metrics.jsonl
-  state_file: state/state.json
+  state_path: /opt/xsmom-bot/state.json
+  logs_dir: /opt/xsmom-bot/logs
+  metrics_path: null
 logging:
   level: INFO
   file_max_mb: 20
   file_backups: 5
-costs:
-  maker_fee_bps: 1.0
-  taker_fee_bps: 5.0
-  slippage_bps: 2.0
-  borrow_bps: 0.0
-  maker_fill_ratio: 0.9
+  

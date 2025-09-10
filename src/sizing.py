@@ -688,3 +688,69 @@ def finalize_weights_pipeline(
     w = w.apply(lambda x: float(np.round(x, 8)))
     return w
 
+
+
+
+
+
+# =============================
+# Correlation-Cluster Diversification (Top-K per cluster)
+# =============================
+def _cd_corr_matrix(prices: pd.DataFrame, lookback: int) -> pd.DataFrame:
+    px = prices.ffill().bfill()
+    rets = np.log(px/px.shift(1)).tail(int(lookback))
+    if rets.shape[0] < max(10, int(lookback/3)):
+        return pd.DataFrame(index=px.columns, columns=px.columns, dtype='float64')
+    return rets.corr()
+
+def _cd_connected_components(corr: pd.DataFrame, threshold: float) -> list[list[str]]:
+    syms = list(corr.columns)
+    n = len(syms)
+    visited = set()
+    comps: list[list[str]] = []
+    adj = {s: [] for s in syms}
+    for i in range(n):
+        si = syms[i]
+        for j in range(i+1, n):
+            sj = syms[j]
+            try:
+                c = float(corr.iloc[i, j])
+            except Exception:
+                c = np.nan
+            if np.isfinite(c) and c >= threshold:
+                adj[si].append(sj)
+                adj[sj].append(si)
+    for s in syms:
+        if s in visited: 
+            continue
+        stack = [s]
+        comp = []
+        while stack:
+            u = stack.pop()
+            if u in visited:
+                continue
+            visited.add(u)
+            comp.append(u)
+            for v in adj.get(u, []):
+                if v not in visited:
+                    stack.append(v)
+        comps.append(comp)
+    return comps
+
+def _apply_cluster_diversification(weights: pd.Series, prices: pd.DataFrame, *, lookback: int = 240, corr_threshold: float = 0.75, max_per_cluster: int = 2) -> pd.Series:
+    if weights is None or weights.empty:
+        return weights
+    if prices is None or getattr(prices, "empty", True):
+        return weights
+    corr = _cd_corr_matrix(prices.loc[:, weights.index], lookback=lookback)
+    comps = _cd_connected_components(corr, threshold=float(corr_threshold))
+    w = weights.copy().astype(float)
+    for comp in comps:
+        if not comp:
+            continue
+        sabs = w.reindex(comp).abs().sort_values(ascending=False)
+        keep = list(sabs.head(int(max_per_cluster)).index)
+        drop = [x for x in comp if x not in keep]
+        if drop:
+            w.loc[drop] = 0.0
+    return w

@@ -234,64 +234,91 @@ def compute_avg_pair_corr(prices, lookback: int = 48) -> float:
 
 
 # ================= Convenience wrapper for callers =================
-def prepare_zscores_for_selection(zscores, cfg: dict, *, prices_df=None, corr_lookback: int = 48, atr_pct: float | None = None):
+def prepare_zscores_for_selection(
+    zscores: pd.Series,
+    cfg: dict,
+    *,
+    prices_df: Optional[pd.DataFrame] = None,
+    next_funding_bps: Optional[pd.Series] = None,
+    corr_lookback: int = 48,
+    atr_pct: float | None = None
+) -> tuple[pd.Series, dict]:
     """
-    Convenience: compute avg pairwise correlation from prices_df (if provided),
-    then run gate_zscores_pipeline(zscores, cfg, avg_pair_corr=..., atr_pct=...).
-    Returns (zscores_ready, meta).
+    Apply ensemble blend + funding trim (if enabled), then run the entry/breadth gating
+    using average pairwise correlation derived from prices_df.
+    Returns: (zscores_ready, meta)
     """
+    meta = {"ensemble_applied": False, "funding_trim_applied": False, "avg_pair_corr": None}
+
+    # ---- Ensemble (x-sec z + ts sign + breakout) ----
+    try:
+        ens = ((cfg or {}).get("strategy", {}) or {}).get("ensemble", {}) or {}
+        if bool(ens.get("enabled", False)) and prices_df is not None and not getattr(prices_df, "empty", True):
+            w = ens.get("weights", {'xsec':0.6,'ts':0.2,'breakout':0.2})
+            ts_len = int(ens.get("ts_len", 48))
+            br_len = int(ens.get("breakout_len", 96))
+            out = {}
+            for sym in zscores.index:
+                try:
+                    p = prices_df[sym].dropna()
+                    r = p.pct_change().dropna()
+                    ts_s = _compute_ts_sign(r, ts_len)
+                    br_s = _compute_breakout_score(p, br_len)
+                    out[sym] = compute_ensemble_score(float(zscores.loc[sym]), ts_s, br_s, w)
+                except Exception:
+                    out[sym] = float(zscores.loc[sym])
+            zscores = pd.Series(out).reindex(zscores.index).astype(float)
+            meta["ensemble_applied"] = True
+    except Exception:
+        pass
+
+    # ---- Funding Trim ----
+    try:
+        st = (cfg or {}).get("strategy", {}) or {}
+        ft = st.get("funding_trim", {}) or {}
+        if bool(ft.get("enabled", False)) and next_funding_bps is not None:
+            # same semantics as apply_funding_trim helper
+            thr = float(ft.get("threshold_bps", 1.8))
+            slope = float(ft.get("slope_per_bps", 0.15))
+            max_red = float(ft.get("max_reduction", 0.5))
+            s = pd.Series(zscores).astype(float)
+            f = pd.Series(next_funding_bps).astype(float).reindex(s.index).fillna(0.0)
+            adversity = pd.Series(0.0, index=s.index, dtype=float)
+            adversity[(s > 0) & (f > thr)] = (f[(s > 0) & (f > thr)] - thr)
+            adversity[(s < 0) & (f < -thr)] = (abs(f[(s < 0) & (f < -thr)]) - thr)
+            red = 1.0 - slope * adversity.clip(lower=0.0)
+            red = red.clip(lower=max(1.0 - max_red, 0.0), upper=1.0)
+            zscores = (s * red).astype(float)
+            meta["funding_trim_applied"] = True
+    except Exception:
+        pass
+
+    # ---- Avg pairwise corr for gating ----
     avg_corr = None
     try:
-        if prices_df is not None:
-            avg_corr = compute_avg_pair_corr(prices_df, lookback=int(corr_lookback))
+        if prices_df is not None and not getattr(prices_df, "empty", True):
+            # use the helper if present
+            try:
+                avg_corr = compute_avg_pair_corr(prices_df, lookback=int(corr_lookback))
+            except Exception:
+                # fallback quick corr
+                px = prices_df.ffill().bfill()
+                rets = np.log(px/px.shift(1)).tail(int(corr_lookback))
+                if rets.shape[0] >= max(10, int(corr_lookback/3)):
+                    c = rets.corr().values
+                    n = c.shape[0]
+                    tri = [c[i,j] for i in range(n) for j in range(i+1, n)]
+                    avg_corr = float(np.mean(tri)) if tri else None
     except Exception:
         avg_corr = None
-    return gate_zscores_pipeline(zscores, cfg, avg_pair_corr=avg_corr, atr_pct=atr_pct)
+    meta["avg_pair_corr"] = None if avg_corr is None else float(avg_corr)
 
-# PRESERVED (non-executed) ORIGINAL ENSEMBLE BLOCK
-_PRESERVED_ENSEMBLE_BLOCK = r"""
-## ENSEMBLE_INJECT
-try:
-    # Build ensemble score per symbol if enabled
-    ens = getattr(getattr(cfg, "strategy", None), "ensemble", None)
-    if ens and getattr(ens, "enabled", False):
-        import pandas as pd
-        _w = getattr(ens, "weights", {'xsec':0.6,'ts':0.2,'breakout':0.2})
-        _ts_len = int(getattr(ens, "ts_len", 48))
-        _br_len = int(getattr(ens, "breakout_len", 96))
-        _ens_scores = {}
-        for sym in zscores.index:
-            try:
-                # Use closes and returns from your symbol data caches (assumed present)
-                _p = closes[sym]
-                _r = _p.pct_change().dropna()
-                ts_s = _compute_ts_sign(_r, _ts_len)
-                br_s = _compute_breakout_score(_p, _br_len)
-                _ens_scores[sym] = compute_ensemble_score(float(zscores.loc[sym]), ts_s, br_s, _w)
-            except Exception:
-                _ens_scores[sym] = float(zscores.loc[sym])
-        zscores = pd.Series(_ens_scores).reindex(zscores.index).astype(float)
-    # Apply funding trim if configured
-    ft = getattr(getattr(cfg, "strategy", None), "funding_trim", None)
-    if ft and getattr(ft, "enabled", False):
-        # Expect next_funding_bps Series keyed by symbol available as 'next_funding_bps' or via data cache
-        try:
-            _nfb = next_funding_bps  # provided by outer scope
-        except NameError:
-            # fallback: look for 'funding_bps' column in recent funding snapshot dict
-            _nfb = None
-        if _nfb is not None:
-            zscores = apply_funding_trim(zscores, _nfb, cfg)
-except Exception:
-    pass
-
-"""
+    # ---- Entry/breadth gating ----
+    zscores_ready, gate_meta = gate_zscores_pipeline(zscores, cfg, avg_pair_corr=avg_corr, atr_pct=atr_pct)
+    meta.update({k:v for k,v in gate_meta.items() if k not in meta})
+    return zscores_ready, meta
 
 
-
-# =============================
-# Ensemble signal components
-# =============================
 def _compute_ts_sign(returns: pd.Series, length: int = 48) -> float:
     """
     Simple time-series filter: sign of EMA of returns over `length`.
@@ -435,3 +462,136 @@ def compute_conviction_scores(closes, cfg, next_funding_bps=None):
     except Exception:
         pass
     return z
+
+
+
+
+# =============================
+# Lightweight Online Meta-Labeler (SGD Logistic Regression)
+# =============================
+from dataclasses import dataclass, field
+
+@dataclass
+class _MetaCfg:
+    enabled: bool = True
+    min_prob: float = 0.55
+    learning_rate: float = 0.05
+    l2: float = 1e-3
+    feature_names: list[str] = field(default_factory=lambda: ["abs_z","sign","vol_look","breakout","funding_bps"])
+    state_path: str = "meta_label_state.json"
+
+class _OnlineMetaLabeler:
+    def __init__(self, cfg: _MetaCfg):
+        self.cfg = cfg
+        self.w: dict[str, np.ndarray] = {}
+        self.b: dict[str, float] = {}
+        self.n = len(cfg.feature_names)
+        # lazy load on first update/predict
+        try:
+            import json, os
+            if os.path.exists(cfg.state_path):
+                data = json.load(open(cfg.state_path, "r"))
+                self.w = {k: np.array(v, dtype=float) for k, v in data.get("w", {}).items()}
+                self.b = {k: float(v) for k, v in data.get("b", {}).items()}
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            import json
+            json.dump({"w": {k: v.tolist() for k, v in self.w.items()}, "b": self.b}, open(self.cfg.state_path, "w"))
+        except Exception:
+            pass
+
+    def _ensure(self, sym: str):
+        if sym not in self.w:
+            self.w[sym] = np.zeros(self.n, dtype=float)
+            self.b[sym] = 0.0
+
+    def _sigmoid(self, x: float) -> float:
+        return float(1.0 / (1.0 + np.exp(-x)))
+
+    def predict(self, X: pd.DataFrame) -> pd.Series:
+        probs = {}
+        for sym, row in X.iterrows():
+            self._ensure(sym)
+            z = float(np.dot(self.w[sym], row.values) + self.b[sym])
+            probs[sym] = self._sigmoid(z)
+        return pd.Series(probs).reindex(X.index)
+
+    def update(self, X: pd.DataFrame, y: pd.Series):
+        lr = float(self.cfg.learning_rate)
+        l2 = float(self.cfg.l2)
+        for sym, row in X.iterrows():
+            if sym not in y.index:
+                continue
+            target = float(y.loc[sym])
+            self._ensure(sym)
+            z = float(np.dot(self.w[sym], row.values) + self.b[sym])
+            p = self._sigmoid(z)
+            grad_w = (p - target) * row.values + l2 * self.w[sym]
+            grad_b = (p - target)
+            self.w[sym] = self.w[sym] - lr * grad_w
+            self.b[sym] = self.b[sym] - lr * grad_b
+        self._save()
+
+def _build_meta_features(
+    zscores: pd.Series,
+    closes: pd.DataFrame | None = None,
+    next_funding_bps: pd.Series | None = None,
+    breakout_len: int = 96,
+    vol_len: int = 48,
+) -> pd.DataFrame:
+    idx = list(zscores.index)
+    feats = pd.DataFrame(index=idx, columns=["abs_z","sign","vol_look","breakout","funding_bps"], dtype=float)
+    feats["abs_z"] = zscores.abs().astype(float)
+    feats["sign"]  = np.sign(zscores).astype(float)
+    feats["funding_bps"] = (pd.Series(next_funding_bps).reindex(idx).astype(float).fillna(0.0)
+                            if next_funding_bps is not None else 0.0)
+    if closes is not None and not getattr(closes, "empty", True):
+        px = closes.reindex(columns=idx).ffill().bfill()
+        r = np.log(px/px.shift(1))
+        vol = r.rolling(int(vol_len)).std().iloc[-1].reindex(idx).astype(float)
+        feats["vol_look"] = vol.fillna(float(np.nanmedian(vol))) if len(vol.dropna()) else 0.0
+        wind = int(breakout_len)
+        hi = px.tail(wind).max()
+        lo = px.tail(wind).min()
+        last = px.tail(1).iloc[0]
+        denom = (hi - lo).replace(0, np.nan)
+        br = ((last - lo) / denom * 2.0 - 1.0).clip(-1,1).reindex(idx)
+        feats["breakout"] = br.fillna(0.0).values
+    else:
+        feats["vol_look"] = 0.0
+        feats["breakout"] = 0.0
+    return feats.fillna(0.0).astype(float)
+
+def _filter_by_meta(zscores: pd.Series, cfg: dict, *, closes: pd.DataFrame | None, next_funding_bps: pd.Series | None) -> tuple[pd.Series, dict]:
+    st = (cfg or {}).get("strategy", {}) or {}
+    ml = st.get("meta_label", {}) or {}
+    meta = {"meta_label_applied": False}
+    if not bool(ml.get("enabled", False)):
+        return zscores, meta
+    feats = _build_meta_features(
+        zscores,
+        closes=closes,
+        next_funding_bps=next_funding_bps,
+        breakout_len=int(ml.get("breakout_len", 96)),
+        vol_len=int(ml.get("vol_len", 48)),
+    )
+    model = _OnlineMetaLabeler(_MetaCfg(
+        enabled=True,
+        min_prob=float(ml.get("min_prob", 0.55)),
+        learning_rate=float(ml.get("learning_rate", 0.05)),
+        l2=float(ml.get("l2", 1e-3)),
+        feature_names=list(feats.columns),
+        state_path=str(ml.get("state_path", "meta_label_state.json"))
+    ))
+    p = model.predict(feats)
+    thr = float(ml.get("min_prob", 0.55))
+    mask = (p >= thr)
+    z = zscores.copy().astype(float)
+    z.loc[~mask.reindex(z.index).fillna(False)] = 0.0
+    meta["meta_label_applied"] = True
+    meta["kept"] = int(mask.sum())
+    meta["blocked"] = int((~mask).sum())
+    return z, meta
