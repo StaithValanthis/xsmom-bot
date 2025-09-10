@@ -648,10 +648,12 @@ def finalize_weights_pipeline(
     avg_pair_corr: float | None = None,
     vol_z: float | None = None,
     tickers: dict | None = None,
-    equity_usdt: float | None = None
+    equity_usdt: float | None = None,
+    prices_df: pd.DataFrame | None = None
 ) -> pd.Series:
     """
     Post-processing pipeline to be called after build_targets():
+      0) Correlation-cluster diversification (optional)
       1) Liquidity & notional caps (back-compat via apply_liquidity_caps)
       2) Sleeve constraints (e.g., meme max_total_weight)
       3) Conviction-weighted Kelly scaling (uses `scores`)
@@ -660,6 +662,22 @@ def finalize_weights_pipeline(
     """
     import numpy as np
     w = targets.copy().astype(float).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    # 0) Correlation-cluster diversification (top-K per cluster)
+    try:
+        st = (cfg or {}).get("strategy", {}) or {}
+        cd = st.get("cluster_diversify", {}) or {}
+        if bool(cd.get("enabled", False)) and prices_df is not None and not getattr(prices_df, "empty", True):
+            w = _apply_cluster_diversification(
+                w,
+                prices_df.loc[:, w.index],
+                lookback=int(cd.get("lookback", 240)),
+                corr_threshold=float(cd.get("corr_threshold", 0.75)),
+                max_per_cluster=int(cd.get("max_per_cluster", 2)),
+            )
+    except Exception:
+        pass
+
 
     # 1) Liquidity caps
     st = (cfg or {}).get("strategy", {}) or {}

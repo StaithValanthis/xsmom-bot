@@ -190,6 +190,20 @@ strategy:
     breakout_len: 96
     vol_len: 48
     state_path: meta_label_state.json
+  trailing:
+    adaptive:
+      enabled: false
+      base_mult: 1.0
+      by_vol:
+        low: 0.9
+        mid: 1.0
+        high: 1.2
+      ema:
+        len: 200
+        slope_min_bps_per_day: 0.0
+        use_abs: false
+        bull_mult: 0.95
+        bear_mult: 1.1
 liquidity:
   adv_cap_pct: 0.08
   notional_cap_usdt: 20000.0
@@ -308,6 +322,8 @@ optimizer:
     lookback_bars: 600
     objective: sharpe
     max_params: 256
+  last_best_params: {}
+  last_updated: null
 paths:
   state_path: /opt/xsmom-bot/state.json
   logs_dir: /opt/xsmom-bot/logs
@@ -316,4 +332,3 @@ logging:
   level: INFO
   file_max_mb: 20
   file_backups: 5
-  

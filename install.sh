@@ -2,60 +2,42 @@
 set -euo pipefail
 
 # =========================
-# Configurable parameters
+# XSMOM Bot Installer
+# Installs the app under /opt/xsmom-bot (default), creates venv, seeds config,
+# installs/patches systemd units for:
+#   - xsmom-bot.service
+#   - xsmom-optimizer.service (+ timer)
+# Idempotent: safe to re-run after pulling updates.
 # =========================
+
 APP_NAME="xsmom-bot"
-DEFAULT_APP_DIR="/opt/${APP_NAME}"
-PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
-RUN_AS="${RUN_AS:-ubuntu}"        # change if you run as another user
-RUN_GROUP="${RUN_GROUP:-$RUN_AS}"
-SERVICE_NAME="${APP_NAME}"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-START_NOW="${START_NOW:-ask}"      # ask | yes | no
-RUN_NONINTERACTIVE="${RUN_NONINTERACTIVE:-0}"
+SERVICE_NAME="xsmom-bot"
+DEFAULT_APP_DIR="/opt/xsmom-bot"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+RUN_AS="${RUN_AS:-ubuntu}"
+RUN_GROUP="${RUN_GROUP:-${RUN_AS}}"
+START_NOW="${START_NOW:-ask}"           # yes|no|ask
+SERVICE_DRY="${SERVICE_DRY:-1}"         # 1 => --dry on bot service
+OPTIMER_CALENDAR="${OPTIMER_CALENDAR:-*-*-* 00:30:00}"
+OPT_ENV_FILE="/etc/default/xsmom-optimizer"
 
-# 1 = dry-run (default, safe), 0 = live trading
-SERVICE_DRY="${SERVICE_DRY:-1}"
+info(){ echo -e "\033[1;32m[+]\033[0m $*"; }
+warn(){ echo -e "\033[1;33m[!]\033[0m $*"; }
+die(){ echo -e "\033[1;31m[x]\033[0m $*"; exit 1; }
 
-# =========================
-# Helpers
-# =========================
-info(){ echo "[*] $*"; }
-warn(){ echo "[!] $*" >&2; }
-die(){ echo "[x] $*" >&2; exit 1; }
-
-ensure_dir_owned() {
+ensure_dir_owned(){
   local d="$1"
   sudo mkdir -p "$d"
   sudo chown -R "${RUN_AS}:${RUN_GROUP}" "$d"
 }
 
-seed_local_if_missing() {
-  mkdir -p config src systemd state logs tests
-
-  if [ ! -f ".env.example" ]; then
-    cat > .env.example <<'EOF'
-BYBIT_API_KEY=
-BYBIT_API_SECRET=
-PYTHONUNBUFFERED=1
-PYTHONDONTWRITEBYTECODE=1
-EOF
-  fi
-
-  if [ ! -f "requirements.txt" ]; then
-    cat > requirements.txt <<'EOF'
-ccxt>=4.1,<5
-pandas==2.2.2
-numpy==1.26.4
-tenacity==8.5.0
-pydantic==2.8.2
-python-dateutil==2.9.0.post0
-PyYAML==6.0.2
-EOF
-  fi
-
-  if [ ! -f "config/config.yaml.example" ]; then
-    cat > config/config.yaml.example <<'EOF'
+seed_local_if_missing(){
+  # Ensure minimal tree exists in repo (for rsync convenience)
+  mkdir -p config logs state systemd src tests || true
+  touch logs/.gitkeep state/.gitkeep || true
+  # If there is no example config, stub one
+  if [ ! -f config/config.yaml.example ]; then
+    cat > config/config.yaml.example <<'YAML'
 exchange:
   id: bybit
   account_type: swap
@@ -63,139 +45,84 @@ exchange:
   only_perps: true
   unified_margin: true
   testnet: false
-  max_symbols: 80
-  min_usd_volume_24h: 5000000
-  min_price: 0.005
-  timeframe: "1h"
+  max_symbols: 30
+  min_usd_volume_24h: 20000000
+  min_price: 0.03
+  timeframe: 1h
   candles_limit: 1500
 strategy:
-  lookbacks: [1, 6, 24]
-  lookback_weights: [1.0, 1.0, 1.0]
-  vol_lookback: 72
-  k_min: 8
-  k_max: 24
+  ensemble:
+    enabled: true
+    weights: {xsec: 0.6, ts: 0.2, breakout: 0.2}
+    ts_len: 48
+    breakout_len: 96
+  funding_trim:
+    enabled: true
+    threshold_bps: 1.8
+    slope_per_bps: 0.15
+    max_reduction: 0.5
+  confirmation:
+    enabled: true
+    lookback_bars: 2
+    z_boost: 0.0
+  signal_power: 1.35
+  lookbacks: [12,24,48,96]
+  lookback_weights: [0.4,0.3,0.2,0.1]
+  vol_lookback: 96
+  k_min: 2
+  k_max: 8
   market_neutral: true
-  gross_leverage: 1.5
-  max_weight_per_asset: 0.08
-  regime_filter:
+  gross_leverage: 1.8
+  max_weight_per_asset: 0.1
+  entry_zscore_min: 0.45
+  regime_filter: {enabled: true, ema_len: 200, slope_min_bps_per_day: 2.0, use_abs: false}
+  adx_filter:
     enabled: true
-    ema_len: 200
-    slope_min_bps_per_day: 4
-  funding_tilt:
+    len: 14
+    min_adx: 20.0
+    require_rising: false
+    use_di_alignment: true
+    min_di_separation: 0.0
+    di_hysteresis_bps: 0.0
+  symbol_filter:
     enabled: true
-    weight: 0.15
-liquidity:
-  adv_cap_pct: 0.002
-  notional_cap_usdt: 40000
-execution:
-  order_type: limit
-  post_only: true
-  price_offset_bps: 3
-  slippage_bps_guard: 20
-  set_leverage: 3
-  rebalance_minute: 5
-  poll_seconds: 15
+    whitelist: []
+    banlist: []
+    score:
+      enabled: true
+      min_sample_trades: 8
+      ema_alpha: 0.2
+      min_win_rate_pct: 38.0
+      min_pf: 1.05
+      min_pnl_usd: -250.0
+      decay_bps_per_day: 3.0
+      ban_duration_days: 5
+      downweight_floor: 0.25
 risk:
-  atr_mult_sl: 2.0
-  atr_mult_tp: 3.5
-  use_tp: true
-  max_daily_loss_pct: 2.5
-  trade_disable_minutes: 720
-costs:
-  taker_fee_bps: 6.0
-  maker_fee_bps: 1.0
-  slippage_bps: 3.0
-  funding_bps_per_day: 0.8
-paths:
-  state_path: "state/state.json"
-  logs_dir: "logs"
+  max_drawdown_pct: 25.0
+  dd_stepdown:
+    enabled: true
+    thresholds: [5, 10, 15, 20]
+    scalers:   [0.9, 0.8, 0.6, 0.4]
+  vol_target:
+    enabled: true
+    annual_vol_pct: 18.0
 logging:
   level: INFO
-  file_max_mb: 20
-  file_backups: 5
-EOF
-  fi
-
-  if [ ! -f "systemd/${SERVICE_NAME}.service" ]; then
-    cat > "systemd/${SERVICE_NAME}.service" <<'EOF'
-[Unit]
-Description=Multi-pair XSMOM Crypto Bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=ubuntu
-Group=ubuntu
-WorkingDirectory=/opt/xsmom-bot
-EnvironmentFile=/opt/xsmom-bot/.env
-ExecStart=/opt/xsmom-bot/venv/bin/python -m src.main live --config /opt/xsmom-bot/config/config.yaml --dry
-Restart=always
-RestartSec=10
-LimitNOFILE=65535
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
+paths:
+  state_path: /opt/xsmom-bot/state
+  logs_dir: /opt/xsmom-bot/logs
+YAML
   fi
 }
 
-normalize_destination_tree() {
+normalize_destination_tree(){
   local dest="$1"
-  sudo mkdir -p "${dest}/config" "${dest}/src" "${dest}/systemd" "${dest}/state" "${dest}/logs"
+  sudo mkdir -p "${dest}/config" "${dest}/logs" "${dest}/state" "${dest}/systemd"
   sudo chown -R "${RUN_AS}:${RUN_GROUP}" "${dest}"
-
-  if [ -f "${dest}/config.yaml.example" ]; then
-    sudo mv "${dest}/config.yaml.example" "${dest}/config/"
-  fi
-  if [ -f "${dest}/config.yaml" ]; then
-    sudo mv "${dest}/config.yaml" "${dest}/config/"
-  fi
-  if [ -f "${dest}/${SERVICE_NAME}.service" ]; then
-    sudo mv "${dest}/${SERVICE_NAME}.service" "${dest}/systemd/"
-  fi
-
-  for f in __init__.py backtester.py config.py exchange.py live.py main.py risk.py signals.py utils.py; do
-    if [ -f "${dest}/${f}" ]; then
-      sudo mv "${dest}/${f}" "${dest}/src/"
-    fi
-  done
-  if [ -f "${dest}/sizing.py" ]; then
-    sudo mv "${dest}/sizing.py" "${dest}/src/sizing.py"
-  fi
 }
 
-ensure_active_config() {
-  local dest="$1"
-  if [ ! -f "${dest}/config/config.yaml" ]; then
-    if [ -f "${dest}/config/config.yaml.example" ]; then
-      sudo -u "${RUN_AS}" cp "${dest}/config/config.yaml.example" "${dest}/config/config.yaml"
-    else
-      warn "config.yaml.example missing at ${dest}/config; seeding a minimal config.yaml"
-      sudo -u "${RUN_AS}" tee "${dest}/config/config.yaml" >/dev/null <<'EOF'
-exchange: {id: bybit, account_type: swap, quote: USDT, only_perps: true, unified_margin: true, testnet: false,
-  max_symbols: 80, min_usd_volume_24h: 5000000, min_price: 0.005, timeframe: "1h", candles_limit: 1500}
-strategy: {lookbacks: [1,6,24], lookback_weights: [1,1,1], vol_lookback: 72, k_min: 8, k_max: 24,
-  market_neutral: true, gross_leverage: 1.5, max_weight_per_asset: 0.08,
-  regime_filter: {enabled: true, ema_len: 200, slope_min_bps_per_day: 4},
-  funding_tilt: {enabled: true, weight: 0.15}}
-liquidity: {adv_cap_pct: 0.002, notional_cap_usdt: 40000}
-execution: {order_type: limit, post_only: true, price_offset_bps: 3, slippage_bps_guard: 20,
-  set_leverage: 3, rebalance_minute: 5, poll_seconds: 15}
-risk: {atr_mult_sl: 2.0, atr_mult_tp: 3.5, use_tp: true, max_daily_loss_pct: 2.5, trade_disable_minutes: 720}
-costs: {taker_fee_bps: 6.0, maker_fee_bps: 1.0, slippage_bps: 3.0, funding_bps_per_day: 0.8}
-paths: {state_path: "state/state.json", logs_dir: "logs"}
-logging: {level: INFO, file_max_mb: 20, file_backups: 5}
-EOF
-    fi
-  fi
-}
-
-ensure_env_file() {
+ensure_env_file(){
   local dest="$1"
   if [ ! -f "${dest}/.env" ]; then
     if [ -f "${dest}/.env.example" ]; then
@@ -213,7 +140,18 @@ EOF
   fi
 }
 
-fix_service_user_and_paths() {
+ensure_active_config(){
+  local dest="$1"
+  if [ ! -f "${dest}/config/config.yaml" ]; then
+    if [ -f "${dest}/config/config.yaml.example" ]; then
+      sudo -u "${RUN_AS}" cp "${dest}/config/config.yaml.example" "${dest}/config/config.yaml"
+    else
+      die "Missing ${dest}/config/config.yaml(.example)."
+    fi
+  fi
+}
+
+fix_service_user_and_paths(){
   local dest="$1"
   local svc="${dest}/systemd/${SERVICE_NAME}.service"
 
@@ -256,6 +194,87 @@ EOF
   sudo sed -i "s|^ExecStart=.*|ExecStart=${dest}/venv/bin/python -m src.main live ${EXEC_FLAGS}|" "$svc"
 }
 
+install_optimizer_units(){
+  local dest="$1"
+
+  # Environment defaults for the optimizer grid
+  if [ ! -f "${OPT_ENV_FILE}" ]; then
+    sudo tee "${OPT_ENV_FILE}" >/dev/null <<'ENV'
+# JSON grid for optimizer_cli (quote the value if editing in shell)
+GRID={"k":[2,4,6,8],"gross":[0.8,1.0,1.2]}
+# Optional: override optimizer OnCalendar (systemd timer) via OPTIMER_CALENDAR env to install.sh
+ENV
+    sudo chown root:root "${OPT_ENV_FILE}"
+    sudo chmod 0644 "${OPT_ENV_FILE}"
+  fi
+
+  # Prefer repo-provided units if they exist; otherwise, seed robust defaults.
+  local svc_repo="${dest}/systemd/xsmom-optimizer.service"
+  local tim_repo="${dest}/systemd/xsmom-optimizer.timer"
+
+  if [ ! -f "${svc_repo}" ]; then
+    cat > /tmp/xsmom-optimizer.service <<EOF
+[Unit]
+Description=XSMOM daily optimizer (purged-CV walk-forward)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=${RUN_AS}
+Group=${RUN_GROUP}
+WorkingDirectory=${dest}
+EnvironmentFile=-${OPT_ENV_FILE}
+# Sanitise GRID for python -m src.optimizer_cli
+ExecStart=${dest}/venv/bin/python -m src.optimizer_cli --config ${dest}/config/config.yaml --objective sharpe --splits 3 --embargo 0.02 --max-symbols 20 --grid "\$GRID"
+StandardOutput=append:/var/log/xsmom-optimizer.log
+StandardError=append:/var/log/xsmom-optimizer.log
+Nice=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo mv /tmp/xsmom-optimizer.service /etc/systemd/system/xsmom-optimizer.service
+  else
+    sudo cp "${svc_repo}" "/etc/systemd/system/xsmom-optimizer.service"
+  fi
+
+  if [ ! -f "${tim_repo}" ]; then
+    cat > /tmp/xsmom-optimizer.timer <<EOF
+[Unit]
+Description=Run XSMOM optimizer daily and at boot
+
+[Timer]
+OnBootSec=3min
+OnCalendar=${OPTIMER_CALENDAR}
+Persistent=true
+Unit=xsmom-optimizer.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    sudo mv /tmp/xsmom-optimizer.timer /etc/systemd/system/xsmom-optimizer.timer
+  else
+    sudo cp "${tim_repo}" "/etc/systemd/system/xsmom-optimizer.timer"
+  fi
+
+  # Back-compat: if older xsmom-opt.* units ship in repo, install them too.
+  if [ -f "${dest}/systemd/xsmom-opt.service" ]; then
+    sudo cp "${dest}/systemd/xsmom-opt.service" "/etc/systemd/system/xsmom-opt.service"
+  fi
+  if [ -f "${dest}/systemd/xsmom-opt.timer" ]; then
+    sudo cp "${dest}/systemd/xsmom-opt.timer" "/etc/systemd/system/xsmom-opt.timer"
+  fi
+
+  # Ensure log file exists and is writable by the service user
+  sudo touch /var/log/xsmom-optimizer.log
+  sudo chown "${RUN_AS}:${RUN_GROUP}" /var/log/xsmom-optimizer.log
+}
+
 # =========================
 # Begin installation
 # =========================
@@ -291,8 +310,9 @@ sudo chown -R "${RUN_AS}:${RUN_GROUP}" "${APP_DIR}"
 
 info "Creating Python venv and installing requirements..."
 sudo -u "${RUN_AS}" "${PYTHON_BIN}" -m venv "${APP_DIR}/venv"
-sudo -u "${RUN_AS}" "${APP_DIR}/venv/bin/pip" install --upgrade pip
-if grep -q '^tccxt' "${APP_DIR}/requirements.txt"; then
+sudo -u "${RUN_AS}" "${APP_DIR}/venv/bin/pip" install --upgrade pip wheel
+# A few repos mis-typed 'tccxt' historically; auto-fix
+if grep -q '^tccxt' "${APP_DIR}/requirements.txt" 2>/dev/null; then
   sudo sed -i 's/^tccxt/ccxt/' "${APP_DIR}/requirements.txt"
 fi
 sudo -u "${RUN_AS}" "${APP_DIR}/venv/bin/pip" install -r "${APP_DIR}/requirements.txt"
@@ -305,28 +325,22 @@ ensure_active_config "${APP_DIR}"
 
 info "Installing systemd service..."
 fix_service_user_and_paths "${APP_DIR}"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 sudo cp "${APP_DIR}/systemd/${SERVICE_NAME}.service" "${SERVICE_FILE}"
 
-# Install optimizer service + timer
-if [ -f "${APP_DIR}/systemd/xsmom-opt.service" ]; then
-  sudo cp "${APP_DIR}/systemd/xsmom-opt.service" "/etc/systemd/system/xsmom-opt.service"
-fi
-if [ -f "${APP_DIR}/systemd/xsmom-opt.timer" ]; then
-  sudo cp "${APP_DIR}/systemd/xsmom-opt.timer" "/etc/systemd/system/xsmom-opt.timer"
-fi
+info "Installing optimizer service + timer..."
+install_optimizer_units "${APP_DIR}"
 
 sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE_NAME}"
 
-# Enable optimizer timer if present
-if systemctl list-unit-files | grep -q "^xsmom-opt.timer"; then
-  sudo systemctl enable xsmom-opt.timer || true
-  sudo systemctl start xsmom-opt.timer || true
-  info "Optimizer timer enabled (xsmom-opt.timer)."
-fi
+# Enable optimizer timer
+sudo systemctl enable xsmom-optimizer.timer || true
+sudo systemctl start xsmom-optimizer.timer || true
+info "Optimizer timer enabled (xsmom-optimizer.timer)."
 
 # Start service now?
-if [ "${RUN_NONINTERACTIVE}" = "1" ] || [ "${START_NOW}" = "yes" ]; then
+if [ "${START_NOW}" = "yes" ]; then
   info "Starting service..."
   sudo systemctl start "${SERVICE_NAME}"
   info "Service started. Tail logs with: journalctl -u ${SERVICE_NAME} -f -o cat"
@@ -363,3 +377,5 @@ echo "  sudo systemctl status ${SERVICE_NAME}"
 echo "  sudo systemctl restart ${SERVICE_NAME}"
 echo "  sudo systemctl stop ${SERVICE_NAME}"
 echo "  journalctl -u ${SERVICE_NAME} -f -o cat"
+echo
+echo "Optimizer logs: tail -f /var/log/xsmom-optimizer.log"
