@@ -5,11 +5,14 @@ exchange:
   only_perps: true
   unified_margin: true
   testnet: false
-  max_symbols: 30
-  min_usd_volume_24h: 20000000
+  max_symbols: 36
+  min_usd_volume_24h: 30000000
   min_price: 0.03
   timeframe: 1h
   candles_limit: 1500
+  recv_window_ms: 10000
+  include_symbols: []
+  exclude_symbols: []
 strategy:
   ensemble:
     enabled: true
@@ -30,21 +33,19 @@ strategy:
     z_boost: 0.0
   signal_power: 1.35
   lookbacks:
-  - 12
+  - 1
+  - 6
   - 24
-  - 48
-  - 96
   lookback_weights:
-  - 0.4
-  - 0.3
-  - 0.2
-  - 0.1
+  - 1.0
+  - 1.0
+  - 1.0
   vol_lookback: 96
   k_min: 2
   k_max: 8
   market_neutral: true
-  gross_leverage: 1.8
-  max_weight_per_asset: 0.1
+  gross_leverage: 1.1
+  max_weight_per_asset: 0.14
   entry_zscore_min: 0.45
   regime_filter:
     enabled: true
@@ -95,7 +96,7 @@ strategy:
   diversify:
     enabled: true
     corr_lookback: 48
-    max_pair_corr: 0.9
+    max_pair_corr: 0.85
   vol_target:
     enabled: true
     target_daily_vol_bps: 100.0
@@ -204,6 +205,76 @@ strategy:
         use_abs: false
         bull_mult: 0.95
         bear_mult: 1.1
+  dynamic_k: true
+  dispersion_gate: 0.6
+  breadth_gate_frac: 0.2
+  carry:
+    enabled: true
+    budget_frac: 0.25
+    hedge_market_neutral: true
+    per_asset_cap: 0.14
+    funding:
+      use: true
+      min_percentile_30d: 0.8
+      sign_stability_k: 5
+      min_abs_rate_8h: 0.0002
+    basis:
+      use: true
+      min_annualized: 0.05
+      min_zscore: 0.8
+  risk:
+    target_daily_vol_bps: 60
+    vol_clamp_min: 0.6
+    vol_clamp_max: 1.3
+    fractional_kelly: 0.5
+    dd_soft_kill:
+      enabled: true
+      lookback_days: 30
+      soft_kill_at_drawdown: 0.12
+      resume_after_minutes: 120
+  gates:
+    microstructure:
+      enabled: true
+      max_spread_bps: 15
+      min_top_of_book_depth_usd: 1500
+    adx:
+      enabled: true
+      length: 14
+      min_adx: 15
+      rising_only: true
+    regime:
+      enabled: true
+      ema_fast: 12
+      ema_slow: 48
+      slope_min: 0.0
+    time_of_day:
+      enabled: true
+      timezone: Australia/Brisbane
+      allowed_hours:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+      - 10
+      - 11
+      - 12
+      - 13
+      - 14
+      - 15
+      - 16
+      - 17
+      - 18
+      - 19
+      - 20
+      - 21
+      - 22
+      - 23
 liquidity:
   adv_cap_pct: 0.08
   notional_cap_usdt: 20000.0
@@ -219,7 +290,7 @@ execution:
   align_after_funding_minutes: 0
   funding_hours_utc: []
   min_notional_per_order_usdt: 5.0
-  min_rebalance_delta_bps: 1.0
+  min_rebalance_delta_bps: 1.5
   cancel_open_orders_on_start: false
   stale_orders:
     enabled: false
@@ -242,6 +313,16 @@ execution:
     min_obi: 0.15
     max_spread_bps: 8.0
   bump_to_exchange_min: true
+  offset_mode: dynamic
+  offset_bps_min: 0.5
+  offset_bps_max: 2.5
+  spread_guard_bps_max: 15
+  min_order_notional_usd: 5.0
+  cancel_stale_after_seconds: 15
+  retry:
+    enabled: true
+    on_request_timeout: 1
+    backoff_seconds: 1
 risk:
   atr_len: 28
   atr_mult_sl: 2.0
@@ -332,3 +413,5 @@ logging:
   level: INFO
   file_max_mb: 20
   file_backups: 5
+  audit_unknown_keys: true
+sleeve_constraints: {}
