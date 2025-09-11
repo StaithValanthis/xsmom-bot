@@ -1,9 +1,4 @@
-# signals.py — v1.4 (2025-09-11)
-# Implements:
-# - Ensemble blend + funding trim in prepare_zscores_for_selection
-# - Shock-mode entry bump in dynamic entry band resolution
-# - Optional meta-labeler gate before final entry/breadth gating
-# - Helper: compute_trailing_scaler() for adaptive MA+ATR trailing stops
+# signals.py — v1.3 (2025-09-04)
 # Added:
 # - helper to compute volatility "tier" for adaptive risk if needed externally
 # - (no breaking changes)
@@ -119,38 +114,6 @@ def volatility_tier(atr_pct: float, low_thr_bps: float=40.0, high_thr_bps: float
         return "high"
     return "mid"
 
-def compute_trailing_scaler(close: pd.Series, cfg: dict, atr_pct: float | None = None) -> float:
-    """
-    Compute a trailing stop multiplier based on regime (EMA slope) and volatility tier.
-    Config keys (all optional):
-      strategy.trailing.adaptive.enabled: bool
-      strategy.trailing.adaptive.base_mult: float (default 1.0)
-      strategy.trailing.adaptive.by_vol: {low:0.9, mid:1.0, high:1.2}
-      strategy.trailing.adaptive.ema: {len:200, slope_min_bps_per_day:0.0, use_abs:false, bull_mult:0.95, bear_mult:1.10}
-    Returns a float multiplier (clipped to [0.5, 2.0]).
-    """
-    try:
-        st = (cfg or {}).get("strategy", {}) or {}
-        ta = ((st.get("trailing", {}) or {}).get("adaptive", {}) or {})
-        if not bool(ta.get("enabled", False)):
-            return 1.0
-        base = float(ta.get("base_mult", 1.0))
-        vol_map = ta.get("by_vol", {"low":0.9, "mid":1.0, "high":1.2})
-        ema_cfg = ta.get("ema", {"len":200, "slope_min_bps_per_day":0.0, "use_abs":False, "bull_mult":0.95, "bear_mult":1.10})
-        tier = "mid"
-        if atr_pct is not None:
-            tier = volatility_tier(float(atr_pct))
-        mult = float(vol_map.get(tier, 1.0)) * base
-        # Regime adjustment
-        try:
-            ok = regime_ok(close, int(ema_cfg.get("len", 200)), float(ema_cfg.get("slope_min_bps_per_day", 0.0)), use_abs=bool(ema_cfg.get("use_abs", False)))
-        except Exception:
-            ok = True
-        mult *= float(ema_cfg.get("bull_mult", 0.95)) if ok else float(ema_cfg.get("bear_mult", 1.10))
-        return float(max(0.5, min(2.0, mult)))
-    except Exception:
-        return 1.0
-
 # NOTE (auto-wiring):
 # If your eligibility step didn't match our pattern, call this explicitly where you
 # finalize zscores and before selection:
@@ -159,44 +122,23 @@ def compute_trailing_scaler(close: pd.Series, cfg: dict, atr_pct: float | None =
 
 
 # ================= Adaptive entry band + breadth gate + one-call pipeline =================
-
 def _resolve_entry_threshold_from_cfg(cfg: dict, *, avg_pair_corr: float | None = None, atr_pct: float | None = None, default: float = 0.55) -> float:
     try:
         st = (cfg or {}).get("strategy", {}) or {}
         dyn = st.get("dynamic_entry_band", {}) or {}
-        zmin = None
         if bool(dyn.get("enabled", False)) and avg_pair_corr is not None:
             hi = dyn.get("high_corr",  {"threshold": 0.75, "zmin": 0.70})
             md = dyn.get("mid_corr",   {"threshold": 0.60, "zmin": 0.60})
             lo = dyn.get("low_corr",   {"threshold": 0.45, "zmin": 0.50})
             c = float(avg_pair_corr)
             if c >= float(hi.get("threshold", 0.75)):
-                zmin = float(hi.get("zmin", 0.70))
-            elif c >= float(md.get("threshold", 0.60)):
-                zmin = float(md.get("zmin", 0.60))
-            elif c >= float(lo.get("threshold", 0.45)):
-                zmin = float(lo.get("zmin", 0.50))
-        if zmin is None:
-            nb = st.get("no_trade_bands", {}) or {}
-            zmin = float(nb.get("z_entry", default))
-        # Shock-mode bump: temporarily widen entry band
-        sm = st.get("shock_mode", {}) or {}
-        if bool(sm.get("enabled", False)):
-            bump = float(sm.get("entry_z_bump", 0.0))
-            corr_thr = float(sm.get("corr_threshold", 0.85))
-            atr_bps_thr = float(sm.get("atr_bps_threshold", 120.0))
-            trigger = False
-            if avg_pair_corr is not None and float(avg_pair_corr) >= corr_thr:
-                trigger = True
-            if not trigger and atr_pct is not None:
-                try:
-                    if float(atr_pct) * 10_000.0 >= atr_bps_thr:
-                        trigger = True
-                except Exception:
-                    pass
-            if trigger and bump > 0:
-                zmin += bump
-        return float(zmin)
+                return float(hi.get("zmin", 0.70))
+            if c >= float(md.get("threshold", 0.60)):
+                return float(md.get("zmin", 0.60))
+            if c >= float(lo.get("threshold", 0.45)):
+                return float(lo.get("zmin", 0.50))
+        nb = st.get("no_trade_bands", {}) or {}
+        return float(nb.get("z_entry", default))
     except Exception:
         return float(default)
 
@@ -292,8 +234,42 @@ def compute_avg_pair_corr(prices, lookback: int = 48) -> float:
 
 
 # ================= Convenience wrapper for callers =================
+
+def _compute_base_xsec_z(prices_df: pd.DataFrame, cfg: dict | None = None) -> pd.Series:
+    """
+    Compute cross-sectional z from weighted multi-lookback returns and apply z_power.
+    Uses strategy.lookbacks (default [1,6,24]) and lookback_weights (default [1.0,1.5,2.0]).
+    Returns last-row z^power series aligned to columns (symbols).
+    """
+    import numpy as np, pandas as pd
+    if prices_df is None or getattr(prices_df, "empty", True):
+        return pd.Series(dtype="float64")
+    st = (cfg or {}).get("strategy", {}) or {}
+    lookbacks = list(st.get("lookbacks", [1,6,24]))
+    weights   = list(st.get("lookback_weights", [1.0,1.5,2.0]))
+    z_power   = float(st.get("z_power", 1.35))
+    assert len(lookbacks) == len(weights), "strategy.lookbacks/weights length mismatch"
+    px = prices_df.ffill().bfill()
+    T, N = px.shape
+    S = 0.0
+    acc = None
+    vals = px.values
+    import numpy as np
+    for lb, w in zip(lookbacks, weights):
+        rr = np.zeros_like(vals, dtype=float)
+        if lb < T:
+            rr[lb:, :] = vals[lb:, :] / vals[:-lb, :] - 1.0
+        acc = (acc + w * rr) if acc is not None else (w * rr)
+    # cross-sectional z on last row
+    last = acc[-1, :] if acc is not None else np.zeros(N, dtype=float)
+    mu = float(np.nanmean(last)) if np.isfinite(last).any() else 0.0
+    sd = float(np.nanstd(last)) if np.isfinite(last).any() else 1.0
+    if sd == 0.0: sd = 1.0
+    z = (last - mu) / sd
+    z = np.sign(z) * (np.abs(z) ** z_power)
+    return pd.Series(z, index=px.columns, dtype="float64")
 def prepare_zscores_for_selection(
-    zscores: pd.Series,
+    zscores: pd.Series | None,
     cfg: dict,
     *,
     prices_df: Optional[pd.DataFrame] = None,
@@ -307,6 +283,17 @@ def prepare_zscores_for_selection(
     Returns: (zscores_ready, meta)
     """
     meta = {"ensemble_applied": False, "funding_trim_applied": False, "avg_pair_corr": None}
+
+    # ---- Base zscores (if none provided) ----
+    if zscores is None and prices_df is not None and not getattr(prices_df, "empty", True):
+        try:
+            zscores = _compute_base_xsec_z(prices_df, cfg)
+        except Exception:
+            pass
+    if zscores is None:
+        # as a last resort, return empty
+        import pandas as pd
+        zscores = pd.Series(dtype="float64")
 
     # ---- Ensemble (x-sec z + ts sign + breakout) ----
     try:
@@ -350,16 +337,6 @@ def prepare_zscores_for_selection(
             meta["funding_trim_applied"] = True
     except Exception:
         pass
-    # ---- Meta-labeler Gate (optional) ----
-    try:
-        st = (cfg or {}).get("strategy", {}) or {}
-        ml = st.get("meta_label", {}) or {}
-        if bool(ml.get("enabled", False)):
-            zscores, ml_meta = _filter_by_meta(pd.Series(zscores), cfg, closes=prices_df, next_funding_bps=(pd.Series(next_funding_bps) if next_funding_bps is not None else None))
-            meta.update(ml_meta)
-    except Exception:
-        pass
-
 
     # ---- Avg pairwise corr for gating ----
     avg_corr = None

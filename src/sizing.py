@@ -254,7 +254,8 @@ def build_targets(
     strategy_cfg: StrategyCfg,
     prev_weights: Optional[pd.Series] = None,
     returns: Optional[pd.DataFrame] = None,
-    weights_history: Optional[pd.DataFrame] = None
+    weights_history: Optional[pd.DataFrame] = None,
+    zscores_ready: Optional[pd.Series] = None
 ) -> pd.Series:
     """
     Main entry: compute target weights for the latest bar using:
@@ -272,15 +273,17 @@ def build_targets(
     symbols = list(prices.columns)
     latest_ts = prices.index[-1]
 
-    # Compute scores (z^power)
-    scores = compute_signal_scores(
-        prices,
-        list(strategy_cfg.lookbacks),
-        list(strategy_cfg.lookback_weights),
-        strategy_cfg.z_power
-    )
-
-    z = scores.iloc[-1].values.copy()
+    # Compute or accept precomputed z-scores
+    if zscores_ready is not None and not zscores_ready.empty:
+        z = zscores_ready.reindex(symbols).fillna(0.0).astype(float).values.copy()
+    else:
+        scores = compute_signal_scores(
+            prices,
+            list(strategy_cfg.lookbacks),
+            list(strategy_cfg.lookback_weights),
+            strategy_cfg.z_power
+        )
+        z = scores.iloc[-1].values.copy()
     z = _sanitize_vec(z)
 
     # Market neutral: de-mean cross-section before ranking
@@ -648,12 +651,10 @@ def finalize_weights_pipeline(
     avg_pair_corr: float | None = None,
     vol_z: float | None = None,
     tickers: dict | None = None,
-    equity_usdt: float | None = None,
-    prices_df: pd.DataFrame | None = None
+    equity_usdt: float | None = None
 ) -> pd.Series:
     """
     Post-processing pipeline to be called after build_targets():
-      0) Correlation-cluster diversification (optional)
       1) Liquidity & notional caps (back-compat via apply_liquidity_caps)
       2) Sleeve constraints (e.g., meme max_total_weight)
       3) Conviction-weighted Kelly scaling (uses `scores`)
@@ -662,22 +663,6 @@ def finalize_weights_pipeline(
     """
     import numpy as np
     w = targets.copy().astype(float).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-
-    # 0) Correlation-cluster diversification (top-K per cluster)
-    try:
-        st = (cfg or {}).get("strategy", {}) or {}
-        cd = st.get("cluster_diversify", {}) or {}
-        if bool(cd.get("enabled", False)) and prices_df is not None and not getattr(prices_df, "empty", True):
-            w = _apply_cluster_diversification(
-                w,
-                prices_df.loc[:, w.index],
-                lookback=int(cd.get("lookback", 240)),
-                corr_threshold=float(cd.get("corr_threshold", 0.75)),
-                max_per_cluster=int(cd.get("max_per_cluster", 2)),
-            )
-    except Exception:
-        pass
-
 
     # 1) Liquidity caps
     st = (cfg or {}).get("strategy", {}) or {}

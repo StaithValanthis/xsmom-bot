@@ -1881,7 +1881,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     else:
                         post_only = bool(getattr(cfg.execution, "post_only", True))
                         
-                                # --- Exec Alpha: spread guard + dynamic price ---
+        # --- Exec Alpha: spread guard + dynamic price ---
                         try:
                             # best bid/ask from exchange wrapper (prefer a direct method if available)
                             try:

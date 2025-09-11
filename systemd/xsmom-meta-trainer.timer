@@ -1,0 +1,11 @@
+# systemd/xsmom-meta-trainer.timer
+[Unit]
+Description=Run XSMOM meta-label trainer once per day
+
+[Timer]
+OnCalendar=01:20
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target
