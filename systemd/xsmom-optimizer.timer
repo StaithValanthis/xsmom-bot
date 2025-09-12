@@ -1,0 +1,11 @@
+[Unit]
+Description=Run XSMOM optimizer once per day
+
+[Timer]
+# Runs 03:15 local time (Australia/Brisbane in your case)
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

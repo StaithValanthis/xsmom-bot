@@ -1,0 +1,15 @@
+[Unit]
+Description=XSMOM optimizer (autotune via backtests)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/xsmom-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/xsmom-bot/venv/bin/python -m src.optimizer_runner \
+  --config /opt/xsmom-bot/config/config.yaml \
+  --objective sharpe \
+  --min-improve-rel 0.03 \
+  --require-no-worse-mdd \
+  --max-turnover-per-year 200
+# (adjust flags to your taste)

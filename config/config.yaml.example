@@ -293,7 +293,7 @@ execution:
   min_rebalance_delta_bps: 1.5
   cancel_open_orders_on_start: false
   stale_orders:
-    enabled: false
+    enabled: true
     cleanup_interval_sec: 60
     max_age_sec: 180
     reprice_if_far_bps: 15.0
