@@ -23,10 +23,10 @@ strategy:
     ts_len: 48
     breakout_len: 96
   funding_trim:
-    enabled: false
-    threshold_bps: 0.0
-    slope_per_bps: 0.0
-    max_reduction: 0.0
+    enabled: true
+    threshold_bps: 1.5
+    slope_per_bps: 0.10
+    max_reduction: 0.5
   confirmation:
     enabled: true
     lookback_bars: 2
@@ -46,16 +46,16 @@ strategy:
   market_neutral: true
   gross_leverage: 1.1
   max_weight_per_asset: 0.14
-  entry_zscore_min: 0.45
+  entry_zscore_min: 0.6
   regime_filter:
     enabled: true
     ema_len: 200
-    slope_min_bps_per_day: 2.0
+    slope_min_bps_per_day: 2.5
     use_abs: false
   adx_filter:
     enabled: true
     len: 14
-    min_adx: 20.0
+    min_adx: 25.0
     require_rising: false
     use_di_alignment: true
     min_di_separation: 0.0
@@ -64,6 +64,7 @@ strategy:
     enabled: true
     whitelist: []
     banlist: []
+    exclude: []
     score:
       enabled: true
       min_sample_trades: 8
@@ -82,7 +83,7 @@ strategy:
     enabled: false
     use_ema: true
     ema_alpha: 0.2
-    min_trades_per_hour: 5
+    min_trades_per_hour: 25
     min_hours_allowed: 6
     threshold_bps: 0.0
     fixed_hours: []
@@ -193,7 +194,7 @@ strategy:
     state_path: meta_label_state.json
   trailing:
     adaptive:
-      enabled: false
+      enabled: true
       base_mult: 1.0
       by_vol:
         low: 0.9
@@ -206,7 +207,8 @@ strategy:
         bull_mult: 0.95
         bear_mult: 1.1
   dynamic_k: true
-  dispersion_gate: 0.6
+  dispersion_gate:
+    threshold: 0.6
   breadth_gate_frac: 0.2
   carry:
     enabled: true
@@ -235,7 +237,7 @@ strategy:
   gates:
     microstructure:
       enabled: true
-      max_spread_bps: 15
+      max_spread_bps: 12
       min_top_of_book_depth_usd: 1500
     adx:
       enabled: true
@@ -282,7 +284,8 @@ execution:
   reload_positions_on_start: true
   order_type: limit
   post_only: true
-  price_offset_bps: 0.0
+  maker_ttl_secs: 25
+  price_offset_bps: 2.0
   slippage_bps_guard: 25.0
   set_leverage: 1
   rebalance_minute: 1
@@ -290,7 +293,14 @@ execution:
   align_after_funding_minutes: 0
   funding_hours_utc: []
   min_notional_per_order_usdt: 5.0
-  min_rebalance_delta_bps: 1.5
+  min_rebalance_delta_bps: 6.0
+  throttle:
+    min_seconds_between_entries_per_symbol: 180
+    max_entries_per_hour_per_symbol: 3
+    max_entries_per_day_per_symbol: 12
+  pyramiding:
+    enabled: false
+    allow_when_rr_ge: 0.8
   cancel_open_orders_on_start: false
   stale_orders:
     enabled: true
@@ -304,12 +314,12 @@ execution:
     max_spread_bps: 15.0
     skip_if_wider: true
   dynamic_offset:
-    enabled: false
-    base_bps: 3.0
+    enabled: true
+    base_bps: 2.0
     per_spread_coeff: 0.5
     max_offset_bps: 20.0
   microstructure:
-    enabled: false
+    enabled: true
     min_obi: 0.15
     max_spread_bps: 8.0
   bump_to_exchange_min: true
@@ -345,13 +355,14 @@ risk:
   min_hold_minutes: 0
   catastrophic_atr_mult: 3.5
   stop_buffer_bps: 0.0
-  cooldown_minutes_after_stop: 0
+  cooldown_minutes_after_stop: 8
+  reentry_after_loss_minutes: 10
   partial_tp_enabled: false
   partial_tp_r: 0.0
   partial_tp_size: 0.0
   max_daily_loss_pct: 5.0
   trade_disable_minutes: 0
-  use_trailing_killswitch: false
+  use_trailing_killswitch: true
   min_close_pnl_pct: 0.0
   max_hours_in_trade: 0
   trailing_unlocks:
@@ -359,10 +370,10 @@ risk:
     triggers_r: []
     lock_r: []
   exit_on_regime_flip:
-    enabled: false
+    enabled: true
     confirm_bars: 1
   adaptive:
-    enabled: false
+    enabled: true
     low_thr_bps: 40.0
     high_thr_bps: 120.0
     sl_scale:
@@ -383,7 +394,7 @@ risk:
     sizes: []
     reduce_only: true
   no_progress:
-    enabled: false
+    enabled: true
     min_minutes: 180
     min_rr: 0.5
     min_close_pnl_pct: 0.0
@@ -396,6 +407,20 @@ risk:
   breakeven_extra_bps: 0.0
   trail_after_partial_mult: 0.0
   age_tighten: null
+  anti_churn:
+    enabled: true
+    cooldown_minutes: 20
+    after_stop_cooldown_minutes: 60
+    max_trades_per_lookback: 2
+    lookback_minutes: 60
+    streak_pause_after_losses:
+    streak_pause_minutes: 180
+    reentry_requires_reset:
+      zscore_max: 0.25
+      atr_breakout_mult: 0.5
+      use_any: true
+      hysteresis_z: 0.10
+    min_bar_separation: 1
 optimizer:
   walk_forward:
     n_splits: 6

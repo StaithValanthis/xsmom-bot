@@ -1,6 +1,6 @@
-# v1.3.0 – turnover-aware stats
+# v1.3.1 – turnover-aware stats + optional symbols
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import numpy as np
 import pandas as pd
 
@@ -11,6 +11,39 @@ from .sizing import build_targets
 from .utils import utcnow
 
 log = logging.getLogger("backtest")
+
+def _symbols_from_cfg(cfg: Any) -> List[str]:
+    """Derive symbols list from cfg if not explicitly provided."""
+    # attribute path attempts
+    for path in [
+        ("strategy", "symbols"),
+        ("exchange", "symbols"),
+        ("universe", "symbols"),
+    ]:
+        try:
+            cur = cfg
+            for p in path:
+                cur = getattr(cur, p)
+            if cur:
+                if isinstance(cur, str):
+                    return [s.strip() for s in cur.split(",") if s.strip()]
+                if isinstance(cur, (list, tuple)):
+                    return [str(s) for s in cur if s]
+        except Exception:
+            pass
+    # dict path attempts
+    try:
+        d = cfg if isinstance(cfg, dict) else {}
+        for key in ("strategy", "exchange", "universe"):
+            v = (d.get(key) or {}).get("symbols")
+            if v:
+                if isinstance(v, str):
+                    return [s.strip() for s in v.split(",") if s.strip()]
+                if isinstance(v, (list, tuple)):
+                    return [str(s) for s in v if s]
+    except Exception:
+        pass
+    return ["BTC/USDT", "ETH/USDT"]
 
 def _costs(turnover_notional: float, maker_ratio: float, cfg: AppConfig) -> float:
     fee_bps = maker_ratio * cfg.costs.maker_fee_bps + (1 - maker_ratio) * cfg.costs.taker_fee_bps
@@ -40,10 +73,14 @@ def _perf_stats(eq: pd.Series) -> Dict[str, float]:
 
 def run_backtest(
     cfg: AppConfig,
-    symbols: List[str],
+    symbols: Optional[List[str]] = None,
     prefetch_bars: Optional[Dict[str, pd.DataFrame]] = None,
     return_curve: bool = False,
 ) -> Dict[str, float]:
+    """Optimizer-friendly entrypoint. If symbols is None, derive from cfg."""
+    if symbols is None:
+        symbols = _symbols_from_cfg(cfg)
+
     log.info("=== BACKTEST (cost-aware) ===")
     log.info(f"Start: {utcnow().isoformat()} | timeframe={cfg.exchange.timeframe}")
 

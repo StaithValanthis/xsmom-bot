@@ -1,11 +1,12 @@
 [Unit]
-Description=Run XSMOM optimizer once per day
+Description=Nightly XSMOM optimizer run
 
 [Timer]
-# Runs 03:15 local time (Australia/Brisbane in your case)
-OnCalendar=*-*-* 03:15:00
-RandomizedDelaySec=300
+# Runs every day at 03:30 local time with up to 20 minutes of jitter
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=20m
 Persistent=true
+Unit=xsmom-optimizer.service
 
 [Install]
 WantedBy=timers.target

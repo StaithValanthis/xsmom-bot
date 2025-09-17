@@ -386,6 +386,12 @@ def _compute_dmi(df: pd.DataFrame, n: int = 14):
 def _state_get_symstats(state: dict) -> dict:
     return state.setdefault("sym_stats", {})
 
+    state.setdefault("entry_log", {})
+    state.setdefault("loss_cooldown_until", {})
+    state.setdefault("anti_last_entry_ts", {})
+    state.setdefault("anti_last_exit", {})
+    state.setdefault("anti_loss_streak", {})
+    state.setdefault("anti_stop_cooldown_until", {})
 def _update_symbol_score_on_close(state: dict, cfg: AppConfig, symbol: str, pnl_usdt: float) -> None:
     sf_cfg = getattr(cfg.strategy, "symbol_filter", None)
     if not sf_cfg or not sf_cfg.enabled or not getattr(sf_cfg, "score", None) or not sf_cfg.score.enabled:
@@ -1795,6 +1801,258 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 if notional < min_notional:
                     continue
 
+
+
+                # === ANTI-CHURN GATE ===
+
+                ac = getattr(cfg, "anti_churn", None)
+
+                if ac and getattr(ac, "enabled", False):
+
+                    now_s = time.time()
+
+                    tf = str(getattr(getattr(cfg, "exchange", object()), "timeframe", "5m")).strip().lower()
+
+                    _m = re.match(r"^(\d+)([mh])$", tf)
+
+                    tfm = (int(_m.group(1)) if _m and _m.group(2) == "m" else int(_m.group(1))*60) if _m else 5
+
+
+                    # 1) min bar separation
+
+                    try:
+
+                        min_bars = int(getattr(ac, "min_bar_separation", 0) or 0)
+
+                    except Exception:
+
+                        min_bars = 0
+
+                    if min_bars > 0:
+
+                        last_e_ts = float(state.setdefault("anti_last_entry_ts", {}).get(s, 0.0) or 0.0)
+
+                        if last_e_ts > 0 and (now_s - last_e_ts) < (min_bars * tfm * 60):
+
+                            log.info(f"[ANTI-CHURN] Skip {s}: bar separation ({min_bars} bars)")
+
+                            continue
+
+
+                    # 2) general cooldown after any entry
+
+                    try:
+
+                        cd_min = int(getattr(ac, "cooldown_minutes", 0) or 0)
+
+                    except Exception:
+
+                        cd_min = 0
+
+                    if cd_min > 0:
+
+                        last_e_ts = float(state.setdefault("anti_last_entry_ts", {}).get(s, 0.0) or 0.0)
+
+                        if last_e_ts > 0 and (now_s - last_e_ts) < (cd_min * 60):
+
+                            log.info(f"[ANTI-CHURN] Skip {s}: cooldown {cd_min}m from last entry")
+
+                            continue
+
+
+                    # 3) stop cooldown
+
+                    stop_map = state.setdefault("anti_stop_cooldown_until", {})
+
+                    try:
+
+                        if isinstance(stop_map, dict) and stop_map.get(s) and pd.Timestamp(stop_map[s]) > pd.Timestamp.utcnow():
+
+                            log.info(f"[ANTI-CHURN] Skip {s}: stop-cooldown active until {stop_map[s]}")
+
+                            continue
+
+                        elif isinstance(stop_map, dict) and stop_map.get(s):
+
+                            stop_map.pop(s, None)
+
+                    except Exception:
+
+                        pass
+
+
+                    # 4) lookback trade count cap
+
+                    try:
+
+                        lb_min = int(getattr(ac, "lookback_minutes", 0) or 0)
+
+                        lb_max = int(getattr(ac, "max_trades_per_lookback", 0) or 0)
+
+                    except Exception:
+
+                        lb_min, lb_max = 0, 0
+
+                    if lb_min > 0 and lb_max > 0:
+
+                        arr = list(state.setdefault("entry_log", {}).get(s, []))
+
+                        cutoff = now_s - lb_min * 60
+
+                        cnt = len([ts for ts in arr if ts >= cutoff])
+
+                        cur_qty = float(positions.get(s, {}).get("net_qty") or 0.0)
+
+                        if cnt >= lb_max and abs(cur_qty) <= 0.0:
+
+                            log.info(f"[ANTI-CHURN] Skip {s}: {cnt}/{lb_max} entries in last {lb_min}m")
+
+                            continue
+
+
+                    # 5) loss streak pause
+
+                    st_after = getattr(ac, "streak_pause_after_losses", None)
+
+                    st_pause = int(getattr(ac, "streak_pause_minutes", 0) or 0)
+
+                    try:
+
+                        st_after = int(st_after) if st_after not in (None, "", False) else None
+
+                    except Exception:
+
+                        st_after = None
+
+                    if st_after and st_pause > 0:
+
+                        ls = int(state.setdefault("anti_loss_streak", {}).get(s, 0) or 0)
+
+                        if ls >= st_after:
+
+                            last_exit = (state.get("anti_last_exit", {}) or {}).get(s)
+
+                            anchor = float((last_exit or {}).get("ts") or now_s)
+
+                            if (now_s - anchor) < (st_pause * 60):
+
+                                log.info(f"[ANTI-CHURN] Skip {s}: loss-streak {ls} pause {st_pause}m")
+
+                                continue
+
+                            else:
+
+                                state["anti_loss_streak"][s] = 0
+
+
+                    # 6) re-entry requires reset (after a loss)
+
+                    rr = getattr(ac, "reentry_requires_reset", None)
+
+                    if isinstance(rr, dict):
+
+                        last_exit = (state.get("anti_last_exit", {}) or {}).get(s)
+
+                        cur_qty = float(positions.get(s, {}).get("net_qty") or 0.0)
+
+                        if last_exit and last_exit.get("was_loss") and abs(cur_qty) <= 0.0:
+
+                            use_any = bool(rr.get("use_any", True))
+
+                            pass_tests = []
+
+
+                            # z-score reset
+
+                            z_ok = True
+
+                            zmax = rr.get("zscore_max", None)
+
+                            if zmax not in (None, "", False):
+
+                                try: zmax = float(zmax)
+
+                                except Exception: zmax = None
+
+                            if zmax is not None:
+
+                                lb = int(getattr(getattr(cfg, "strategy", object()), "vol_lookback", 72))
+
+                                df = bars.get(s)
+
+                                if df is not None and len(df) >= max(20, lb):
+
+                                    w = df["close"].tail(max(20, lb)).astype("float64")
+
+                                    mu = float(w.mean()); sd = float(w.std(ddof=0))
+
+                                    z = None if sd <= 0 else float((w.iloc[-1] - mu) / sd)
+
+                                else:
+
+                                    z = None
+
+                                hyst = float(rr.get("hysteresis_z", 0.0) or 0.0)
+
+                                z_ok = (z is not None) and (abs(z) <= max(0.0, zmax - hyst))
+
+                                pass_tests.append(bool(z_ok))
+
+
+                            # ATR breakout since last loss exit (optional)
+
+                            atr_ok = True
+
+                            ab = rr.get("atr_breakout_mult", None)
+
+                            if ab not in (None, "", False):
+
+                                try: ab = float(ab)
+
+                                except Exception: ab = None
+
+                            if ab is not None:
+
+                                atr = None
+
+                                df_b = bars.get(s)
+
+                                try:
+
+                                    from src.ta import compute_atr as _compute_atr
+
+                                except Exception:
+
+                                    _compute_atr = None
+
+                                if _compute_atr and df_b is not None and len(df_b) > 0:
+
+                                    try:
+
+                                        atr = float(_compute_atr(df_b, n=int(getattr(cfg.risk, "atr_len", 28)), method="rma").iloc[-1])
+
+                                    except Exception:
+
+                                        atr = None
+
+                                prc = float(df_b["close"].iloc[-1]) if df_b is not None and len(df_b) > 0 else None
+
+                                px0 = float((last_exit or {}).get("px") or 0.0)
+
+                                atr_ok = bool(atr and prc and atr > 0.0 and abs(prc - px0) / atr >= ab)
+
+                                pass_tests.append(bool(atr_ok))
+
+
+                            ok = any(pass_tests) if use_any else (all(pass_tests) if pass_tests else True)
+
+                            if not ok:
+
+                                log.info(f"[ANTI-CHURN] Skip {s}: reentry reset not satisfied (tests={pass_tests})")
+
+                                continue
+
+                # === END ANTI-CHURN GATE ===
                 cur_qty = float(positions.get(s, {}).get("net_qty") or 0.0)
                 desired_contracts = tgt_w * eq / mid
 
@@ -1906,6 +2164,15 @@ def run_live(cfg: AppConfig, dry: bool = False):
                         ex.create_order_safe(s, side, q_to_send, px, post_only=post_only, reduce_only=False)
                         created += 1
                         last_trade_ts[s] = time.time()
+                        # Anti-churn: record entry time
+                        try:
+                            if abs(cur_qty) <= 0.0:
+                                entry_log = state.setdefault("entry_log", {})
+                                entry_log.setdefault(s, []).append(time.time())
+                                state.setdefault("anti_last_entry_ts", {})[s] = time.time()
+                        except Exception:
+                            pass
+
                 except Exception as e:
                     msg = str(e)
                     # Learn min qty from error strings like:
