@@ -6,8 +6,8 @@ exchange:
   unified_margin: true
   testnet: false
   max_symbols: 36
-  min_usd_volume_24h: 30000000
-  min_price: 0.03
+  min_usd_volume_24h: 75000000
+  min_price: 0.05
   timeframe: 1h
   candles_limit: 1500
   recv_window_ms: 10000
@@ -29,8 +29,8 @@ strategy:
     max_reduction: 0.5
   confirmation:
     enabled: true
-    lookback_bars: 2
-    z_boost: 0.0
+    lookback_bars: 4
+    z_boost: 0.10
   signal_power: 1.35
   lookbacks:
   - 1
@@ -44,9 +44,9 @@ strategy:
   k_min: 2
   k_max: 8
   market_neutral: true
-  gross_leverage: 1.1
-  max_weight_per_asset: 0.14
-  entry_zscore_min: 0.6
+  gross_leverage: 0.95
+  max_weight_per_asset: 0.09
+  entry_zscore_min: 0.90
   regime_filter:
     enabled: true
     ema_len: 200
@@ -67,30 +67,34 @@ strategy:
     exclude: []
     score:
       enabled: true
-      min_sample_trades: 8
-      ema_alpha: 0.2
-      min_win_rate_pct: 38.0
+      min_sample_trades: 14
+      ema_alpha: 0.25
+      min_win_rate_pct: 50.0
       pf_downweight_threshold: 1.0
       downweight_factor: 0.6
-      block_below_win_rate_pct: 38.0
-      pf_block_threshold: 0.9
-      pnl_block_threshold_usdt_per_trade: -0.1
-      ban_minutes: 1440
-      grace_trades_after_unban: 3
+      block_below_win_rate_pct: 50.0
+      pf_block_threshold: 1.24
+      pnl_block_threshold_usdt_per_trade: -0.10
+      ban_minutes: 5760
+      grace_trades_after_unban: 2
       decay_days: 14
       pf_warn_threshold: 1.2
+      rolling_window_hours: 72
+      max_daily_loss_per_symbol_usdt: 3.0
   time_of_day_whitelist:
-    enabled: false
+    enabled: true
     use_ema: true
-    ema_alpha: 0.2
-    min_trades_per_hour: 25
+    ema_alpha: 0.20
+    min_trades_per_hour: 30
     min_hours_allowed: 6
     threshold_bps: 0.0
     fixed_hours: []
-    downweight_factor: 0.6
-    boost_good_hours: false
-    boost_factor: 1.0
+    downweight_factor: 0.70
+    boost_good_hours: true
+    boost_factor: 1.25
     fixed_good_hours: []
+    require_consecutive_good_hours: 2
+    blackout_hours_utc: []
   funding_tilt:
     enabled: true
     weight: 0.15
@@ -110,8 +114,8 @@ strategy:
     min_entry_zscore: 0.65
   soft_kill:
     enabled: true
-    soft_daily_loss_pct: 0.05
-    resume_after_minutes: 120
+    soft_daily_loss_pct: 5.0
+    resume_after_minutes: 60
   soft_win_lock:
     enabled: false
     arm_after_r: 0.0
@@ -142,8 +146,8 @@ strategy:
   dynamic_entry_band:
     enabled: true
     high_corr:
-      threshold: 0.75
-      zmin: 0.7
+      threshold: 0.80
+      zmin: 0.75
     mid_corr:
       threshold: 0.6
       zmin: 0.6
@@ -158,7 +162,7 @@ strategy:
     fallback_k: 6
   portfolio_vol_target:
     enabled: true
-    target_ann_vol: 0.35
+    target_ann_vol: 0.26
     lookback_hours: 72
     min_scale: 0.5
     max_scale: 1.6
@@ -186,7 +190,7 @@ strategy:
     max_per_cluster: 2
   meta_label:
     enabled: true
-    min_prob: 0.55
+    min_prob: 0.62
     learning_rate: 0.05
     l2: 0.001
     breakout_len: 96
@@ -237,8 +241,8 @@ strategy:
   gates:
     microstructure:
       enabled: true
-      max_spread_bps: 12
-      min_top_of_book_depth_usd: 1500
+      max_spread_bps: 8
+      min_top_of_book_depth_usd: 5000
     adx:
       enabled: true
       length: 14
@@ -284,6 +288,8 @@ execution:
   reload_positions_on_start: true
   order_type: limit
   post_only: true
+  child_order_ttl_ms: 750
+  cancel_retries_max: 2    
   maker_ttl_secs: 25
   price_offset_bps: 2.0
   slippage_bps_guard: 25.0
@@ -311,17 +317,17 @@ execution:
     keep_reduce_only: true
   spread_guard:
     enabled: true
-    max_spread_bps: 15.0
+    max_spread_bps: 9
     skip_if_wider: true
   dynamic_offset:
     enabled: true
     base_bps: 2.0
-    per_spread_coeff: 0.5
-    max_offset_bps: 20.0
+    per_spread_coeff: 0.58
+    max_offset_bps: 3.0
   microstructure:
     enabled: true
     min_obi: 0.15
-    max_spread_bps: 8.0
+    max_spread_bps: 8
   bump_to_exchange_min: true
   offset_mode: dynamic
   offset_bps_min: 0.5
@@ -347,8 +353,8 @@ risk:
     type: ma_atr
     ma_len: 34
     atr_length: 28
-    multiplier: 1.5
-    cooldown_bars: 0
+    multiplier: 1.9
+    cooldown_bars: 1
   breakeven_after_r: 1.0
   stop_on_close_only: false
   stop_confirm_bars: 0
@@ -360,7 +366,7 @@ risk:
   partial_tp_enabled: false
   partial_tp_r: 0.0
   partial_tp_size: 0.0
-  max_daily_loss_pct: 5.0
+  max_daily_loss_pct: 12.0
   trade_disable_minutes: 0
   use_trailing_killswitch: true
   min_close_pnl_pct: 0.0
@@ -410,10 +416,10 @@ risk:
   anti_churn:
     enabled: true
     cooldown_minutes: 20
-    after_stop_cooldown_minutes: 60
-    max_trades_per_lookback: 2
-    lookback_minutes: 60
-    streak_pause_after_losses:
+    after_stop_cooldown_minutes: 120
+    max_trades_per_lookback: 1
+    lookback_minutes: 90
+    streak_pause_after_losses: 2
     streak_pause_minutes: 180
     reentry_requires_reset:
       zscore_max: 0.25
