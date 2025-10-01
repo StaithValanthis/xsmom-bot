@@ -6,7 +6,7 @@ set -euo pipefail
 # Installs under /opt/xsmom-bot, creates venv, seeds .env/config,
 # installs/patches systemd units for:
 #   - xsmom-bot.service
-#   - xsmom-optimizer.service + xsmom-optimizer.timer (or repo xsmom-opt.*)
+#   - xsmom-optimizer.service + xsmom-optimizer.timer
 #   - xsmom-meta-trainer.service + xsmom-meta-trainer.timer
 # Idempotent: safe to re-run.
 # =========================
@@ -62,85 +62,42 @@ normalize_destination_tree(){
 }
 
 seed_local_if_missing(){
-  # Creates minimal files if repo was incomplete; no-ops if present
-  [ -d config ] || mkdir -p config
-  [ -f .env.example ] || cat > .env.example <<EOF
-BYBIT_API_KEY=your_key_here
-BYBIT_API_SECRET=your_secret_here
-PYTHONUNBUFFERED=1
-PYTHONDONTWRITEBYTECODE=1
-EOF
-  [ -f config/config.yaml.example ] || cat > config/config.yaml.example <<'EOF'
-exchange:
-  id: bybit
-  account_type: swap
-  quote: USDT
-  only_perps: true
-  unified_margin: true
-  testnet: false
-  timeframe: 1h
-strategy:
-  signal_power: 1.35
-  lookbacks: [1,6,24]
-  lookback_weights: [1.0,1.0,1.0]
-  market_neutral: true
-  gross_leverage: 1.1
-  max_weight_per_asset: 0.14
-paths:
-  state_path: /opt/xsmom-bot/state
-logging:
-  logs_dir: /opt/xsmom-bot/logs
-  level: INFO
-EOF
+  # Ensure repo has minimal files so rsync won't fail if user copied partial tree
+  mkdir -p config src systemd state logs tests bin || true
+  touch logs/.gitkeep state/.gitkeep || true
 }
 
 fix_service_user_and_paths(){
   local dest="$1"
-  local svc="${dest}/systemd/${SERVICE_NAME}.service"
-
-  if [ ! -f "$svc" ]; then
-    die "Missing ${svc} in repository."
-  fi
-
-  local EXEC_FLAGS="--config ${dest}/config/config.yaml"
-  if [ "${SERVICE_DRY}" = "1" ]; then
-    EXEC_FLAGS="${EXEC_FLAGS} --dry"
-  fi
-
-  sudo sed -i "s|^User=.*|User=${RUN_AS}|" "$svc"
-  sudo sed -i "s|^Group=.*|Group=${RUN_GROUP}|" "$svc" || true
-  sudo sed -i "s|^WorkingDirectory=.*|WorkingDirectory=${dest}|" "$svc"
-  sudo sed -i "s|^ExecStart=.*|ExecStart=${dest}/venv/bin/python -m src.main live ${EXEC_FLAGS}|" "$svc"
+  # No content rewrite needed here because units reference absolute /opt paths;
+  # ensure they're present under ${dest}.
+  :
 }
 
 install_optimizer_units(){
   local dest="$1"
-
-  # Prefer repo-provided units if they exist; otherwise write robust defaults.
   local svc_repo="${dest}/systemd/xsmom-optimizer.service"
   local tim_repo="${dest}/systemd/xsmom-optimizer.timer"
 
   if [ ! -f "${svc_repo}" ]; then
     cat > /tmp/xsmom-optimizer.service <<EOF
 [Unit]
-Description=XSMOM daily optimizer (purged-CV walk-forward)
-After=network-online.target
+Description=XSMOM optimizer (autotune via backtests)
 Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=oneshot
 User=${RUN_AS}
 Group=${RUN_GROUP}
 WorkingDirectory=${dest}
-EnvironmentFile=-${OPT_ENV_FILE}
-ExecStart=${dest}/venv/bin/python -m src.optimizer_cli --config ${dest}/config/config.yaml --objective sharpe --splits 3 --embargo 0.02 --max-symbols 20 --grid "\$GRID"
-StandardOutput=append:/var/log/xsmom-optimizer.log
-StandardError=append:/var/log/xsmom-optimizer.log
-Nice=5
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
+EnvironmentFile=${dest}/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=${dest}
+Environment=PATH=${dest}/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/bin/bash -lc '${dest}/bin/run-optimizer.sh ${dest}/config/config.yaml ${dest}/reports'
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -153,11 +110,11 @@ EOF
   if [ ! -f "${tim_repo}" ]; then
     cat > /tmp/xsmom-optimizer.timer <<EOF
 [Unit]
-Description=Run XSMOM optimizer daily and at boot
+Description=Nightly XSMOM optimizer run
 
 [Timer]
-OnBootSec=3min
 OnCalendar=${OPTIMER_CALENDAR}
+RandomizedDelaySec=1200
 Persistent=true
 Unit=xsmom-optimizer.service
 
@@ -167,17 +124,6 @@ EOF
     sudo mv /tmp/xsmom-optimizer.timer /etc/systemd/system/xsmom-optimizer.timer
   else
     sudo cp "${tim_repo}" "/etc/systemd/system/xsmom-optimizer.timer"
-  fi
-
-  # Back-compat: if older xsmom-opt.* ship in repo, install them as well.
-  [ -f "${dest}/systemd/xsmom-opt.service" ] && sudo cp "${dest}/systemd/xsmom-opt.service" "/etc/systemd/system/xsmom-opt.service"
-  [ -f "${dest}/systemd/xsmom-opt.timer" ]   && sudo cp "${dest}/systemd/xsmom-opt.timer"   "/etc/systemd/system/xsmom-opt.timer"
-
-  # Ensure log and environment defaults
-  sudo touch /var/log/xsmom-optimizer.log
-  sudo chown "${RUN_AS}:${RUN_GROUP}" /var/log/xsmom-optimizer.log
-  if [ ! -f "${OPT_ENV_FILE}" ]; then
-    echo "GRID=${DEFAULT_GRID}" | sudo tee "${OPT_ENV_FILE}" >/dev/null
   fi
 }
 
@@ -239,9 +185,9 @@ EOF
 # Begin installation
 # =========================
 APP_DIR="$DEFAULT_APP_DIR"
-info "Ensuring /opt exists (or fallback to \$HOME)..."
+info "Ensuring /opt exists (or fallback to $HOME)..."
 if ! sudo mkdir -p /opt 2>/dev/null; then
-  warn "Could not create /opt; falling back to \$HOME/${APP_NAME}-app"
+  warn "Could not create /opt; falling back to $HOME/${APP_NAME}-app"
   APP_DIR="${HOME}/${APP_NAME}-app"
   mkdir -p "${APP_DIR}"
 else
@@ -256,10 +202,7 @@ info "Creating app directory at ${APP_DIR}..."
 ensure_dir_owned "${APP_DIR}"
 
 info "Copying repository files into ${APP_DIR}..."
-sudo rsync -a --delete \
-  README.md requirements.txt .env.example install.sh run_local.sh \
-  config/ src/ systemd/ state/ logs/ tests/ \
-  "${APP_DIR}/" || true
+sudo rsync -a --delete   README.md requirements.txt .env.example install.sh run_local.sh   config/ src/ systemd/ state/ logs/ tests/ bin/   "${APP_DIR}/" || true
 
 info "Normalizing destination tree..."
 normalize_destination_tree "${APP_DIR}"
@@ -287,7 +230,7 @@ fix_service_user_and_paths "${APP_DIR}"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 sudo cp "${APP_DIR}/systemd/${SERVICE_NAME}.service" "${SERVICE_FILE}"
 
-info "Installing optimizer service + timer..."
+info "Installing optimizer service + timer (canonical: xsmom-optimizer.*)..."
 install_optimizer_units "${APP_DIR}"
 
 info "Installing meta-trainer service + timer..."
@@ -323,24 +266,3 @@ else
 fi
 
 info "Done."
-
-echo
-echo "=== Next steps ==="
-echo "1) Edit ${APP_DIR}/.env and set BYBIT_API_KEY / BYBIT_API_SECRET"
-echo "2) Edit ${APP_DIR}/config/config.yaml as needed"
-if [ "${SERVICE_DRY}" = "1" ]; then
-  echo "Service mode: DRY-RUN. To switch to LIVE:"
-  echo "   sudo systemctl stop ${SERVICE_NAME}"
-  echo "   sudo sed -i 's/ --dry\\b//' ${SERVICE_FILE}"
-  echo "   sudo systemctl daemon-reload && sudo systemctl start ${SERVICE_NAME}"
-else
-  echo "Service mode: LIVE TRADING (no --dry). Make sure keys/permissions are correct!"
-fi
-echo
-echo "Manage:"
-echo "  sudo systemctl status ${SERVICE_NAME}"
-echo "  sudo systemctl restart ${SERVICE_NAME}"
-echo "  journalctl -u ${SERVICE_NAME} -f -o cat"
-echo
-echo "Timers:"
-echo "  systemctl list-timers | egrep 'xsmom-(optimizer|meta-trainer).timer'"

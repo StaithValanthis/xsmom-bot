@@ -4,22 +4,15 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-# Load API keys and any extra env (e.g., OPTIMIZER_EXTRA_FLAGS) from the project's .env
-EnvironmentFile=/opt/xsmom-bot/.env
 Type=oneshot
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/xsmom-bot
-
-# Minimal env for Python resolution
+EnvironmentFile=/opt/xsmom-bot/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/opt/xsmom-bot
 Environment=PATH=/opt/xsmom-bot/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-
-# Use a single-line ExecStart to avoid systemd line-continuation pitfalls
 ExecStart=/bin/bash -lc '/opt/xsmom-bot/bin/run-optimizer.sh /opt/xsmom-bot/config/config.yaml /opt/xsmom-bot/reports'
-
-# Log to the journal
 StandardOutput=journal
 StandardError=journal
 

@@ -2,7 +2,6 @@
 Description=Nightly XSMOM optimizer run
 
 [Timer]
-# Runs every day at 03:30 local time with up to 20 minutes of jitter
 OnCalendar=*-*-* 03:30:00
 RandomizedDelaySec=20m
 Persistent=true

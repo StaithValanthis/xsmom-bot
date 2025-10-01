@@ -10,7 +10,7 @@ Group=ubuntu
 WorkingDirectory=/opt/xsmom-bot
 EnvironmentFile=/opt/xsmom-bot/.env
 ExecStart=/opt/xsmom-bot/venv/bin/python -m src.main live --config /opt/xsmom-bot/config/config.yaml --dry
-# Live trading (remove --dry after validation):
+# For live trading (remove --dry after validation):
 # ExecStart=/opt/xsmom-bot/venv/bin/python -m src.main live --config /opt/xsmom-bot/config/config.yaml
 
 Restart=always
