@@ -173,13 +173,14 @@ class ExchangeWrapper:
             return self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=min(limit, MAX_BARS_PER_REQUEST), since=since)
         
         # CCXT returns oldest-first. To get most recent N bars:
-        # Strategy: Fetch chunks going backwards in time, then reverse to get chronological order
+        # Strategy: Fetch chunks going backwards in time, deduplicate, then take most recent N
         # 1. First chunk: since=None gets most recent 1000 bars
-        # 2. Subsequent chunks: Use oldest timestamp from previous chunk to fetch older data
-        # 3. Prepend older chunks, then take the last N bars (most recent)
+        # 2. Subsequent chunks: Use oldest timestamp minus one timeframe to fetch older data
+        # 3. Deduplicate by timestamp, then take the last N bars (most recent)
         
         chunks = []  # Store chunks (will be in reverse chronological order)
         current_since = since  # None means most recent
+        seen_timestamps = set()  # Track timestamps to avoid duplicates
         
         while remaining > 0:
             # Fetch up to MAX_BARS_PER_REQUEST bars
@@ -196,20 +197,32 @@ class ExchangeWrapper:
                 if not chunk:
                     break
                 
-                chunks.append(chunk)
-                remaining -= len(chunk)
+                # Filter out duplicates within this chunk
+                unique_chunk = []
+                for bar in chunk:
+                    ts = bar[0]  # Timestamp is first element
+                    if ts not in seen_timestamps:
+                        seen_timestamps.add(ts)
+                        unique_chunk.append(bar)
                 
-                if len(chunk) < chunk_limit:
+                if not unique_chunk:
+                    # All bars in this chunk were duplicates, we've hit the end
+                    break
+                
+                chunks.append(unique_chunk)
+                remaining -= len(unique_chunk)
+                
+                if len(unique_chunk) < chunk_limit:
                     # Got fewer bars than requested, no more data available
                     break
                 
                 # Move backwards in time for next chunk
                 # Use the oldest timestamp from this chunk (first element, since CCXT returns oldest-first)
-                if chunk:
-                    oldest_timestamp = chunk[0][0]  # First element's timestamp (oldest in chunk)
+                if unique_chunk:
+                    oldest_timestamp = unique_chunk[0][0]  # First element's timestamp (oldest in chunk)
                     # Calculate start time for next (older) chunk
-                    # Go back by (chunk_limit * timeframe_ms) to avoid overlap
-                    current_since = oldest_timestamp - (chunk_limit * timeframe_ms)
+                    # Go back by one timeframe to get the next older bar (avoid overlap)
+                    current_since = oldest_timestamp - timeframe_ms
                     # Ensure we don't go negative
                     if current_since < 0:
                         break
@@ -234,6 +247,15 @@ class ExchangeWrapper:
             all_bars = []
             for chunk in reversed(chunks):
                 all_bars.extend(chunk)
+            
+            # Final deduplication pass (safety check)
+            # Use dict to keep last occurrence of each timestamp (most recent data)
+            unique_bars_dict = {}
+            for bar in all_bars:
+                ts = bar[0]
+                unique_bars_dict[ts] = bar
+            all_bars = list(unique_bars_dict.values())
+            all_bars.sort(key=lambda x: x[0])  # Sort by timestamp (oldest first)
             
             # Trim to exact limit (keep most recent N bars)
             # Since all_bars is now oldest-first, take the last N elements
