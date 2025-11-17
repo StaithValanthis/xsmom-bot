@@ -748,8 +748,10 @@ class FastSLTPThread(threading.Thread):
             else:
                 self.ex.create_order_safe(symbol, side_close, q, None, post_only=False, reduce_only=True)
                 log.info(f"[LIVE-{reason}] {symbol}: {side_close} {q} @ mkt")
-                # Track last trade timestamp (MAKE MONEY monitoring)
-                self.state["last_trade_ts"] = time.time()
+                # Track last trade timestamp (MAKE MONEY monitoring) - per-symbol
+                if "last_trade_ts" not in self.state or not isinstance(self.state["last_trade_ts"], dict):
+                    self.state["last_trade_ts"] = {}
+                self.state["last_trade_ts"][symbol] = time.time()
         finally:
             try:
                 pinfo = (self.state.get("perpos", {}) or {}).get(symbol, {})
@@ -1133,7 +1135,14 @@ def run_live(cfg: AppConfig, dry: bool = False):
     state.setdefault("cooldowns", {})
     state.setdefault("enter_bar_time", {})
     state.setdefault("locked_r", {})
-    state.setdefault("last_trade_ts", 0.0)  # Timestamp of last trade (float)
+    # Migrate last_trade_ts from float to dict if needed
+    if "last_trade_ts" in state and isinstance(state["last_trade_ts"], (int, float)):
+        # Old format: single float timestamp, migrate to empty dict
+        old_ts = state.pop("last_trade_ts")
+        state["last_trade_ts"] = {}
+        if old_ts > 0:
+            log.info(f"[MIGRATION] Converted last_trade_ts from float ({old_ts}) to dict format")
+    state.setdefault("last_trade_ts", {})  # Per-symbol last trade timestamps (dict: symbol -> timestamp)
     state.setdefault("funding_costs", {})  # Per-symbol cumulative funding costs
     state.setdefault("total_funding_cost", 0.0)  # Total cumulative funding cost
     state.setdefault("day_date", None)
@@ -1439,7 +1448,9 @@ def run_live(cfg: AppConfig, dry: bool = False):
             # ===========================
             no_trade_cfg = getattr(cfg.notifications.monitoring, "no_trade", {}) or {}
             if no_trade_cfg.get("enabled", True):
-                last_trade_ts = state.get("last_trade_ts", 0.0)
+                last_trade_ts_dict = state.get("last_trade_ts", {}) or {}
+                # Get most recent trade timestamp across all symbols
+                last_trade_ts = max(last_trade_ts_dict.values()) if last_trade_ts_dict else 0.0
                 threshold_hours = float(no_trade_cfg.get("threshold_hours", 4.0))
                 if last_trade_ts > 0:
                     hours_since_trade = (time.time() - last_trade_ts) / 3600.0
@@ -2017,7 +2028,10 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 pass
 
             created = 0
-            last_trade_ts = state.setdefault("last_trade_ts", {})
+            # Ensure last_trade_ts is a dict (per-symbol timestamps)
+            if "last_trade_ts" not in state or not isinstance(state.get("last_trade_ts"), dict):
+                state["last_trade_ts"] = {}
+            last_trade_ts = state["last_trade_ts"]
 
             for s in order_syms:
                 tgt_w = float(targets.loc[s])
@@ -2397,8 +2411,10 @@ def run_live(cfg: AppConfig, dry: bool = False):
                         # --- end exec alpha ---
                         ex.create_order_safe(s, side, q_to_send, px, post_only=post_only, reduce_only=False)
                         created += 1
-                        # Track last trade timestamp (MAKE MONEY monitoring)
-                        state["last_trade_ts"] = time.time()
+                        # Track last trade timestamp (MAKE MONEY monitoring) - per-symbol
+                        if "last_trade_ts" not in state or not isinstance(state.get("last_trade_ts"), dict):
+                            state["last_trade_ts"] = {}
+                        state["last_trade_ts"][s] = time.time()
                         write_json(state_path, state)
                         # Anti-churn: record entry time
                         try:
