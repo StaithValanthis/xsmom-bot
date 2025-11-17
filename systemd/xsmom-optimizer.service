@@ -1,0 +1,20 @@
+[Unit]
+Description=XSMOM optimizer (autotune via backtests)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/xsmom-bot
+EnvironmentFile=/opt/xsmom-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/xsmom-bot
+Environment=PATH=/opt/xsmom-bot/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/bin/bash -lc '/opt/xsmom-bot/bin/run-optimizer.sh /opt/xsmom-bot/config/config.yaml /opt/xsmom-bot/reports'
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

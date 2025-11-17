@@ -1,0 +1,485 @@
+exchange:
+  id: bybit
+  account_type: swap
+  quote: USDT
+  only_perps: true
+  unified_margin: true
+  testnet: false
+  max_symbols: 36
+  min_usd_volume_24h: 100000000
+  min_price: 0.05
+  timeframe: 1h
+  candles_limit: 1500
+  recv_window_ms: 10000
+  include_symbols: []
+  exclude_symbols: []
+
+strategy:
+  ensemble:
+    enabled: true
+    weights:
+      xsec: 0.6
+      ts: 0.2
+      breakout: 0.2
+    ts_len: 48
+    breakout_len: 96
+
+  funding_trim:
+    enabled: true
+    threshold_bps: 1.2
+    slope_per_bps: 0.20
+    max_reduction: 0.6
+
+  confirmation:
+    enabled: true
+    lookback_bars: 4
+    z_boost: 0.10
+
+  signal_power: 1.35
+  lookbacks: [1, 6, 24]
+  lookback_weights: [1.0, 1.0, 1.0]
+  vol_lookback: 96
+
+  market_neutral: true
+  gross_leverage: 0.95
+  max_weight_per_asset: 0.09
+
+  regime_filter:
+    enabled: true
+    ema_len: 200
+    slope_min_bps_per_day: 3.5
+    use_abs: true
+
+  adx_filter:
+    enabled: true
+    len: 14
+    min_adx: 28.0
+    require_rising: true
+    use_di_alignment: true
+    min_di_separation: 0.0
+    di_hysteresis_bps: 0.0
+
+  symbol_filter:
+    enabled: true
+    whitelist: []
+    banlist: []
+    exclude: []
+    score:
+      enabled: true
+      min_sample_trades: 4
+      ema_alpha: 0.25
+      min_win_rate_pct: 50.0
+      pf_downweight_threshold: 1.10
+      downweight_factor: 0.60
+      block_below_win_rate_pct: 0.0
+      pf_block_threshold: 1.25
+      pnl_block_threshold_usdt_per_trade: -0.015
+      ban_minutes: 1440
+      grace_trades_after_unban: 1
+      decay_days: 14
+      pf_warn_threshold: 1.20
+      rolling_window_hours: 168
+      max_daily_loss_per_symbol_usdt: 0.8
+
+  time_of_day_whitelist:
+    enabled: true
+    use_ema: true
+    ema_alpha: 0.20
+    min_trades_per_hour: 12
+    min_hours_allowed: 5
+    threshold_bps: 0.14
+    fixed_hours: []
+    downweight_factor: 0.58
+    boost_good_hours: true
+    boost_factor: 1.15
+    fixed_good_hours: []
+    require_consecutive_good_hours: 3
+    blackout_hours_utc: []
+    timezone: UTC
+
+  funding_tilt:
+    enabled: true
+    weight: 0.25
+
+  diversify:
+    enabled: true
+    corr_lookback: 48
+    max_pair_corr: 0.70
+
+  vol_target:
+    enabled: false
+    target_daily_vol_bps: 100.0
+    min_scale: 0.6
+    max_scale: 1.3
+
+  entry_throttle:
+    max_new_positions_per_cycle: 3
+    max_open_positions: 12
+    per_symbol_trade_cooldown_min: 45
+    min_entry_zscore: 0.80
+
+  soft_kill:
+    enabled: true
+    soft_daily_loss_pct: 5.0
+    resume_after_minutes: 60
+
+  soft_win_lock:
+    enabled: false
+    arm_after_r: 0.0
+    lock_r: 0.0
+    cooldown_minutes: 0
+
+  liquidity_caps:
+    enabled: false
+    max_weight_low_liq: 0.08
+    symbols_low_liq: []
+
+  majors_regime:
+    enabled: true
+    majors:
+      - BTC/USDT:USDT
+      - ETH/USDT:USDT
+    ema_len: 200
+    slope_bps_per_day: 1.0
+    action: downweight
+    downweight_factor: 0.6
+
+  kelly:
+    enabled: true
+    base_frac: 0.5
+    half_kelly: true
+    min_scale: 0.5
+    max_scale: 1.6
+
+  confirmation_timeframe: 4h
+  confirmation_lookback: 6
+  require_mtf_alignment: true
+
+  dynamic_entry_band:
+    enabled: true
+    high_corr:
+      threshold: 0.80
+      zmin: 0.75
+    mid_corr:
+      threshold: 0.60
+      zmin: 0.60
+    low_corr:
+      threshold: 0.45
+      zmin: 0.50
+
+  selection:
+    enabled: true
+    k_min: 2
+    k_max: 6
+    kappa: 6.0
+    fallback_k: 6
+
+  portfolio_vol_target:
+    enabled: true
+    target_ann_vol: 0.24
+    lookback_hours: 72
+    min_scale: 0.5
+    max_scale: 1.6
+    bars_per_year: 8760.0
+
+  breadth_gate:
+    enabled: true
+    min_fraction: 0.20
+    zero_when_blocked: true
+
+  sleeve_constraints:
+    meme:
+      symbols: [DOGEUSDT, PEPEUSDT, SHIBUSDT]
+      max_total_weight: 0.10
+      sleeve_vol_bps: 60.0
+
+  shock_mode:
+    enabled: true
+    vol_z_threshold: 2.5
+    cap_scale: 0.7
+
+  cluster_diversify:
+    enabled: true
+    lookback: 240
+    corr_threshold: 0.75
+    max_per_cluster: 2
+
+  meta_label:
+    enabled: true
+    min_prob: 0.72
+    learning_rate: 0.05
+    l2: 0.001
+    breakout_len: 96
+    vol_len: 48
+    state_path: meta_label_state.json
+
+  trailing:
+    adaptive:
+      enabled: true
+      base_mult: 1.0
+      by_vol:
+        low: 0.9
+        mid: 1.0
+        high: 1.2
+      ema:
+        len: 200
+        slope_min_bps_per_day: 0.0
+        use_abs: false
+        bull_mult: 0.95
+        bear_mult: 1.1
+
+  dynamic_k: true
+
+  dispersion_gate:
+    threshold: 0.60
+
+  carry:
+    enabled: true
+    budget_frac: 0.20
+    hedge_market_neutral: true
+    per_asset_cap: 0.14
+    funding:
+      use: true
+      min_percentile_30d: 0.8
+      sign_stability_k: 5
+      min_abs_rate_8h: 0.0002
+    basis:
+      use: true
+      min_annualized: 0.05
+      min_zscore: 0.8
+
+risk:
+  target_daily_vol_bps: 60
+  vol_clamp_min: 0.6
+  vol_clamp_max: 1.3
+  fractional_kelly: 0.5
+  dd_soft_kill:
+    enabled: true
+    lookback_days: 30
+    soft_kill_at_drawdown: 0.12
+    resume_after_minutes: 120
+  
+  # MAKE MONEY hardening: Margin protection
+  margin_soft_limit_pct: 0.0  # 0.0 = disabled, e.g., 80.0 for 80% margin usage
+  margin_hard_limit_pct: 0.0  # 0.0 = disabled, e.g., 90.0 for 90% margin usage (close positions)
+  margin_action: "pause"  # "pause" = stop new trades, "close" = close all positions
+  
+  # MAKE MONEY hardening: API circuit breaker
+  api_circuit_breaker:
+    enabled: true
+    max_errors: 5  # Max errors in window
+    window_seconds: 300  # 5 minutes
+    cooldown_seconds: 600  # 10 minutes cooldown after trip
+
+liquidity:
+  adv_cap_pct: 0.08
+  notional_cap_usdt: 20000.0
+
+execution:
+  reload_positions_on_start: true
+  order_type: limit
+  post_only: true
+  child_order_ttl_ms: 750
+  cancel_retries_max: 2
+  maker_ttl_secs: 25
+  price_offset_bps: 2.8
+  slippage_bps_guard: 25.0
+  set_leverage: 1
+  rebalance_minute: 1
+  poll_seconds: 10
+  align_after_funding_minutes: 0
+  funding_hours_utc: []
+  min_notional_per_order_usdt: 5.0
+  min_rebalance_delta_bps: 6.0
+
+  throttle:
+    min_seconds_between_entries_per_symbol: 30
+    max_entries_per_hour_per_symbol: 2
+    max_entries_per_day_per_symbol: 6
+
+  pyramiding:
+    enabled: false
+    allow_when_rr_ge: 0.8
+
+  cancel_open_orders_on_start: false
+
+  stale_orders:
+    enabled: true
+    cleanup_interval_sec: 60
+    max_age_sec: 180
+    reprice_if_far_bps: 15.0
+    cancel_if_not_targeted: true
+    keep_reduce_only: true
+
+  spread_guard:
+    enabled: true
+    max_spread_bps: 9
+    skip_if_wider: true
+
+  dynamic_offset:
+    enabled: true
+    base_bps: 2.8
+    per_spread_coeff: 0.50
+    max_offset_bps: 3.0
+
+  microstructure:
+    enabled: true
+    min_obi: 0.20
+    max_spread_bps: 6
+    min_top_of_book_depth_usd: 10000
+
+  bump_to_exchange_min: true
+  offset_mode: dynamic
+  offset_bps_min: 0.5
+  offset_bps_max: 2.5
+  spread_guard_bps_max: 15
+  min_order_notional_usd: 5.0
+  cancel_stale_after_seconds: 15
+
+  retry:
+    enabled: true
+    on_request_timeout: 1
+    backoff_seconds: 1
+
+risk:
+  atr_len: 28
+  atr_mult_sl: 1.7
+  atr_mult_tp: 0.0
+  use_tp: false
+  fast_check_seconds: 2
+  stop_timeframe: 5m
+
+  trailing_enabled: true
+  trail_atr_mult: 1.10
+
+  trailing_sl:
+    enabled: true
+    type: ma_atr
+    ma_len: 34
+    atr_length: 28
+    multiplier: 1.6
+    cooldown_bars: 2
+
+  breakeven_after_r: 0.60
+  stop_on_close_only: false
+  stop_confirm_bars: 0
+  min_hold_minutes: 0
+  catastrophic_atr_mult: 2.0
+  stop_buffer_bps: 0.0
+  cooldown_minutes_after_stop: 20
+  reentry_after_loss_minutes: 30
+
+  partial_tp_enabled: true
+  partial_tp_r: 0.75
+  partial_tp_size: 0.45
+  max_daily_loss_pct: 12.0
+  trade_disable_minutes: 0
+  use_trailing_killswitch: true
+  min_close_pnl_pct: 0.0
+  max_hours_in_trade: 10
+
+  trailing_unlocks:
+    enabled: false
+    triggers_r: []
+    lock_r: []
+
+  exit_on_regime_flip:
+    enabled: true
+    confirm_bars: 1
+
+  adaptive:
+    enabled: true
+    low_thr_bps: 40.0
+    high_thr_bps: 120.0
+    sl_scale:
+      low: 1.4
+      mid: 1.0
+      high: 0.8
+    trail_scale:
+      low: 1.2
+      mid: 1.0
+      high: 0.8
+    ladder_r_scale:
+      low: 1.1
+      mid: 1.0
+      high: 0.9
+
+  partial_ladders:
+    enabled: true
+    r_levels: [0.80]
+    sizes: [0.30]
+    reduce_only: true
+
+  no_progress:
+    enabled: true
+    min_minutes: 120
+    min_rr: 0.70
+    min_close_pnl_pct: 0.0
+    tiers: null
+
+  profit_lock:
+    enabled: false
+    triggers_r: []
+    lock_to_r: []
+
+  profit_lock_steps: null
+  breakeven_extra_bps: 0.0
+  trail_after_partial_mult: 0.10
+  age_tighten: null
+
+  anti_churn:
+    enabled: true
+    cooldown_minutes: 20
+    after_stop_cooldown_minutes: 120
+    max_trades_per_lookback: 1
+    lookback_minutes: 90
+    streak_pause_after_losses: 2
+    streak_pause_minutes: 180
+    reentry_requires_reset:
+      zscore_max: 0.25
+      atr_breakout_mult: 0.5
+      use_any: true
+      hysteresis_z: 0.10
+    min_bar_separation: 1
+
+optimizer:
+  walk_forward:
+    n_splits: 6
+    embargo_frac: 0.02
+    lookback_bars: 600
+    objective: sharpe
+    max_params: 256
+  last_best_params: {}
+  last_updated: null
+
+paths:
+  state_path: /opt/xsmom-bot/state.json
+  logs_dir: /opt/xsmom-bot/logs
+  metrics_path: null
+
+logging:
+  level: INFO
+  file_max_mb: 20
+  file_backups: 5
+  audit_unknown_keys: true
+
+notifications:
+  discord:
+    enabled: false
+    send_optimizer_results: true
+    send_daily_report: true
+    # Fallback webhook if DISCORD_WEBHOOK_URL env var is not set.
+    # NOTE: This is the actual webhook; do NOT commit this to a public repo.
+    webhook_url: null
+  
+  # MAKE MONEY hardening: Monitoring and alerts
+  monitoring:
+    no_trade:
+      enabled: true
+      threshold_hours: 4.0  # Alert if no trades for N hours
+    cost_tracking:
+      enabled: true
+      compare_to_backtest: true  # Compare live costs to backtest assumptions
+      alert_threshold_pct: 20.0  # Alert if costs exceed backtest by N%
+
+sleeve_constraints: {}

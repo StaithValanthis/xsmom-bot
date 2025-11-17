@@ -1,0 +1,50 @@
+# config/optimizer.grid.yaml
+# A practical staged grid, tuned for moderate search size.
+optimizer:
+  objective: calmar_minus_lambda_turnover
+  lambda_turnover: [0.0002, 0.0006, 0.001, 0.002]
+
+guards:
+  min_trades: 150
+  oos_degradation_max: 0.20   # reserved (not enforced in this basic CLI)
+  param_change_budget:
+    per_run_max:
+      gross_leverage: 0.25
+      k_max: 2
+      entry_zscore_min: 0.4
+
+stages:
+  # Stage 1: structure (timeframe + momentum windows/weights + k's)
+  - timeframe: ["30m", "1h", "2h", "4h"]
+    lookbacks:
+      - [2, 8, 24]
+      - [4, 12, 36]
+      - [6, 18, 48]
+    lookback_weights:
+      - [1.0, 1.0, 1.0]
+      - [1.2, 1.0, 0.8]
+    vol_lookback: [36, 72, 120]
+    k_min: [2, 3]
+    k_max: [6, 8, 10]
+
+  # Stage 2: risk
+  - gross_leverage: [0.8, 1.0, 1.2, 1.5]
+    max_weight_per_asset: [0.08, 0.12, 0.16]
+    target_portfolio_vol: [0.18, 0.24, 0.30]
+
+  # Stage 3: hygiene (entries/exits + regime + diversification)
+  - entry_zscore_min: [0.4, 0.6, 0.8, 1.0]
+    exit_zscore: [0.2, 0.4, 0.6]
+    regime_ema: [120, 160, 200, 240]
+    regime_slope: [0, 2, 4, 6]
+    adx_len: [10, 14, 20]
+    adx_min: [18, 22, 26]
+    corr_lookback: [36, 72]
+    max_pair_corr: [0.8, 0.9]
+
+  # Stage 4: costs/carry/microstructure
+  - fill_bias: [0.4, 0.6, 0.8]
+    spread_bps_max: [5, 10, 15]
+    min_depth_usd: [500, 1500, 3000]
+    funding_tilt: [0.0, 0.5, 1.0]
+    carry_budget_frac: [0.0, 0.2, 0.4]

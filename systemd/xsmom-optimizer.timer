@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly XSMOM optimizer run
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=20m
+Persistent=true
+Unit=xsmom-optimizer.service
+
+[Install]
+WantedBy=timers.target

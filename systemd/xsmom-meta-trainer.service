@@ -1,0 +1,16 @@
+# systemd/xsmom-meta-trainer.service
+[Unit]
+Description=XSMOM meta-label trainer (EOD)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/xsmom-bot
+Environment=PYTHONPATH=/opt/xsmom-bot
+ExecStart=/opt/xsmom-bot/venv/bin/python3 -m src.meta_label_trainer --config /opt/xsmom-bot/config/config.yaml
+Restart=no
+StandardOutput=append:/var/log/xsmom-meta-trainer.log
+StandardError=append:/var/log/xsmom-meta-trainer.log

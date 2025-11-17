@@ -1,0 +1,26 @@
+[Unit]
+Description=Multi-pair XSMOM Crypto Bot (Bybit USDT-perp)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/xsmom-bot
+EnvironmentFile=/opt/xsmom-bot/.env
+ExecStart=/opt/xsmom-bot/venv/bin/python -m src.main live --config /opt/xsmom-bot/config/config.yaml --dry
+# For live trading (remove --dry after validation):
+# ExecStart=/opt/xsmom-bot/venv/bin/python -m src.main live --config /opt/xsmom-bot/config/config.yaml
+
+Restart=always
+RestartSec=10
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
