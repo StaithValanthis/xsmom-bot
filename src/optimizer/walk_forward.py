@@ -69,6 +69,8 @@ def generate_wfo_segments(
         return []
     
     # Find common date range
+    # Use flexible timestamp matching: require timestamps to be present in at least 80% of symbols
+    # This is more robust than strict intersection when symbols have different trading hours
     all_indices = []
     for df in bars.values():
         if len(df) > 0:
@@ -78,15 +80,26 @@ def generate_wfo_segments(
         log.warning("No valid data in bars")
         return []
     
-    common_index = all_indices[0]
-    for idx in all_indices[1:]:
-        common_index = common_index.intersection(idx)
+    # Get union of all timestamps
+    all_timestamps = set()
+    for idx in all_indices:
+        all_timestamps.update(idx)
     
-    if len(common_index) == 0:
-        log.warning("No overlapping timestamps across symbols")
+    # Count how many symbols have each timestamp
+    timestamp_counts = {}
+    for ts in all_timestamps:
+        count = sum(1 for idx in all_indices if ts in idx)
+        timestamp_counts[ts] = count
+    
+    # Require timestamps to be present in at least 80% of symbols
+    min_symbols = max(1, int(len(all_indices) * 0.8))
+    flexible_common = [ts for ts, count in timestamp_counts.items() if count >= min_symbols]
+    
+    if len(flexible_common) == 0:
+        log.warning(f"No timestamps found in at least {min_symbols} symbols (80% of {len(all_indices)} symbols)")
         return []
     
-    common_index = common_index.sort_values()
+    common_index = pd.Index(flexible_common).sort_values()
     
     if start_date is not None:
         common_index = common_index[common_index >= start_date]
@@ -148,6 +161,12 @@ def generate_wfo_segments(
             
             train_df = df[train_mask].copy()
             oos_df = df[oos_mask].copy()
+            
+            # Remove duplicate timestamps (keep first occurrence)
+            if train_df.index.duplicated().any():
+                train_df = train_df[~train_df.index.duplicated(keep='first')]
+            if oos_df.index.duplicated().any():
+                oos_df = oos_df[~oos_df.index.duplicated(keep='first')]
             
             if len(train_df) >= min_train_bars and len(oos_df) >= min_oos_bars:
                 train_seg_bars[sym] = train_df

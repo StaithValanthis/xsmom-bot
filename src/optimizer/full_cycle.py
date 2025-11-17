@@ -9,7 +9,7 @@ import logging
 import argparse
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 
 from ..config import load_config, AppConfig
@@ -221,7 +221,7 @@ def run_full_cycle(
     """
     log.info("=== FULL CYCLE OPTIMIZER ===")
     
-    run_start_time = datetime.utcnow()
+    run_start_time = datetime.now(timezone.utc)
     
     # Load configs
     base_cfg = load_config(base_config_path)
@@ -486,7 +486,7 @@ def run_full_cycle(
     
     # Prepare result
     result = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "baseline_metrics": baseline_aggregated,
         "candidates_evaluated": len(candidate_results),
         "best_candidate": None,
