@@ -246,14 +246,44 @@ def run_full_cycle(
     if symbol_universe is None:
         symbol_universe = symbols
     
-    log.info(f"Fetched data for {len(bars)} symbols, {len(list(bars.values())[0])} bars")
+    # Check available data
+    sample_symbol = list(bars.keys())[0] if bars else None
+    available_bars = len(bars[sample_symbol]) if sample_symbol else 0
+    log.info(f"Fetched data for {len(bars)} symbols, {available_bars} bars per symbol")
+    
+    # Calculate required bars for WFO (before creating WFOConfig)
+    timeframe_hours = 1.0  # Assuming 1h bars (could be extracted from config)
+    min_train_days = 60  # WFOConfig default
+    min_oos_days = 7  # WFOConfig default
+    min_train_bars = int(min_train_days * 24 / timeframe_hours)  # 60 days * 24h = 1440 bars
+    min_oos_bars = int(min_oos_days * 24 / timeframe_hours)  # 7 days * 24h = 168 bars
+    embargo_bars_required = int(embargo_days * 24 / timeframe_hours)
+    required_bars = min_train_bars + embargo_bars_required + min_oos_bars
+    
+    if available_bars < required_bars:
+        available_days = available_bars * timeframe_hours / 24
+        required_days = required_bars * timeframe_hours / 24
+        error_msg = (
+            f"WFO requires at least {required_days:.1f} days of data "
+            f"({required_bars} bars at {timeframe_hours}h), but only {available_days:.1f} days "
+            f"({available_bars} bars) are available.\n\n"
+            f"Solutions:\n"
+            f"1. Increase candles_limit in config.yaml (current: {base_cfg.exchange.candles_limit})\n"
+            f"   Set to at least {required_bars} (recommended: {required_bars + 200})\n"
+            f"2. Use a simpler optimizer that doesn't require WFO:\n"
+            f"   - python -m src.optimizer_runner (grid search)\n"
+            f"   - python -m src.optimizer_cli (staged grid search)\n"
+            f"   - python -m src.optimizer (legacy simple grid)\n"
+            f"3. Reduce WFO requirements (train_days, oos_days) if you have less data"
+        )
+        raise RuntimeError(error_msg)
     
     # Generate WFO segments
     wfo_cfg = WFOConfig(
         train_days=train_days,
         oos_days=oos_days,
         embargo_days=embargo_days,
-        timeframe_hours=1.0,  # Assuming 1h bars
+        timeframe_hours=timeframe_hours,
     )
     
     segments = generate_wfo_segments(bars, wfo_cfg)
