@@ -252,13 +252,42 @@ prompt_secrets(){
 
 ensure_active_config(){
   local dest="$1"
+  # Ensure config directory exists
+  ensure_dir_owned "${dest}/config"
+  
   if [ ! -f "${dest}/config/config.yaml" ]; then
+    # Try config.yaml.example first (preferred)
     if [ -f "${dest}/config/config.yaml.example" ]; then
       cp "${dest}/config/config.yaml.example" "${dest}/config/config.yaml"
       sudo chown "${RUN_AS}:${RUN_GROUP}" "${dest}/config/config.yaml"
-      info "Seeded ${dest}/config/config.yaml from example."
+      info "Created ${dest}/config/config.yaml from config.yaml.example"
+    # Fallback to config.yaml.best (if example doesn't exist)
+    elif [ -f "${dest}/config/config.yaml.best" ]; then
+      cp "${dest}/config/config.yaml.best" "${dest}/config/config.yaml"
+      sudo chown "${RUN_AS}:${RUN_GROUP}" "${dest}/config/config.yaml"
+      info "Created ${dest}/config/config.yaml from config.yaml.best"
     else
-      warn "config.yaml.example not found. You'll need to create config/config.yaml manually."
+      warn "Neither config.yaml.example nor config.yaml.best found."
+      warn "You'll need to create ${dest}/config/config.yaml manually."
+      # Create a minimal config file as last resort
+      cat > "${dest}/config/config.yaml" << 'EOF'
+# Minimal xsmom-bot config
+# TODO: Copy from config.yaml.example or config.yaml.best
+
+exchange:
+  id: bybit
+  testnet: true  # Set to false for production
+  max_symbols: 36
+
+strategy:
+  signal_power: 1.35
+  gross_leverage: 0.95
+
+risk:
+  max_daily_loss_pct: 5.0
+EOF
+      sudo chown "${RUN_AS}:${RUN_GROUP}" "${dest}/config/config.yaml"
+      warn "Created minimal config file. Please update it with proper settings."
     fi
   else
     info "Config file already exists: ${dest}/config/config.yaml"
@@ -267,11 +296,18 @@ ensure_active_config(){
 
 normalize_destination_tree(){
   local dest="$1"
-  ensure_dir_owned "${dest}/logs"
-  ensure_dir_owned "${dest}/state"
+  # Ensure all required directories exist
+  ensure_dir_owned "${dest}/src"              # Python source code (CRITICAL)
+  ensure_dir_owned "${dest}/config"            # Config files (CRITICAL)
+  ensure_dir_owned "${dest}/logs"              # Log files
+  ensure_dir_owned "${dest}/state"             # State files
   ensure_dir_owned "${dest}/data"              # For rollout state
   ensure_dir_owned "${dest}/config/optimized"  # For optimized configs
   ensure_dir_owned "${dest}/reports"           # For optimizer reports
+  ensure_dir_owned "${dest}/systemd"           # Systemd unit files
+  ensure_dir_owned "${dest}/bin"                # Helper scripts
+  ensure_dir_owned "${dest}/docs"              # Documentation
+  ensure_dir_owned "${dest}/tools"              # Tools
 }
 
 seed_local_if_missing(){
@@ -384,6 +420,17 @@ validate_installation(){
     die "Virtual environment not properly created at ${dest}/venv"
   fi
   
+  # Check src/ directory exists and has Python files
+  if [ ! -d "${dest}/src" ]; then
+    die "src/ directory not found. Bot cannot run without Python source code."
+  fi
+  if [ ! -f "${dest}/src/main.py" ]; then
+    warn "src/main.py not found. Bot may not run properly."
+  fi
+  if [ ! -f "${dest}/src/config.py" ]; then
+    warn "src/config.py not found. Bot may not run properly."
+  fi
+  
   # Check config exists
   if [ ! -f "${dest}/config/config.yaml" ]; then
     warn "config/config.yaml not found. Bot may not run without it."
@@ -493,14 +540,39 @@ main(){
   info "Copying repository files into ${APP_DIR}..."
   # Ensure .env.example exists before copying
   ensure_env_example "."
-  sudo rsync -a --delete \
-    README.md requirements.txt .env.example install.sh run_local.sh \
-    config/ src/ systemd/ state/ logs/ tests/ bin/ docs/ tools/ \
-    "${APP_DIR}/" 2>/dev/null || true
+  # Use explicit paths to avoid case-sensitivity issues on Windows/WSL
+  # Ensure src/ exists and is lowercase
+  if [ -d "./src" ]; then
+    sudo rsync -a --delete \
+      README.md requirements.txt .env.example install.sh run_local.sh \
+      config/ ./src/ systemd/ state/ logs/ tests/ bin/ docs/ tools/ \
+      "${APP_DIR}/" 2>/dev/null || true
+  else
+    warn "src/ directory not found. Skipping rsync."
+  fi
   
   # Normalize destination tree (create required dirs)
   info "Normalizing destination tree..."
   normalize_destination_tree "${APP_DIR}"
+  
+  # Fix case-sensitivity: ensure src/ is lowercase (not Src/)
+  if [ -d "${APP_DIR}/Src" ] && [ ! -d "${APP_DIR}/src" ]; then
+    warn "Found Src/ directory (wrong case). Renaming to src/..."
+    sudo mv "${APP_DIR}/Src" "${APP_DIR}/src"
+  fi
+  
+  # Verify critical directories exist
+  if [ ! -d "${APP_DIR}/src" ]; then
+    warn "src/ directory missing after rsync. Creating it..."
+    ensure_dir_owned "${APP_DIR}/src"
+  fi
+  
+  # Verify src/ has Python files
+  if [ ! -f "${APP_DIR}/src/main.py" ] && [ ! -f "${APP_DIR}/src/config.py" ]; then
+    warn "⚠️  WARNING: src/ directory exists but appears empty or incomplete."
+    warn "   Expected files: src/main.py, src/config.py, etc."
+    warn "   This may indicate rsync failed or source files are missing."
+  fi
   
   # Set permissions
   info "Setting permissions..."
