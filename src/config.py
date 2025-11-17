@@ -276,6 +276,13 @@ class NoProgressCfg(BaseModel):
     # min_close_pnl_pct removed per parameter review (dead code)
     # tiers removed per parameter review (dead code)
 
+class DataCfg(BaseModel):
+    """Configuration for historical data fetching and pagination."""
+    max_candles_per_request: int = 1000  # Bybit's per-request limit
+    max_candles_total: int = 50000  # Safety cap per symbol/timeframe
+    api_throttle_sleep_ms: int = 200  # Sleep between paginated calls (milliseconds)
+    max_pagination_requests: int = 100  # Safety limit on number of pagination requests
+
 class RiskCfg(BaseModel):
     atr_len: int = 28
     atr_mult_sl: float = 2.0
@@ -391,6 +398,7 @@ class AppConfig(BaseModel):
     logging: LoggingCfg
     costs: CostsCfg = CostsCfg()
     notifications: NotificationsCfg = NotificationsCfg()
+    data: DataCfg = DataCfg()  # Historical data fetching configuration
     
     # Rollout/optimizer configs (optional, for rollout system)
     rollout: Optional[Dict[str, Any]] = None
@@ -450,6 +458,12 @@ def _merge_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
     raw["notifications"].setdefault("monitoring", {})
     raw["notifications"]["monitoring"].setdefault("no_trade", {"enabled": True, "threshold_hours": 4.0})
     raw["notifications"]["monitoring"].setdefault("cost_tracking", {"enabled": True, "compare_to_backtest": True, "alert_threshold_pct": 20.0})
+    
+    raw.setdefault("data", {})
+    raw["data"].setdefault("max_candles_per_request", 1000)
+    raw["data"].setdefault("max_candles_total", 50000)
+    raw["data"].setdefault("api_throttle_sleep_ms", 200)
+    raw["data"].setdefault("max_pagination_requests", 100)
     
     raw.setdefault("risk", {})
     raw["risk"].setdefault("api_circuit_breaker", {"enabled": True, "max_errors": 5, "window_seconds": 300, "cooldown_seconds": 600})

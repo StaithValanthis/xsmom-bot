@@ -112,7 +112,7 @@ def run_timeframe_sweep(
         ) + margin_bars
         trial.exchange.candles_limit = max(trial.exchange.candles_limit, need, min_candles)
 
-        ex_tf = ExchangeWrapper(trial.exchange)
+        ex_tf = ExchangeWrapper(trial.exchange, data_cfg=base_cfg.data)
         try:
             bars = _fetch_bars_for_tf(ex_tf, universe, trial.exchange.timeframe, trial.exchange.candles_limit)
         finally:

@@ -92,7 +92,7 @@ def run_backtest(
             if isinstance(df, pd.DataFrame) and len(df) > 0:
                 bars[s] = df.copy()
     else:
-        ex = ExchangeWrapper(cfg.exchange, risk_cfg=None)  # Backtester doesn't need circuit breaker
+        ex = ExchangeWrapper(cfg.exchange, risk_cfg=None, data_cfg=cfg.data)  # Backtester doesn't need circuit breaker
         try:
             for s in symbols:
                 try:

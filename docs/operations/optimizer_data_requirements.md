@@ -26,25 +26,36 @@ exchange:
 
 **Bybit API Limit:**
 - **Per request:** Maximum 1000 bars per single API call
-- **Automatic pagination:** The `ExchangeWrapper.fetch_ohlcv()` method now automatically paginates when `candles_limit > 1000`
-- **How it works:** Makes multiple requests of 1000 bars each and concatenates them
+- **Automatic pagination:** The `ExchangeWrapper.fetch_ohlcv()` method automatically paginates when `candles_limit > 1000`
+- **How it works:** 
+  - Makes multiple requests of up to 1000 bars each
+  - Goes backwards in time (most recent → older)
+  - Automatically deduplicates timestamps
+  - Respects rate limits with configurable delays
+- **Date range fetching:** `fetch_ohlcv_range()` supports explicit start/end timestamps with forward pagination
 
 **Common causes of limited data:**
 1. **Config override:** Your `config.yaml` may have `candles_limit: 1000` or lower
-2. **Pagination not working:** If pagination fails, you'll only get 1000 bars (check logs for pagination errors)
-3. **Network/timeout issues:** Partial data fetch due to timeouts
-4. **Exchange historical data limits:** Some exchanges may not have enough historical data available
+2. **Safety limits:** `data.max_candles_total` or `data.max_pagination_requests` may be too low
+3. **Pagination not working:** If pagination fails, you'll only get 1000 bars (check logs for pagination errors)
+4. **Rate limiting:** Too aggressive fetching may hit rate limits (increase `data.api_throttle_sleep_ms`)
+5. **Network/timeout issues:** Partial data fetch due to timeouts
+6. **Exchange historical data limits:** Some exchanges may not have enough historical data available
 
 ### Solutions
 
-#### Solution 1: Increase `candles_limit` (Recommended)
+#### Solution 1: Increase `candles_limit` and Configure Data Limits (Recommended)
 
 **Edit your config:**
 ```yaml
 exchange:
-  candles_limit: 2000  # For 1h bars: ~83 days (minimum for WFO)
-  # Or higher for default WFO settings:
-  candles_limit: 4000  # ~167 days (comfortable for 120/30/2 WFO)
+  candles_limit: 4000  # ~167 days at 1h (comfortable for 120/30/2 WFO)
+
+# Configure pagination limits
+data:
+  max_candles_total: 5000  # Safety cap (should be >= candles_limit)
+  api_throttle_sleep_ms: 200  # Delay between pagination requests (ms)
+  max_pagination_requests: 100  # Max pagination requests per fetch
 ```
 
 **After updating:**
@@ -52,6 +63,17 @@ exchange:
 # Restart optimizer
 sudo systemctl restart xsmom-optimizer.service
 ```
+
+**Verify pagination is working:**
+```bash
+# Test data fetching
+python tools/test_data_loader.py --config config/config.yaml --symbol BTC/USDT:USDT --limit 2000
+```
+
+Expected output should show:
+- ✓ Fetched ~2000 bars (not just 1000)
+- ✓ No duplicate timestamps
+- ✓ Date range covers expected period
 
 #### Solution 2: Use Alternative Optimizers (No WFO Required)
 

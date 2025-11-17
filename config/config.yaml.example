@@ -14,6 +14,14 @@ exchange:
   include_symbols: []
   exclude_symbols: []
 
+# Historical data fetching configuration
+# Controls pagination and rate limiting for fetching >1000 bars from Bybit
+data:
+  max_candles_per_request: 1000  # Bybit's per-request limit (do not change)
+  max_candles_total: 50000       # Safety cap per symbol/timeframe (prevents runaway fetches)
+  api_throttle_sleep_ms: 200     # Sleep between paginated requests (milliseconds)
+  max_pagination_requests: 100   # Safety limit on number of pagination requests per fetch
+
 strategy:
   ensemble:
     enabled: true

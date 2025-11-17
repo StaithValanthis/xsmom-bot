@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional
 
 import ccxt
+import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
 from .config import ExchangeCfg
 from .risk_controller import APICircuitBreaker
@@ -19,15 +20,17 @@ class ExchangeWrapper:
     Public methods stable for live.py/backtester.
     """
 
-    def __init__(self, cfg: ExchangeCfg, risk_cfg=None):
+    def __init__(self, cfg: ExchangeCfg, risk_cfg=None, data_cfg=None):
         """
         Initialize ExchangeWrapper.
         
         Args:
             cfg: ExchangeCfg
             risk_cfg: Optional RiskCfg for circuit breaker config
+            data_cfg: Optional DataCfg for pagination/rate limiting config
         """
         self.cfg = cfg
+        self.data_cfg = data_cfg
         
         # Circuit breaker for API failures (MAKE MONEY hardening)
         # Get config from risk_cfg if provided, else default
@@ -153,8 +156,11 @@ class ExchangeWrapper:
         Returns:
             List of [timestamp, open, high, low, close, volume] arrays
         """
-        # Bybit API limit per request
-        MAX_BARS_PER_REQUEST = 1000
+        # Bybit API limit per request (configurable via data_cfg)
+        if self.data_cfg:
+            MAX_BARS_PER_REQUEST = self.data_cfg.max_candles_per_request
+        else:
+            MAX_BARS_PER_REQUEST = 1000
         
         if limit <= MAX_BARS_PER_REQUEST:
             # Single request is sufficient
@@ -263,6 +269,158 @@ class ExchangeWrapper:
                 all_bars = all_bars[-limit:]
         
         log.debug(f"Fetched {len(all_bars)} bars for {symbol} (requested {limit})")
+        return all_bars
+    
+    def fetch_ohlcv_range(
+        self,
+        symbol: str,
+        timeframe: str,
+        start_ts: int,
+        end_ts: int,
+        max_candles: Optional[int] = None,
+    ) -> List[List]:
+        """
+        Fetch OHLCV data for a specific date range using forward pagination.
+        
+        This method fetches data from start_ts to end_ts by making multiple
+        paginated requests. It's designed for historical data fetching where
+        you need a specific time range rather than "most recent N bars".
+        
+        Args:
+            symbol: Symbol to fetch (e.g., 'BTC/USDT:USDT')
+            timeframe: Bar timeframe (e.g., '1h', '5m')
+            start_ts: Start timestamp in milliseconds (inclusive)
+            end_ts: End timestamp in milliseconds (inclusive)
+            max_candles: Optional maximum number of candles to fetch (safety limit)
+        
+        Returns:
+            List of [timestamp, open, high, low, close, volume] arrays, oldest-first
+        """
+        # Get config values
+        max_per_request = 1000
+        throttle_ms = 200
+        max_requests = 100
+        max_total = 50000
+        
+        if self.data_cfg:
+            max_per_request = self.data_cfg.max_candles_per_request
+            throttle_ms = self.data_cfg.api_throttle_sleep_ms
+            max_requests = self.data_cfg.max_pagination_requests
+            max_total = self.data_cfg.max_candles_total
+        
+        if max_candles is None:
+            max_candles = max_total
+        
+        # Calculate timeframe duration
+        timeframe_ms = self._timeframe_to_ms(timeframe)
+        if timeframe_ms is None:
+            log.warning(f"Unknown timeframe {timeframe}, cannot paginate by date range")
+            # Fall back to single request
+            return self.x.fetch_ohlcv(
+                symbol,
+                timeframe=timeframe,
+                limit=min(max_per_request, max_candles),
+                since=start_ts
+            )
+        
+        log.info(
+            f"Fetching OHLCV range for {symbol}: "
+            f"{pd.Timestamp(start_ts, unit='ms', tz='UTC')} to "
+            f"{pd.Timestamp(end_ts, unit='ms', tz='UTC')} "
+            f"(max {max_candles} candles)"
+        )
+        
+        all_bars = []
+        current_since = start_ts
+        request_count = 0
+        seen_timestamps = set()
+        
+        while current_since <= end_ts and len(all_bars) < max_candles:
+            if request_count >= max_requests:
+                log.warning(f"Reached max pagination requests ({max_requests}) for {symbol}")
+                break
+            
+            # Calculate how many bars we can request in this chunk
+            # Estimate based on time range remaining
+            time_remaining_ms = end_ts - current_since + timeframe_ms
+            estimated_bars = int(time_remaining_ms / timeframe_ms)
+            chunk_limit = min(max_per_request, estimated_bars, max_candles - len(all_bars))
+            
+            if chunk_limit <= 0:
+                break
+            
+            try:
+                chunk = self.x.fetch_ohlcv(
+                    symbol,
+                    timeframe=timeframe,
+                    limit=chunk_limit,
+                    since=current_since
+                )
+                
+                if not chunk:
+                    log.debug(f"No more data available for {symbol} at {pd.Timestamp(current_since, unit='ms', tz='UTC')}")
+                    break
+                
+                # Filter duplicates and bars within range
+                unique_chunk = []
+                for bar in chunk:
+                    ts = bar[0]
+                    if ts < start_ts:
+                        continue  # Skip bars before start
+                    if ts > end_ts:
+                        break  # Stop if we've passed end
+                    if ts not in seen_timestamps:
+                        seen_timestamps.add(ts)
+                        unique_chunk.append(bar)
+                
+                if not unique_chunk:
+                    # No new data in this chunk
+                    break
+                
+                all_bars.extend(unique_chunk)
+                request_count += 1
+                
+                # Move forward: use the last (newest) timestamp + one timeframe
+                # CCXT returns oldest-first, so last element is newest
+                if unique_chunk:
+                    newest_timestamp = unique_chunk[-1][0]
+                    current_since = newest_timestamp + timeframe_ms
+                    
+                    # If we got fewer bars than requested, we've likely hit the end
+                    if len(unique_chunk) < chunk_limit:
+                        break
+                    
+                    # Rate limiting
+                    if current_since <= end_ts and len(all_bars) < max_candles:
+                        time.sleep(throttle_ms / 1000.0)
+                else:
+                    break
+                
+            except Exception as e:
+                log.warning(f"Pagination chunk failed for {symbol} at {pd.Timestamp(current_since, unit='ms', tz='UTC')}: {e}")
+                if "rate limit" in str(e).lower() or "10006" in str(e):
+                    log.warning(f"Rate limit hit for {symbol}, waiting 2 seconds...")
+                    time.sleep(2.0)
+                else:
+                    break
+        
+        # Final deduplication and sorting
+        if all_bars:
+            unique_bars_dict = {}
+            for bar in all_bars:
+                ts = bar[0]
+                if start_ts <= ts <= end_ts:  # Ensure within range
+                    unique_bars_dict[ts] = bar
+            all_bars = list(unique_bars_dict.values())
+            all_bars.sort(key=lambda x: x[0])  # Sort by timestamp (oldest first)
+        
+        log.info(
+            f"Fetched {len(all_bars)} bars for {symbol} "
+            f"(range: {pd.Timestamp(start_ts, unit='ms', tz='UTC')} to "
+            f"{pd.Timestamp(end_ts, unit='ms', tz='UTC')}, "
+            f"{request_count} requests)"
+        )
+        
         return all_bars
     
     def _timeframe_to_ms(self, timeframe: str) -> Optional[int]:

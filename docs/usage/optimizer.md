@@ -366,6 +366,113 @@ Saved to `logs/optimizer_full_cycle_YYYYMMDD_HHMMSS.json`:
 }
 ```
 
+## Bybit Historical Data & 1000-Item Limit
+
+### The Problem
+
+Bybit's API limits single OHLCV requests to **1000 bars per request**. When the optimizer requests more than 1000 bars (e.g., `candles_limit: 4000`), the system automatically paginates to fetch the full range.
+
+### How Pagination Works
+
+The optimizer uses two pagination strategies:
+
+1. **Limit-based pagination** (`fetch_ohlcv`):
+   - Fetches "most recent N bars" by going backwards in time
+   - Used by default when `candles_limit > 1000`
+   - Automatically deduplicates and handles rate limits
+
+2. **Date range pagination** (`fetch_ohlcv_range`):
+   - Fetches data for a specific time range (start_ts to end_ts)
+   - Uses forward pagination (oldest to newest)
+   - Available via `fetch_historical_data(..., use_date_range=True)`
+
+### Configuration
+
+Control pagination behavior via `data.*` config keys:
+
+```yaml
+data:
+  max_candles_per_request: 1000  # Bybit's per-request limit (do not change)
+  max_candles_total: 50000       # Safety cap per symbol/timeframe
+  api_throttle_sleep_ms: 200     # Sleep between paginated requests (ms)
+  max_pagination_requests: 100    # Safety limit on pagination requests
+```
+
+**Recommended settings:**
+- `max_candles_total`: Set to at least `(train_days + oos_days + embargo_days) * 24 / timeframe_hours`
+  - Example: For 120/30/2 days at 1h: `(152 * 24) = 3648` → set to `4000` or higher
+- `api_throttle_sleep_ms`: 200ms is usually safe; increase to 500ms if hitting rate limits
+- `max_pagination_requests`: 100 allows up to 100,000 bars (100 * 1000); adjust if needed
+
+### Rate Limiting
+
+The pagination system includes built-in rate limiting:
+
+- **Per-request delay**: `api_throttle_sleep_ms` between pagination chunks
+- **Rate limit detection**: Automatically waits 2 seconds on rate limit errors
+- **CCXT rate limiting**: Enabled by default (`enableRateLimit: True`)
+
+If you see rate limit errors in logs:
+1. Increase `api_throttle_sleep_ms` (e.g., 500ms)
+2. Reduce number of symbols being fetched
+3. Check Bybit API status page
+
+### Troubleshooting Data Issues
+
+**Symptom:** "No WFO segments generated" or "Insufficient data"
+
+**Causes:**
+1. `candles_limit` too small for WFO requirements
+2. Pagination failing silently (check logs for pagination errors)
+3. Exchange not returning enough historical data
+
+**Solutions:**
+1. Increase `exchange.candles_limit` in config (e.g., 4000+ for 1h bars)
+2. Check logs for pagination warnings/errors
+3. Verify `data.max_candles_total` is high enough
+4. Test data fetching manually (see "Testing Data Fetching" below)
+
+**Symptom:** "Optimizer/backtest doesn't cover full requested history"
+
+**Causes:**
+1. `data.max_candles_total` cap reached
+2. `data.max_pagination_requests` limit hit
+3. Network/timeout issues during pagination
+
+**Solutions:**
+1. Increase `data.max_candles_total` if you need more history
+2. Increase `data.max_pagination_requests` if fetching very long ranges
+3. Check network stability and API connection
+4. Review logs for pagination progress
+
+### Testing Data Fetching
+
+Test the data loader manually:
+
+```bash
+python -c "
+from src.config import load_config
+from src.optimizer.backtest_runner import fetch_historical_data
+import pandas as pd
+
+cfg = load_config('config/config.yaml')
+bars, symbols = fetch_historical_data(cfg, symbols=['BTC/USDT:USDT'])
+
+if bars:
+    btc = bars['BTC/USDT:USDT']
+    print(f'Fetched {len(btc)} bars')
+    print(f'Date range: {btc.index[0]} to {btc.index[-1]}')
+    print(f'Gaps: {btc.index.to_series().diff().value_counts().head()}')
+else:
+    print('No data fetched')
+"
+```
+
+Expected output:
+- Number of bars matches or exceeds `candles_limit`
+- Date range covers expected time period
+- No large gaps in timestamps (except weekends for some markets)
+
 ## Troubleshooting
 
 ### "Optuna not installed"

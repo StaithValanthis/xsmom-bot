@@ -1168,7 +1168,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
     soft_block_until_ts = float((state or {}).get("soft_block_until_ts") or 0.0)
     current_stepdown_tier = int(state.get("risk_stepdown_tier", 0))
 
-    ex = ExchangeWrapper(cfg.exchange, risk_cfg=cfg.risk)
+    ex = ExchangeWrapper(cfg.exchange, risk_cfg=cfg.risk, data_cfg=cfg.data)
 
     if getattr(cfg.execution, "cancel_open_orders_on_start", False):
         try:

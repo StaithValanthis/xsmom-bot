@@ -22,7 +22,32 @@ This document lists all configuration parameters with their types, defaults, and
 | `exchange.max_symbols` | int | `36` | Maximum symbols in trading universe |
 | `exchange.min_usd_volume_24h` | float | `100000000.0` | Minimum 24h volume filter (USD) |
 | `exchange.timeframe` | str | `1h` | OHLCV bar timeframe |
+| `exchange.candles_limit` | int | `4000` | Number of bars to fetch (will paginate if > 1000) |
 | `exchange.testnet` | bool | `false` | Use testnet (recommended for testing) |
+
+---
+
+## Data (Historical Data Fetching)
+
+Controls pagination and rate limiting for fetching historical OHLCV data from Bybit when `candles_limit > 1000`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data.max_candles_per_request` | int | `1000` | Bybit's per-request limit (do not change) |
+| `data.max_candles_total` | int | `50000` | Safety cap per symbol/timeframe (prevents runaway fetches) |
+| `data.api_throttle_sleep_ms` | int | `200` | Sleep between paginated requests (milliseconds) |
+| `data.max_pagination_requests` | int | `100` | Safety limit on number of pagination requests per fetch |
+
+**Notes:**
+- **Bybit API Limit**: Single requests are capped at 1000 bars. The system automatically paginates when `candles_limit > 1000`.
+- **Pagination**: Uses backward pagination (most recent N bars) by default, or forward pagination (date ranges) when using `fetch_ohlcv_range`.
+- **Rate Limiting**: Built-in delays prevent hitting Bybit's rate limits. Increase `api_throttle_sleep_ms` if you see rate limit errors.
+- **Safety Limits**: `max_candles_total` and `max_pagination_requests` prevent infinite loops or excessive API usage.
+
+**Recommended Settings:**
+- For WFO with 120/30/2 days at 1h: Set `max_candles_total` to at least 4000
+- If hitting rate limits: Increase `api_throttle_sleep_ms` to 500ms
+- For very long backtests: Increase `max_pagination_requests` (allows up to `max_pagination_requests * 1000` bars)
 
 ---
 

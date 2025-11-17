@@ -115,6 +115,8 @@ def fetch_historical_data(
     cfg: AppConfig,
     symbols: Optional[List[str]] = None,
     end_time: Optional[pd.Timestamp] = None,
+    start_time: Optional[pd.Timestamp] = None,
+    use_date_range: bool = False,
 ) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
     """
     Fetch historical OHLCV data for symbols.
@@ -123,11 +125,13 @@ def fetch_historical_data(
         cfg: Config object (for exchange settings)
         symbols: Optional symbol list (if None, fetched from exchange)
         end_time: Optional end timestamp (defaults to now)
+        start_time: Optional start timestamp (for date range fetching)
+        use_date_range: If True, use fetch_ohlcv_range for explicit date ranges
     
     Returns:
         Tuple of (bars_dict, symbol_list)
     """
-    ex = ExchangeWrapper(cfg.exchange)
+    ex = ExchangeWrapper(cfg.exchange, data_cfg=cfg.data)
     try:
         if symbols is None:
             symbols_list = ex.fetch_markets_filtered()
@@ -138,14 +142,40 @@ def fetch_historical_data(
             log.warning("No symbols available")
             return {}, []
         
+        # Determine time range
+        if end_time is None:
+            end_time = pd.Timestamp.now(tz='UTC')
+        
+        end_ts = int(end_time.timestamp() * 1000)
+        start_ts = None
+        if start_time is not None:
+            start_ts = int(start_time.timestamp() * 1000)
+        elif use_date_range:
+            # If use_date_range but no start_time, estimate from candles_limit
+            timeframe_ms = ex._timeframe_to_ms(cfg.exchange.timeframe)
+            if timeframe_ms:
+                start_ts = end_ts - (cfg.exchange.candles_limit * timeframe_ms)
+        
         bars: Dict[str, pd.DataFrame] = {}
         for sym in symbols_list:
             try:
-                raw = ex.fetch_ohlcv(
-                    sym,
-                    timeframe=cfg.exchange.timeframe,
-                    limit=cfg.exchange.candles_limit,
-                )
+                if use_date_range and start_ts is not None:
+                    # Use date range fetching
+                    raw = ex.fetch_ohlcv_range(
+                        sym,
+                        timeframe=cfg.exchange.timeframe,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        max_candles=cfg.data.max_candles_total,
+                    )
+                else:
+                    # Use limit-based fetching (backward compatible)
+                    raw = ex.fetch_ohlcv(
+                        sym,
+                        timeframe=cfg.exchange.timeframe,
+                        limit=cfg.exchange.candles_limit,
+                    )
+                
                 if raw:
                     df = pd.DataFrame(
                         raw,
@@ -153,8 +183,19 @@ def fetch_historical_data(
                     )
                     df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
                     df.set_index("dt", inplace=True)
+                    
+                    # Filter by time range if needed
                     if end_time is not None:
                         df = df[df.index <= end_time]
+                    if start_time is not None:
+                        df = df[df.index >= start_time]
+                    
+                    # Remove duplicates (safety check)
+                    if df.index.duplicated().any():
+                        dup_count = df.index.duplicated().sum()
+                        log.debug(f"Removing {dup_count} duplicate timestamps from {sym}")
+                        df = df[~df.index.duplicated(keep='first')]
+                    
                     if len(df) > 0:
                         bars[sym] = df
             except Exception as e:
