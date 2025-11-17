@@ -1515,6 +1515,11 @@ def run_live(cfg: AppConfig, dry: bool = False):
                     df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
                     df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
                     df.set_index("dt", inplace=True)
+                    # Remove duplicate timestamps (keep first occurrence)
+                    if df.index.duplicated().any():
+                        dup_count = df.index.duplicated().sum()
+                        log.warning(f"Removing {dup_count} duplicate timestamps from {s}")
+                        df = df[~df.index.duplicated(keep='first')]
                     if len(df) > 0:
                         bars[s] = df
                 except Exception as e:
@@ -1568,7 +1573,14 @@ def run_live(cfg: AppConfig, dry: bool = False):
             # For now, the previous complex logic is removed.
 
             # Regime filter
-            closes = pd.concat({s: bars[s]["close"] for s in bars}, axis=1).dropna(how="all")
+            # Remove duplicates from each series before concatenating (safety check)
+            close_series = {}
+            for s in bars:
+                ser = bars[s]["close"].copy()
+                if ser.index.duplicated().any():
+                    ser = ser[~ser.index.duplicated(keep='first')]
+                close_series[s] = ser
+            closes = pd.concat(close_series, axis=1).dropna(how="all")
             if cfg.strategy.regime_filter.enabled:
                 ema_len = int(cfg.strategy.regime_filter.ema_len)
                 thr = float(cfg.strategy.regime_filter.slope_min_bps_per_day)
