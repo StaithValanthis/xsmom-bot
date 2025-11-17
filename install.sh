@@ -540,15 +540,36 @@ main(){
   info "Copying repository files into ${APP_DIR}..."
   # Ensure .env.example exists before copying
   ensure_env_example "."
+  
+  # Verify source directories exist
+  local missing_dirs=()
+  [ ! -d "./src" ] && missing_dirs+=("src/")
+  [ ! -d "./config" ] && missing_dirs+=("config/")
+  [ ! -d "./systemd" ] && missing_dirs+=("systemd/")
+  
+  if [ ${#missing_dirs[@]} -gt 0 ]; then
+    warn "Missing source directories: ${missing_dirs[*]}"
+    warn "This may indicate you're not running from the repository root."
+  fi
+  
   # Use explicit paths to avoid case-sensitivity issues on Windows/WSL
   # Ensure src/ exists and is lowercase
   if [ -d "./src" ]; then
-    sudo rsync -a --delete \
+    info "Syncing files from repository to ${APP_DIR}..."
+    # Run rsync with better error handling
+    if sudo rsync -av --delete \
       README.md requirements.txt .env.example install.sh run_local.sh \
       config/ ./src/ systemd/ state/ logs/ tests/ bin/ docs/ tools/ \
-      "${APP_DIR}/" 2>/dev/null || true
+      "${APP_DIR}/" 2>&1; then
+      info "✓ Files synced successfully"
+    else
+      local rsync_exit=$?
+      warn "rsync exited with code ${rsync_exit}. Some files may not have been copied."
+      warn "This is non-fatal, but you may need to copy files manually."
+    fi
   else
-    warn "src/ directory not found. Skipping rsync."
+    warn "src/ directory not found in source. Skipping rsync."
+    warn "You may need to copy files manually to ${APP_DIR}/"
   fi
   
   # Normalize destination tree (create required dirs)
@@ -567,11 +588,47 @@ main(){
     ensure_dir_owned "${APP_DIR}/src"
   fi
   
-  # Verify src/ has Python files
-  if [ ! -f "${APP_DIR}/src/main.py" ] && [ ! -f "${APP_DIR}/src/config.py" ]; then
-    warn "⚠️  WARNING: src/ directory exists but appears empty or incomplete."
+  # Verify src/ has Python files (with detailed diagnostics)
+  local src_files_ok=true
+  if [ ! -f "${APP_DIR}/src/main.py" ]; then
+    warn "⚠️  src/main.py not found in ${APP_DIR}/src/"
+    src_files_ok=false
+  fi
+  if [ ! -f "${APP_DIR}/src/config.py" ]; then
+    warn "⚠️  src/config.py not found in ${APP_DIR}/src/"
+    src_files_ok=false
+  fi
+  
+  if [ "$src_files_ok" = "false" ]; then
+    warn ""
+    warn "⚠️  WARNING: src/ directory appears empty or incomplete."
     warn "   Expected files: src/main.py, src/config.py, etc."
-    warn "   This may indicate rsync failed or source files are missing."
+    warn ""
+    warn "   Possible causes:"
+    warn "   1. rsync failed (check output above for errors)"
+    warn "   2. Source files don't exist in repository"
+    warn "   3. Permission issues preventing file copy"
+    warn ""
+    warn "   To fix:"
+    warn "   - Verify you're running from the repository root"
+    warn "   - Check that ./src/main.py exists in the source"
+    warn "   - Try manually copying: cp -r src/ ${APP_DIR}/src/"
+    warn "   - Check rsync is installed: which rsync"
+    warn ""
+    
+    # Check if source files exist
+    if [ -f "./src/main.py" ] && [ -f "./src/config.py" ]; then
+      info "Source files exist in repository. Attempting manual copy..."
+      if sudo cp -r ./src/* "${APP_DIR}/src/" 2>/dev/null; then
+        info "✓ Manually copied src/ files"
+        sudo chown -R "${RUN_AS}:${RUN_GROUP}" "${APP_DIR}/src"
+      else
+        warn "Manual copy also failed. You may need to copy files manually."
+      fi
+    else
+      warn "Source files (./src/main.py, ./src/config.py) not found in repository."
+      warn "This is a repository issue, not an installer issue."
+    fi
   fi
   
   # Set permissions
