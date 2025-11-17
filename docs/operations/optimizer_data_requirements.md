@@ -24,10 +24,16 @@ exchange:
   candles_limit: 1500  # Default in config.py
 ```
 
+**Bybit API Limit:**
+- **Per request:** Maximum 1000 bars per single API call
+- **Automatic pagination:** The `ExchangeWrapper.fetch_ohlcv()` method now automatically paginates when `candles_limit > 1000`
+- **How it works:** Makes multiple requests of 1000 bars each and concatenates them
+
 **Common causes of limited data:**
 1. **Config override:** Your `config.yaml` may have `candles_limit: 1000` or lower
-2. **Exchange API limits:** Some exchanges limit historical data (Bybit typically allows up to 200 bars per request, but CCXT may handle pagination)
+2. **Pagination not working:** If pagination fails, you'll only get 1000 bars (check logs for pagination errors)
 3. **Network/timeout issues:** Partial data fetch due to timeouts
+4. **Exchange historical data limits:** Some exchanges may not have enough historical data available
 
 ### Solutions
 

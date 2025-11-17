@@ -136,8 +136,121 @@ class ExchangeWrapper:
     # ------------------------ Market Data ------------------------
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
-    def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int):
-        return self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int, since: Optional[int] = None):
+        """
+        Fetch OHLCV data with automatic pagination for limits > 1000.
+        
+        Bybit limits single requests to 1000 bars. This method automatically
+        paginates to fetch more data when limit > 1000.
+        
+        Args:
+            symbol: Symbol to fetch (e.g., 'BTC/USDT:USDT')
+            timeframe: Bar timeframe (e.g., '1h', '5m')
+            limit: Number of bars to fetch (will paginate if > 1000)
+            since: Optional start timestamp in milliseconds (if None, fetches most recent)
+        
+        Returns:
+            List of [timestamp, open, high, low, close, volume] arrays
+        """
+        # Bybit API limit per request
+        MAX_BARS_PER_REQUEST = 1000
+        
+        if limit <= MAX_BARS_PER_REQUEST:
+            # Single request is sufficient
+            return self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit, since=since)
+        
+        # Need pagination: fetch in chunks going backwards in time
+        log.debug(f"Fetching {limit} bars for {symbol} (paginating, max {MAX_BARS_PER_REQUEST} per request)")
+        
+        all_bars = []
+        remaining = limit
+        
+        # Calculate timeframe duration in milliseconds
+        timeframe_ms = self._timeframe_to_ms(timeframe)
+        if timeframe_ms is None:
+            log.warning(f"Unknown timeframe {timeframe}, falling back to single request")
+            return self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=min(limit, MAX_BARS_PER_REQUEST), since=since)
+        
+        # CCXT returns oldest-first. To get most recent N bars:
+        # Strategy: Fetch chunks going backwards in time, then reverse to get chronological order
+        # 1. First chunk: since=None gets most recent 1000 bars
+        # 2. Subsequent chunks: Use oldest timestamp from previous chunk to fetch older data
+        # 3. Prepend older chunks, then take the last N bars (most recent)
+        
+        chunks = []  # Store chunks (will be in reverse chronological order)
+        current_since = since  # None means most recent
+        
+        while remaining > 0:
+            # Fetch up to MAX_BARS_PER_REQUEST bars
+            chunk_limit = min(remaining, MAX_BARS_PER_REQUEST)
+            
+            try:
+                chunk = self.x.fetch_ohlcv(
+                    symbol,
+                    timeframe=timeframe,
+                    limit=chunk_limit,
+                    since=current_since
+                )
+                
+                if not chunk:
+                    break
+                
+                chunks.append(chunk)
+                remaining -= len(chunk)
+                
+                if len(chunk) < chunk_limit:
+                    # Got fewer bars than requested, no more data available
+                    break
+                
+                # Move backwards in time for next chunk
+                # Use the oldest timestamp from this chunk (first element, since CCXT returns oldest-first)
+                if chunk:
+                    oldest_timestamp = chunk[0][0]  # First element's timestamp (oldest in chunk)
+                    # Calculate start time for next (older) chunk
+                    # Go back by (chunk_limit * timeframe_ms) to avoid overlap
+                    current_since = oldest_timestamp - (chunk_limit * timeframe_ms)
+                    # Ensure we don't go negative
+                    if current_since < 0:
+                        break
+                
+            except Exception as e:
+                log.warning(f"Pagination chunk failed for {symbol}: {e}")
+                break
+        
+        # Combine chunks: chunks are in reverse order (newest first), so reverse and concatenate
+        # Then take the last N bars to get most recent
+        if chunks:
+            # Reverse chunks list (oldest chunk first), then flatten
+            all_bars = []
+            for chunk in reversed(chunks):
+                all_bars.extend(chunk)
+            
+            # Trim to exact limit (keep most recent N bars)
+            # Since all_bars is now oldest-first, take the last N elements
+            if len(all_bars) > limit:
+                all_bars = all_bars[-limit:]
+        
+        log.debug(f"Fetched {len(all_bars)} bars for {symbol} (requested {limit})")
+        return all_bars
+    
+    def _timeframe_to_ms(self, timeframe: str) -> Optional[int]:
+        """Convert timeframe string to milliseconds."""
+        # Common timeframes
+        timeframe_map = {
+            '1m': 60 * 1000,
+            '3m': 3 * 60 * 1000,
+            '5m': 5 * 60 * 1000,
+            '15m': 15 * 60 * 1000,
+            '30m': 30 * 60 * 1000,
+            '1h': 60 * 60 * 1000,
+            '2h': 2 * 60 * 60 * 1000,
+            '4h': 4 * 60 * 60 * 1000,
+            '6h': 6 * 60 * 60 * 1000,
+            '12h': 12 * 60 * 60 * 1000,
+            '1d': 24 * 60 * 60 * 1000,
+            '1w': 7 * 24 * 60 * 60 * 1000,
+        }
+        return timeframe_map.get(timeframe)
 
     def fetch_tickers(self, symbols: Iterable[str]) -> Dict[str, dict]:
         syms = list(symbols)
