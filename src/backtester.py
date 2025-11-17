@@ -158,27 +158,12 @@ def run_backtest(
             window = window[eligible_cols]
 
         w = build_targets(
-            window,
-            cfg.strategy.lookbacks,
-            cfg.strategy.lookback_weights,
-            cfg.strategy.vol_lookback,
-            k_min=cfg.strategy.k_min,
-            k_max=cfg.strategy.k_max,
-            market_neutral=cfg.strategy.market_neutral,
-            gross_leverage=cfg.strategy.gross_leverage,
-            max_weight_per_asset=cfg.strategy.max_weight_per_asset,
-            dynamic_k_fn=dynamic_k if bool(getattr(cfg.strategy, "use_dynamic_k", False)) else None,
-            funding_tilt=funding_map if getattr(cfg.strategy.funding_tilt, "enabled", False) else None,
-            funding_weight=float(getattr(cfg.strategy.funding_tilt, "weight", 0.0)) if getattr(cfg.strategy.funding_tilt, "enabled", False) else 0.0,
-            entry_zscore_min=float(getattr(cfg.strategy, "entry_zscore_min", 0.0)),
-            diversify_enabled=bool(getattr(cfg.strategy.diversify, "enabled", False)),
-            corr_lookback=int(getattr(cfg.strategy.diversify, "corr_lookback", 48)),
-            max_pair_corr=float(getattr(cfg.strategy.diversify, "max_pair_corr", 0.9)),
-            vol_target_enabled=bool(getattr(cfg.strategy.vol_target, "enabled", False)),
-            target_daily_vol_bps=float(getattr(cfg.strategy.vol_target, "target_daily_vol_bps", 0.0)),
-            vol_target_min_scale=float(getattr(cfg.strategy.vol_target, "min_scale", 0.5)),
-            vol_target_max_scale=float(getattr(cfg.strategy.vol_target, "max_scale", 2.0)),
-            signal_power=float(getattr(cfg.strategy, "signal_power", 1.35)),
+            prices=window,
+            equity=equity[-1],
+            strategy_cfg=cfg.strategy,
+            prev_weights=weights_hist[-1] if len(weights_hist) else None,
+            returns=rets,
+            weights_history=pd.DataFrame(weights_hist) if len(weights_hist) > 0 else None,
         ).reindex(closes.columns).fillna(0.0)
 
         prev_w = weights_hist[-1] if len(weights_hist) else pd.Series(0.0, index=closes.columns)
@@ -208,10 +193,30 @@ def run_backtest(
         stats["avg_turnover_per_bar"] = float(np.mean(turnover_hist))
         stats["gross_turnover_per_year"] = float(np.mean(turnover_hist) * bars_per_year)
 
+    # Count trades (non-zero weight changes)
+    trade_count = 0
+    if len(weights_hist) > 1:
+        for i in range(1, len(weights_hist)):
+            delta = (weights_hist[i] - weights_hist[i-1]).abs()
+            if delta.sum() > 1e-6:  # Significant weight change
+                trade_count += 1
+    
     log.info("=== BACKTEST (cost-aware) ===")
-    log.info(f"Samples: {len(eq)} bars  |  Universe size: {len(closes.columns)}")
+    log.info(f"Samples: {len(eq)} bars  |  Universe size: {len(closes.columns)} | Trades: {trade_count}")
     log.info(f"Total Return: {stats['total_return']:.2%} | Annualized: {stats['annualized']:.2%} | Sharpe: {stats.get('sharpe',0):.2f}")
     log.info(f"Max Drawdown: {stats['max_drawdown']:.2%} | Calmar: {stats['calmar']:.2f}")
+    
+    # Add trade count to stats
+    stats["trades"] = trade_count
+    
+    # Warn if no trades
+    if trade_count == 0:
+        log.warning(
+            f"No trades executed in backtest. Possible causes: "
+            f"all symbols filtered by regime/ADX filters, "
+            f"entry thresholds too high (entry_zscore_min={getattr(cfg.strategy, 'entry_zscore_min', 0.0)}), "
+            f"or parameter combination produces no signals."
+        )
 
     if return_curve:
         stats["equity_curve"] = eq

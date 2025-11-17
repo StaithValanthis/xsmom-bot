@@ -105,9 +105,29 @@ def run_backtest_with_params(
             prefetch_bars=prefetch_bars,
             return_curve=return_curve,
         )
-        return stats if stats else {}
+        
+        if not stats:
+            log.warning("Backtest returned empty stats - possible causes: no trades, all filters blocking, or data issues")
+            return {}
+        
+        # Log key metrics for debugging
+        total_return = stats.get("total_return", 0.0)
+        sharpe = stats.get("sharpe", 0.0)
+        trades = stats.get("trades", 0)
+        
+        if total_return == 0.0 and sharpe == 0.0 and trades == 0:
+            log.warning(
+                f"Backtest produced zero metrics - total_return={total_return}, sharpe={sharpe}, trades={trades}. "
+                f"Possible causes: no trades executed, all symbols filtered, or parameter combination produces no signals."
+            )
+        else:
+            log.debug(f"Backtest metrics: total_return={total_return:.4f}, sharpe={sharpe:.4f}, trades={trades}")
+        
+        return stats
     except Exception as e:
         log.error(f"Backtest failed: {e}")
+        import traceback
+        log.debug(traceback.format_exc())
         raise
 
 

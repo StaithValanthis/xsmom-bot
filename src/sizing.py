@@ -277,11 +277,13 @@ def build_targets(
     if zscores_ready is not None and not zscores_ready.empty:
         z = zscores_ready.reindex(symbols).fillna(0.0).astype(float).values.copy()
     else:
+        # Handle both z_power (sizing.py StrategyCfg) and signal_power (config.py StrategyCfg)
+        z_power = getattr(strategy_cfg, 'z_power', getattr(strategy_cfg, 'signal_power', 1.35))
         scores = compute_signal_scores(
             prices,
             list(strategy_cfg.lookbacks),
             list(strategy_cfg.lookback_weights),
-            strategy_cfg.z_power
+            z_power
         )
         z = scores.iloc[-1].values.copy()
     z = _sanitize_vec(z)
@@ -296,27 +298,35 @@ def build_targets(
         prev_w_vec = prev_weights.reindex(symbols).fillna(0.0).values
         prev_w_vec = _sanitize_vec(prev_w_vec)
 
-    if strategy_cfg.no_trade_bands.enabled:
+    # Handle no_trade_bands (may not exist in config.py StrategyCfg)
+    no_trade_bands = getattr(strategy_cfg, 'no_trade_bands', None)
+    if no_trade_bands and getattr(no_trade_bands, 'enabled', False):
         z_dir = _apply_no_trade_bands(
             z,
             prev_w_vec,
-            strategy_cfg.no_trade_bands.z_entry,
-            strategy_cfg.no_trade_bands.z_exit
+            getattr(no_trade_bands, 'z_entry', 0.65),
+            getattr(no_trade_bands, 'z_exit', 0.45)
         )
     else:
         z_dir = np.sign(z)
 
-    # Dynamic K selection
-    if strategy_cfg.selection.enabled:
+    # Dynamic K selection (handle both selection config and direct k_min/k_max)
+    selection = getattr(strategy_cfg, 'selection', None)
+    k_min = getattr(strategy_cfg, 'k_min', 2)
+    k_max = getattr(strategy_cfg, 'k_max', 6)
+    
+    if selection and getattr(selection, 'enabled', False):
+        # Use dynamic K selection
         k = _dynamic_k(
             z,
-            strategy_cfg.selection.k_min,
-            strategy_cfg.selection.k_max,
-            strategy_cfg.selection.kappa,
-            strategy_cfg.selection.fallback_k
+            getattr(selection, 'k_min', k_min),
+            getattr(selection, 'k_max', k_max),
+            getattr(selection, 'kappa', 5.0),
+            getattr(selection, 'fallback_k', k_max)
         )
     else:
-        k = strategy_cfg.selection.fallback_k
+        # Fallback: use k_max directly (static K selection)
+        k = k_max
 
     # Build raw long/short mask using the scores but respect banded direction
     masked_scores = z.copy()
@@ -363,19 +373,31 @@ def build_targets(
                 w[i] = np.sign(wi) * (cap_abs / float(equity))
 
     # Portfolio volatility target scaling (based on realized vol)
-    if strategy_cfg.portfolio_vol_target.enabled and returns is not None and weights_history is not None:
-        L = int(strategy_cfg.portfolio_vol_target.lookback_hours)
+    # Handle both portfolio_vol_target (sizing.py) and vol_target (config.py)
+    vol_target_cfg = getattr(strategy_cfg, 'portfolio_vol_target', None) or getattr(strategy_cfg, 'vol_target', None)
+    if vol_target_cfg and getattr(vol_target_cfg, 'enabled', False) and returns is not None and weights_history is not None:
+        # Handle different attribute names: lookback_hours vs vol_lookback
+        lookback_hours = getattr(vol_target_cfg, 'lookback_hours', getattr(strategy_cfg, 'vol_lookback', 72))
+        L = int(lookback_hours)
         w_hist = weights_history.reindex(prices.index).fillna(0.0).values[-L:]
         r_hist = returns.reindex(prices.index).fillna(0.0).values[-L:]
         if w_hist.size and r_hist.size:
+            # Handle bars_per_year (may not exist in vol_target)
+            bars_per_year = getattr(vol_target_cfg, 'bars_per_year', 8760.0)  # Default for hourly bars
             ann_vol = _realized_port_vol_ann(
-                w_hist, r_hist, bars_per_year=float(strategy_cfg.portfolio_vol_target.bars_per_year)
+                w_hist, r_hist, bars_per_year=float(bars_per_year)
             )
-            tgt = float(strategy_cfg.portfolio_vol_target.target_ann_vol)
+            # Handle target_ann_vol vs target_daily_vol_bps
+            target_ann_vol = getattr(vol_target_cfg, 'target_ann_vol', None)
+            if target_ann_vol is None:
+                # Convert daily vol bps to annualized
+                target_daily_bps = getattr(vol_target_cfg, 'target_daily_vol_bps', 0.0)
+                target_ann_vol = (target_daily_bps / 10000.0) * np.sqrt(365.0) if target_daily_bps > 0 else 0.0
+            tgt = float(target_ann_vol)
             if ann_vol > 1e-12 and tgt > 0:
                 scaler = _clip(tgt / ann_vol,
-                               float(strategy_cfg.portfolio_vol_target.min_scale),
-                               float(strategy_cfg.portfolio_vol_target.max_scale))
+                               float(getattr(vol_target_cfg, 'min_scale', 0.5)),
+                               float(getattr(vol_target_cfg, 'max_scale', 2.0)))
                 # True scaling (no renorm-to-gross here)
                 w = w * scaler
                 # Re-apply per-asset and per-symbol caps AFTER scaling
