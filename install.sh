@@ -290,10 +290,30 @@ fix_service_user_and_paths(){
   :
 }
 
+# Find systemd directory (source repo or destination)
+find_systemd_dir(){
+  local dest="$1"
+  # Try source repo first (where installer is run from)
+  if [ -d "./systemd" ]; then
+    echo "./systemd"
+  # Fall back to destination
+  elif [ -d "${dest}/systemd" ]; then
+    echo "${dest}/systemd"
+  else
+    warn "systemd directory not found in source or destination"
+    return 1
+  fi
+}
+
 install_service_unit(){
   local dest="$1"
   local service_name="$2"
-  local service_file="${dest}/systemd/${service_name}.service"
+  
+  # Find systemd directory (prefer source repo)
+  local systemd_dir
+  systemd_dir=$(find_systemd_dir "${dest}") || return 1
+  
+  local service_file="${systemd_dir}/${service_name}.service"
   
   if [ -f "${service_file}" ]; then
     # Replace User/Group in service file if needed
@@ -311,7 +331,12 @@ install_service_unit(){
 install_timer_unit(){
   local dest="$1"
   local timer_name="$2"
-  local timer_file="${dest}/systemd/${timer_name}.timer"
+  
+  # Find systemd directory (prefer source repo)
+  local systemd_dir
+  systemd_dir=$(find_systemd_dir "${dest}") || return 1
+  
+  local timer_file="${systemd_dir}/${timer_name}.timer"
   
   if [ -f "${timer_file}" ]; then
     sudo cp "${timer_file}" "/etc/systemd/system/${timer_name}.timer"
