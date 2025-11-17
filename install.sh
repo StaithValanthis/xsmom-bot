@@ -266,11 +266,22 @@ ensure_active_config(){
       cp "${dest}/config/config.yaml.best" "${dest}/config/config.yaml"
       sudo chown "${RUN_AS}:${RUN_GROUP}" "${dest}/config/config.yaml"
       info "Created ${dest}/config/config.yaml from config.yaml.best"
+    # Try copying from source repository if files weren't synced
+    elif [ -f "./config/config.yaml.example" ]; then
+      info "Config files not found in destination. Copying from source repository..."
+      cp "./config/config.yaml.example" "${dest}/config/config.yaml"
+      sudo chown "${RUN_AS}:${RUN_GROUP}" "${dest}/config/config.yaml"
+      info "Created ${dest}/config/config.yaml from source config.yaml.example"
+    elif [ -f "./config/config.yaml.best" ]; then
+      info "Config files not found in destination. Copying from source repository..."
+      cp "./config/config.yaml.best" "${dest}/config/config.yaml"
+      sudo chown "${RUN_AS}:${RUN_GROUP}" "${dest}/config/config.yaml"
+      info "Created ${dest}/config/config.yaml from source config.yaml.best"
     else
-      warn "Neither config.yaml.example nor config.yaml.best found."
+      warn "Neither config.yaml.example nor config.yaml.best found in destination or source."
       warn "You'll need to create ${dest}/config/config.yaml manually."
       # Create a minimal config file as last resort
-      cat > "${dest}/config/config.yaml" << 'EOF'
+      sudo tee "${dest}/config/config.yaml" > /dev/null << 'EOF'
 # Minimal xsmom-bot config
 # TODO: Copy from config.yaml.example or config.yaml.best
 
@@ -557,9 +568,13 @@ main(){
   if [ -d "./src" ]; then
     info "Syncing files from repository to ${APP_DIR}..."
     # Run rsync with better error handling
+    # Note: Trailing slashes matter in rsync:
+    #   - "src/" copies contents of src/ into destination
+    #   - "src" copies src/ directory into destination
+    # We want to copy directories, so we use "src" not "src/"
     if sudo rsync -av --delete \
       README.md requirements.txt .env.example install.sh run_local.sh \
-      config/ ./src/ systemd/ state/ logs/ tests/ bin/ docs/ tools/ \
+      config src systemd state logs tests bin docs tools \
       "${APP_DIR}/" 2>&1; then
       info "✓ Files synced successfully"
     else
