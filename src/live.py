@@ -1509,7 +1509,7 @@ def run_live(cfg: AppConfig, dry: bool = False):
             # 1) OHLCV
             bars: Dict[str, pd.DataFrame] = {}
             syms = ex.fetch_markets_filtered()
-            for s in syms:
+            for i, s in enumerate(syms):
                 try:
                     raw = ex.fetch_ohlcv(s, cfg.exchange.timeframe, limit=cfg.exchange.candles_limit)
                     df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
@@ -1524,6 +1524,14 @@ def run_live(cfg: AppConfig, dry: bool = False):
                         bars[s] = df
                 except Exception as e:
                     log.warning(f"OHLCV {s} failed: {e}")
+                    # If rate limit error, add extra delay before next symbol
+                    if "rate limit" in str(e).lower() or "10006" in str(e):
+                        log.warning(f"Rate limit detected, waiting 1 second before next symbol...")
+                        time.sleep(1.0)
+                
+                # Add small delay between symbols to avoid rate limits (except for last symbol)
+                if i < len(syms) - 1:
+                    time.sleep(0.1)  # 100ms delay between symbols
 
             if not bars:
                 log.error("No bars fetched this cycle; sleeping.")

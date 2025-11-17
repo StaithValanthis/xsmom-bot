@@ -2,6 +2,7 @@
 from __future__ import annotations
 import logging
 import os
+import time
 from typing import Any, Dict, Iterable, List, Optional
 
 import ccxt
@@ -213,8 +214,17 @@ class ExchangeWrapper:
                     if current_since < 0:
                         break
                 
+                # Rate limiting: Add a small delay between pagination requests to avoid hitting rate limits
+                # CCXT's enableRateLimit helps, but we need extra delay for pagination bursts
+                if remaining > 0:  # Only delay if we have more chunks to fetch
+                    time.sleep(0.2)  # 200ms delay between pagination chunks
+                
             except Exception as e:
                 log.warning(f"Pagination chunk failed for {symbol}: {e}")
+                # If rate limit error, wait longer before retrying
+                if "rate limit" in str(e).lower() or "10006" in str(e):
+                    log.warning(f"Rate limit hit for {symbol}, waiting 2 seconds before retry...")
+                    time.sleep(2.0)
                 break
         
         # Combine chunks: chunks are in reverse order (newest first), so reverse and concatenate
