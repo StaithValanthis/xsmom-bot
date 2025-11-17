@@ -1,0 +1,27 @@
+[Unit]
+Description=xsmom-bot Rollout Supervisor (staging/promotion lifecycle)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/xsmom-bot
+EnvironmentFile=/opt/xsmom-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/xsmom-bot
+Environment=PATH=/opt/xsmom-bot/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/opt/xsmom-bot/venv/bin/python -m src.rollout.supervisor \
+  --state /opt/xsmom-bot/data/config_rollout_state.json \
+  --live-state /opt/xsmom-bot/state/state.live.json \
+  --staging-state /opt/xsmom-bot/state/state.staging.json \
+  --live-config /opt/xsmom-bot/config/config.live.yaml \
+  --staging-config /opt/xsmom-bot/config/config.staging.yaml
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xsmom-rollout-supervisor
+
+[Install]
+WantedBy=multi-user.target
+

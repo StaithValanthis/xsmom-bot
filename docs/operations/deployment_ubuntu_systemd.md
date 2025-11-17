@@ -4,19 +4,49 @@
 
 This guide covers deploying xsmom-bot to a remote Ubuntu server with 24/7 unattended operation via systemd.
 
+**Recommended:** Use the **one-shot installer** (`install.sh`) for automated setup. See [`installation.md`](installation.md) for details.
+
+**Alternative:** Manual installation steps are provided below for advanced users.
+
 ---
 
 ## Prerequisites
 
 - **OS**: Ubuntu 20.04+ (or similar Linux distribution)
 - **Python**: 3.10+ with `venv` support
-- **User Account**: Non-root user for running the bot (e.g., `xsmom`)
+- **User Account**: Non-root user with sudo access (e.g., `ubuntu`)
 - **Bybit API Keys**: API key + secret (create in Bybit account settings)
 - **Discord Webhook** (optional): For notifications
 
 ---
 
-## Installation
+## Installation: One-Shot Installer (Recommended)
+
+**See:** [`installation.md`](installation.md) for complete installation guide.
+
+**Quick start:**
+```bash
+git clone <repository-url>
+cd xsmom-bot
+chmod +x install.sh
+./install.sh
+```
+
+**What it does:**
+- ✅ Installs system dependencies (Python, pip, git)
+- ✅ Creates virtual environment and installs Python packages
+- ✅ Creates required directories (`logs/`, `state/`, `data/`, etc.)
+- ✅ Prompts for secrets (API keys, Discord webhook)
+- ✅ Installs and enables all systemd services and timers
+- ✅ Validates installation
+
+**Result:** Fully configured bot ready to run.
+
+---
+
+## Installation: Manual Setup (Alternative)
+
+If you prefer manual setup or need custom configuration:
 
 ### 1. Create User Account
 
@@ -56,6 +86,11 @@ sudo -u xsmom nano .env
 BYBIT_API_KEY=your_api_key_here
 BYBIT_API_SECRET=your_api_secret_here
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...  # Optional
+```
+
+**Set permissions:**
+```bash
+sudo chmod 600 /opt/xsmom-bot/.env
 ```
 
 ### 5. Configure Bot

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run xsmom-bot daily report at 00:05 UTC
+Requires=xsmom-daily-report.service
+
+[Timer]
+OnCalendar=*-*-* 00:05:00
+AccuracySec=1m
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+

@@ -210,6 +210,80 @@ These parameters should be used with caution:
 
 ---
 
+## Environment Variables
+
+Environment variables are loaded from `/opt/xsmom-bot/.env` (created by `install.sh` installer).
+
+### Exchange API Keys
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `BYBIT_API_KEY` | Yes | Bybit API key (for live trading) |
+| `BYBIT_API_SECRET` | Yes | Bybit API secret (for live trading) |
+| `API_KEY` | No | Alternative name for API key (fallback) |
+| `API_SECRET` | No | Alternative name for API secret (fallback) |
+
+**How to set:**
+- **During installation:** Installer prompts for keys
+- **After installation:** Edit `/opt/xsmom-bot/.env`:
+  ```bash
+  sudo nano /opt/xsmom-bot/.env
+  # Add:
+  # BYBIT_API_KEY=your_key_here
+  # BYBIT_API_SECRET=your_secret_here
+  ```
+
+**Security:**
+- Stored in `.env` file (mode 600, owner-only access)
+- Never commit to git (in `.gitignore`)
+- Loaded by systemd services via `EnvironmentFile=/opt/xsmom-bot/.env`
+
+### Discord Notifications
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DISCORD_WEBHOOK_URL` | No | Discord webhook URL (primary, takes precedence over config) |
+
+**How to set:**
+- **During installation:** Installer prompts for webhook (optional)
+- **After installation:** Edit `/opt/xsmom-bot/.env`:
+  ```bash
+  sudo nano /opt/xsmom-bot/.env
+  # Add:
+  # DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+  ```
+
+**Fallback:** If env var not set, uses `notifications.discord.webhook_url` from config.
+
+### Python Environment
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PYTHONPATH` | `/opt/xsmom-bot` | Python path |
+| `PYTHONUNBUFFERED` | `1` | Unbuffered output (set automatically by installer) |
+
+### Environment File Location
+
+**Default:** `/opt/xsmom-bot/.env`
+
+**Created by:** `install.sh` installer
+
+**Format:**
+```bash
+BYBIT_API_KEY=your_key_here
+BYBIT_API_SECRET=your_secret_here
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+PYTHONUNBUFFERED=1
+```
+
+**Permissions:** `600` (read/write for owner only)
+
+**Owner:** `ubuntu` (or configured `RUN_AS` user)
+
+**See also:** [`../operations/installation.md`](../operations/installation.md) for installation details.
+
+---
+
 ## Next Steps
 
 - **Config System**: [`../architecture/config_system.md`](../architecture/config_system.md) - How config maps to code

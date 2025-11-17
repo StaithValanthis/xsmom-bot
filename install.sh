@@ -2,12 +2,14 @@
 set -euo pipefail
 
 # =========================
-# XSMOM Bot Installer (full stack)
+# XSMOM Bot Installer (full stack, one-shot)
 # Installs under /opt/xsmom-bot, creates venv, seeds .env/config,
 # installs/patches systemd units for:
-#   - xsmom-bot.service
+#   - xsmom-bot.service (main trading bot)
 #   - xsmom-optimizer.service + xsmom-optimizer.timer
 #   - xsmom-meta-trainer.service + xsmom-meta-trainer.timer
+#   - xsmom-daily-report.service + xsmom-daily-report.timer
+#   - xsmom-rollout-supervisor.service + xsmom-rollout-supervisor.timer
 # Idempotent: safe to re-run.
 # =========================
 
@@ -20,6 +22,7 @@ RUN_GROUP="${RUN_GROUP:-${RUN_AS}}"
 START_NOW="${START_NOW:-ask}"           # yes|no|ask
 SERVICE_DRY="${SERVICE_DRY:-1}"         # 1 => --dry on bot service
 RUN_NONINTERACTIVE="${RUN_NONINTERACTIVE:-0}"
+AUTO_INSTALL_PACKAGES="${AUTO_INSTALL_PACKAGES:-1}"  # 1 => auto-install missing packages
 
 # Optimizer timer & GRID defaults
 OPTIMER_CALENDAR="${OPTIMER_CALENDAR:-*-*-* 00:30:00}"
@@ -34,24 +37,35 @@ warn(){ echo -e "\033[1;33m[!]\033[0m $*"; }
 die(){ echo -e "\033[1;31m[x]\033[0m $*"; exit 1; }
 
 # =========================
-# Pre-flight checks
+# Pre-flight checks & package installation
 # =========================
-check_requirements(){
-  info "Checking system requirements..."
+check_and_install_packages(){
+  info "Checking and installing system packages..."
+  
+  local missing_packages=()
   
   # Check Python
   if ! command -v "${PYTHON_BIN}" &> /dev/null; then
-    die "Python 3 not found. Install python3 first."
+    missing_packages+=("python3")
+  fi
+  
+  # Check python3-venv
+  if ! "${PYTHON_BIN}" -c "import venv" 2>/dev/null; then
+    missing_packages+=("python3-venv")
   fi
   
   # Check pip
-  if ! "${PYTHON_BIN}" -m pip --version &> /dev/null; then
-    die "pip not found. Install pip first: ${PYTHON_BIN} -m ensurepip --upgrade"
+  if ! "${PYTHON_BIN}" -m pip --version &> /dev/null 2>&1; then
+    missing_packages+=("python3-pip")
   fi
   
   # Check git (optional, but nice to have)
   if ! command -v git &> /dev/null; then
-    warn "git not found. You may need it to update the repo."
+    if [ "${AUTO_INSTALL_PACKAGES}" = "1" ]; then
+      missing_packages+=("git")
+    else
+      warn "git not found. You may need it to update the repo."
+    fi
   fi
   
   # Check sudo
@@ -61,10 +75,34 @@ check_requirements(){
   
   # Check systemctl (for systemd)
   if ! command -v systemctl &> /dev/null; then
-    warn "systemctl not found. Systemd services won't be installed."
+    if [ "${AUTO_INSTALL_PACKAGES}" = "1" ]; then
+      # systemd is usually pre-installed, but check anyway
+      warn "systemctl not found. Systemd services won't be installed."
+    else
+      warn "systemctl not found. Systemd services won't be installed."
+    fi
+  fi
+  
+  # Install missing packages if auto-install enabled
+  if [ "${#missing_packages[@]}" -gt 0 ] && [ "${AUTO_INSTALL_PACKAGES}" = "1" ]; then
+    info "Installing missing packages: ${missing_packages[*]}"
+    if command -v apt-get &> /dev/null; then
+      sudo apt-get update -qq
+      sudo apt-get install -y "${missing_packages[@]}" || die "Failed to install packages"
+    elif command -v yum &> /dev/null; then
+      sudo yum install -y "${missing_packages[@]}" || die "Failed to install packages"
+    else
+      warn "No package manager found (apt-get/yum). Please install manually: ${missing_packages[*]}"
+    fi
+  elif [ "${#missing_packages[@]}" -gt 0 ]; then
+    die "Missing required packages: ${missing_packages[*]}. Install them manually or set AUTO_INSTALL_PACKAGES=1"
   fi
   
   info "System requirements OK."
+}
+
+check_requirements(){
+  check_and_install_packages
 }
 
 # =========================
@@ -150,34 +188,38 @@ prompt_secrets(){
     warn "These will be stored in ${env_file} (never commit this file!)"
     echo ""
     
-    # Prompt for Bybit API Key
+    # Prompt for Bybit API Key (with validation)
     local api_key=""
-    read -r -p "[?] Bybit API Key (required): " api_key || true
-    if [ -z "${api_key}" ]; then
-      warn "No API key provided. You'll need to edit ${env_file} manually."
-    else
-      # Update .env file
-      if grep -q "^BYBIT_API_KEY=" "${env_file}"; then
-        sudo sed -i "s|^BYBIT_API_KEY=.*|BYBIT_API_KEY=${api_key}|" "${env_file}"
-      else
-        echo "BYBIT_API_KEY=${api_key}" | sudo tee -a "${env_file}" > /dev/null
+    while [ -z "${api_key}" ]; do
+      read -r -p "[?] Bybit API Key (required): " api_key || true
+      if [ -z "${api_key}" ]; then
+        warn "API key cannot be empty. Please enter a valid API key."
       fi
+    done
+    
+    # Update .env file
+    if grep -q "^BYBIT_API_KEY=" "${env_file}"; then
+      sudo sed -i "s|^BYBIT_API_KEY=.*|BYBIT_API_KEY=${api_key}|" "${env_file}"
+    else
+      echo "BYBIT_API_KEY=${api_key}" | sudo tee -a "${env_file}" > /dev/null
     fi
     
-    # Prompt for Bybit API Secret (hidden input)
+    # Prompt for Bybit API Secret (hidden input, with validation)
     local api_secret=""
-    echo -n "[?] Bybit API Secret (required, hidden): "
-    read -rs api_secret || true
-    echo ""
-    if [ -z "${api_secret}" ]; then
-      warn "No API secret provided. You'll need to edit ${env_file} manually."
-    else
-      # Update .env file
-      if grep -q "^BYBIT_API_SECRET=" "${env_file}"; then
-        sudo sed -i "s|^BYBIT_API_SECRET=.*|BYBIT_API_SECRET=${api_secret}|" "${env_file}"
-      else
-        echo "BYBIT_API_SECRET=${api_secret}" | sudo tee -a "${env_file}" > /dev/null
+    while [ -z "${api_secret}" ]; do
+      echo -n "[?] Bybit API Secret (required, hidden): "
+      read -rs api_secret || true
+      echo ""
+      if [ -z "${api_secret}" ]; then
+        warn "API secret cannot be empty. Please enter a valid API secret."
       fi
+    done
+    
+    # Update .env file
+    if grep -q "^BYBIT_API_SECRET=" "${env_file}"; then
+      sudo sed -i "s|^BYBIT_API_SECRET=.*|BYBIT_API_SECRET=${api_secret}|" "${env_file}"
+    else
+      echo "BYBIT_API_SECRET=${api_secret}" | sudo tee -a "${env_file}" > /dev/null
     fi
     
     # Prompt for Discord Webhook (optional)
@@ -218,6 +260,8 @@ ensure_active_config(){
     else
       warn "config.yaml.example not found. You'll need to create config/config.yaml manually."
     fi
+  else
+    info "Config file already exists: ${dest}/config/config.yaml"
   fi
 }
 
@@ -227,13 +271,13 @@ normalize_destination_tree(){
   ensure_dir_owned "${dest}/state"
   ensure_dir_owned "${dest}/data"              # For rollout state
   ensure_dir_owned "${dest}/config/optimized"  # For optimized configs
-  ensure_dir_owned "${dest}/reports"           # For optimizer reports (if bin/run-optimizer.sh uses it)
+  ensure_dir_owned "${dest}/reports"           # For optimizer reports
 }
 
 seed_local_if_missing(){
   # Ensure repo has minimal files so rsync won't fail if user copied partial tree
-  mkdir -p config src systemd state logs tests bin data config/optimized || true
-  touch logs/.gitkeep state/.gitkeep data/.gitkeep config/optimized/.gitkeep || true
+  mkdir -p config src systemd state logs tests bin data config/optimized reports || true
+  touch logs/.gitkeep state/.gitkeep data/.gitkeep config/optimized/.gitkeep reports/.gitkeep || true
 }
 
 # =========================
@@ -241,116 +285,65 @@ seed_local_if_missing(){
 # =========================
 fix_service_user_and_paths(){
   local dest="$1"
-  # No content rewrite needed here because units reference absolute /opt paths;
-  # ensure they're present under ${dest}.
+  # Service files use absolute paths, so we just need to ensure they exist
+  # and are copied correctly
   :
+}
+
+install_service_unit(){
+  local dest="$1"
+  local service_name="$2"
+  local service_file="${dest}/systemd/${service_name}.service"
+  
+  if [ -f "${service_file}" ]; then
+    # Replace User/Group in service file if needed
+    local temp_file=$(mktemp)
+    sed "s|User=.*|User=${RUN_AS}|g; s|Group=.*|Group=${RUN_GROUP}|g" "${service_file}" > "${temp_file}"
+    sudo cp "${temp_file}" "/etc/systemd/system/${service_name}.service"
+    rm -f "${temp_file}"
+    info "Installed ${service_name}.service"
+  else
+    warn "Service file not found: ${service_file}"
+    return 1
+  fi
+}
+
+install_timer_unit(){
+  local dest="$1"
+  local timer_name="$2"
+  local timer_file="${dest}/systemd/${timer_name}.timer"
+  
+  if [ -f "${timer_file}" ]; then
+    sudo cp "${timer_file}" "/etc/systemd/system/${timer_name}.timer"
+    info "Installed ${timer_name}.timer"
+  else
+    warn "Timer file not found: ${timer_file}"
+    return 1
+  fi
 }
 
 install_optimizer_units(){
   local dest="$1"
-  local svc_repo="${dest}/systemd/xsmom-optimizer.service"
-  local tim_repo="${dest}/systemd/xsmom-optimizer.timer"
-
-  if [ ! -f "${svc_repo}" ]; then
-    cat > /tmp/xsmom-optimizer.service <<EOF
-[Unit]
-Description=XSMOM optimizer (autotune via backtests)
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=oneshot
-User=${RUN_AS}
-Group=${RUN_GROUP}
-WorkingDirectory=${dest}
-EnvironmentFile=${dest}/.env
-Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=${dest}
-Environment=PATH=${dest}/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-ExecStart=/bin/bash -lc '${dest}/bin/run-optimizer.sh ${dest}/config/config.yaml ${dest}/reports'
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    sudo mv /tmp/xsmom-optimizer.service /etc/systemd/system/xsmom-optimizer.service
-  else
-    sudo cp "${svc_repo}" "/etc/systemd/system/xsmom-optimizer.service"
-  fi
-
-  if [ ! -f "${tim_repo}" ]; then
-    cat > /tmp/xsmom-optimizer.timer <<EOF
-[Unit]
-Description=Nightly XSMOM optimizer run
-
-[Timer]
-OnCalendar=${OPTIMER_CALENDAR}
-RandomizedDelaySec=1200
-Persistent=true
-Unit=xsmom-optimizer.service
-
-[Install]
-WantedBy=timers.target
-EOF
-    sudo mv /tmp/xsmom-optimizer.timer /etc/systemd/system/xsmom-optimizer.timer
-  else
-    sudo cp "${tim_repo}" "/etc/systemd/system/xsmom-optimizer.timer"
-  fi
+  install_service_unit "${dest}" "xsmom-optimizer"
+  install_timer_unit "${dest}" "xsmom-optimizer"
 }
 
 install_meta_trainer_units(){
   local dest="$1"
-  local svc_repo="${dest}/systemd/xsmom-meta-trainer.service"
-  local tim_repo="${dest}/systemd/xsmom-meta-trainer.timer"
+  install_service_unit "${dest}" "xsmom-meta-trainer"
+  install_timer_unit "${dest}" "xsmom-meta-trainer"
+}
 
-  if [ ! -f "${svc_repo}" ]; then
-    cat > /tmp/xsmom-meta-trainer.service <<EOF
-[Unit]
-Description=XSMOM meta-label trainer (EOD)
-After=network-online.target
-Wants=network-online.target
+install_daily_report_units(){
+  local dest="$1"
+  install_service_unit "${dest}" "xsmom-daily-report"
+  install_timer_unit "${dest}" "xsmom-daily-report"
+}
 
-[Service]
-Type=oneshot
-User=${RUN_AS}
-Group=${RUN_GROUP}
-WorkingDirectory=${dest}
-Environment=PYTHONPATH=${dest}
-ExecStart=${dest}/venv/bin/python3 -m src.meta_label_trainer --config ${dest}/config/config.yaml
-StandardOutput=append:/var/log/xsmom-meta-trainer.log
-StandardError=append:/var/log/xsmom-meta-trainer.log
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    sudo mv /tmp/xsmom-meta-trainer.service /etc/systemd/system/xsmom-meta-trainer.service
-  else
-    sudo cp "${svc_repo}" "/etc/systemd/system/xsmom-meta-trainer.service"
-  fi
-
-  if [ ! -f "${tim_repo}" ]; then
-    cat > /tmp/xsmom-meta-trainer.timer <<EOF
-[Unit]
-Description=Run XSMOM meta-label trainer once per day
-
-[Timer]
-OnCalendar=${META_CALENDAR}
-Persistent=true
-RandomizedDelaySec=900
-Unit=xsmom-meta-trainer.service
-
-[Install]
-WantedBy=timers.target
-EOF
-    sudo mv /tmp/xsmom-meta-trainer.timer /etc/systemd/system/xsmom-meta-trainer.timer
-  else
-    sudo cp "${tim_repo}" "/etc/systemd/system/xsmom-meta-trainer.timer"
-  fi
-
-  sudo touch /var/log/xsmom-meta-trainer.log
-  sudo chown "${RUN_AS}:${RUN_GROUP}" /var/log/xsmom-meta-trainer.log
+install_rollout_supervisor_units(){
+  local dest="$1"
+  install_service_unit "${dest}" "xsmom-rollout-supervisor"
+  install_timer_unit "${dest}" "xsmom-rollout-supervisor"
 }
 
 # =========================
@@ -376,11 +369,25 @@ validate_installation(){
     warn ".env file not found. Bot will fail without API keys."
   else
     # Validate .env has required keys (even if placeholder)
-    if ! grep -q "^BYBIT_API_KEY=" "${dest}/.env" 2>/dev/null; then
-      warn ".env file missing BYBIT_API_KEY"
+    local has_key=false
+    local has_secret=false
+    if grep -q "^BYBIT_API_KEY=" "${dest}/.env" 2>/dev/null; then
+      local key_val=$(grep "^BYBIT_API_KEY=" "${dest}/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'" | xargs)
+      if [ -n "${key_val}" ] && [ "${key_val}" != "your_api_key_here" ]; then
+        has_key=true
+      fi
     fi
-    if ! grep -q "^BYBIT_API_SECRET=" "${dest}/.env" 2>/dev/null; then
-      warn ".env file missing BYBIT_API_SECRET"
+    if grep -q "^BYBIT_API_SECRET=" "${dest}/.env" 2>/dev/null; then
+      local secret_val=$(grep "^BYBIT_API_SECRET=" "${dest}/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'" | xargs)
+      if [ -n "${secret_val}" ] && [ "${secret_val}" != "your_api_secret_here" ]; then
+        has_secret=true
+      fi
+    fi
+    
+    if [ "${has_key}" = "true" ] && [ "${has_secret}" = "true" ]; then
+      info "✓ .env file has valid API keys"
+    else
+      warn ".env file missing or has placeholder API keys. Bot will not work until keys are set."
     fi
   fi
   
@@ -420,6 +427,14 @@ except Exception as e:
     else
       warn "Config validation failed. Check config/config.yaml for errors."
     fi
+  fi
+  
+  # Test CLI help
+  info "Testing CLI..."
+  if sudo -u "${RUN_AS}" "${dest}/venv/bin/python" -m src.main --help &>/dev/null; then
+    info "✓ CLI works (--help succeeds)"
+  else
+    warn "CLI test failed. Check Python installation."
   fi
 }
 
@@ -470,6 +485,7 @@ main(){
   info "Creating Python venv and installing requirements..."
   if [ ! -d "${APP_DIR}/venv" ]; then
     sudo -u "${RUN_AS}" "${PYTHON_BIN}" -m venv "${APP_DIR}/venv"
+    info "Created new virtual environment"
   else
     info "Venv already exists, reusing..."
   fi
@@ -492,29 +508,47 @@ main(){
   
   # Install systemd services
   if command -v systemctl &> /dev/null; then
-    info "Installing bot service..."
+    info "Installing systemd services..."
     fix_service_user_and_paths "${APP_DIR}"
-    SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-    if [ -f "${APP_DIR}/systemd/${SERVICE_NAME}.service" ]; then
-      sudo cp "${APP_DIR}/systemd/${SERVICE_NAME}.service" "${SERVICE_FILE}"
-    else
-      warn "Service file not found at ${APP_DIR}/systemd/${SERVICE_NAME}.service"
-    fi
     
+    # Main bot service
+    info "Installing bot service..."
+    install_service_unit "${APP_DIR}" "${SERVICE_NAME}"
+    
+    # Optimizer service + timer
     info "Installing optimizer service + timer..."
     install_optimizer_units "${APP_DIR}"
     
+    # Meta-trainer service + timer
     info "Installing meta-trainer service + timer..."
     install_meta_trainer_units "${APP_DIR}"
     
+    # Daily report service + timer
+    info "Installing daily report service + timer..."
+    install_daily_report_units "${APP_DIR}"
+    
+    # Rollout supervisor service + timer
+    info "Installing rollout supervisor service + timer..."
+    install_rollout_supervisor_units "${APP_DIR}"
+    
+    # Reload systemd
     sudo systemctl daemon-reload
+    
+    # Enable services
+    info "Enabling services..."
     sudo systemctl enable "${SERVICE_NAME}" 2>/dev/null || warn "Failed to enable ${SERVICE_NAME}"
     
     # Enable timers
     sudo systemctl enable xsmom-optimizer.timer 2>/dev/null || warn "Failed to enable xsmom-optimizer.timer"
-    sudo systemctl start  xsmom-optimizer.timer 2>/dev/null || warn "Failed to start xsmom-optimizer.timer"
     sudo systemctl enable xsmom-meta-trainer.timer 2>/dev/null || warn "Failed to enable xsmom-meta-trainer.timer"
-    sudo systemctl start  xsmom-meta-trainer.timer 2>/dev/null || warn "Failed to start xsmom-meta-trainer.timer"
+    sudo systemctl enable xsmom-daily-report.timer 2>/dev/null || warn "Failed to enable xsmom-daily-report.timer"
+    sudo systemctl enable xsmom-rollout-supervisor.timer 2>/dev/null || warn "Failed to enable xsmom-rollout-supervisor.timer"
+    
+    # Start timers (services run on schedule)
+    sudo systemctl start xsmom-optimizer.timer 2>/dev/null || warn "Failed to start xsmom-optimizer.timer"
+    sudo systemctl start xsmom-meta-trainer.timer 2>/dev/null || warn "Failed to start xsmom-meta-trainer.timer"
+    sudo systemctl start xsmom-daily-report.timer 2>/dev/null || warn "Failed to start xsmom-daily-report.timer"
+    sudo systemctl start xsmom-rollout-supervisor.timer 2>/dev/null || warn "Failed to start xsmom-rollout-supervisor.timer"
     
     info "Systemd services installed and enabled"
   else
@@ -552,12 +586,22 @@ main(){
   info "Secrets file: ${APP_DIR}/.env (mode 600, owner ${RUN_AS})"
   warn "⚠️  Remember: Never commit .env to a public repository!"
   echo ""
+  info "Installed services:"
+  echo "  - ${SERVICE_NAME}.service (main trading bot)"
+  echo "  - xsmom-optimizer.service + timer (nightly optimization)"
+  echo "  - xsmom-meta-trainer.service + timer (daily meta-label training)"
+  echo "  - xsmom-daily-report.service + timer (daily performance reports)"
+  echo "  - xsmom-rollout-supervisor.service + timer (staging/promotion lifecycle)"
+  echo ""
   info "Next steps:"
   echo "  1. Review config: ${APP_DIR}/config/config.yaml"
   echo "  2. Verify secrets: ${APP_DIR}/.env"
   echo "  3. Test on testnet first (set exchange.testnet: true in config)"
   echo "  4. Start bot: sudo systemctl start ${SERVICE_NAME}"
   echo "  5. Monitor logs: journalctl -u ${SERVICE_NAME} -f"
+  echo "  6. Check timers: systemctl list-timers | grep xsmom"
+  echo ""
+  info "For detailed documentation, see: ${APP_DIR}/docs/overview/quickstart.md"
 }
 
 # Run main

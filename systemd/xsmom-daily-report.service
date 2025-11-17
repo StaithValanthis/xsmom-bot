@@ -1,0 +1,22 @@
+[Unit]
+Description=xsmom-bot Daily Performance Report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/xsmom-bot
+EnvironmentFile=/opt/xsmom-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/xsmom-bot
+Environment=PATH=/opt/xsmom-bot/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/opt/xsmom-bot/venv/bin/python -m src.reports.daily_report --config /opt/xsmom-bot/config/config.yaml
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xsmom-daily-report
+
+[Install]
+WantedBy=multi-user.target
+

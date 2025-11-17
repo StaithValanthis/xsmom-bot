@@ -1,19 +1,119 @@
 # Quick Start Guide
 
-Get xsmom-bot running in **5-10 minutes**.
+Get xsmom-bot running in **5-10 minutes** with the one-shot installer.
 
 ---
 
 ## Prerequisites
 
-- **OS**: Ubuntu 20.04+ (or similar Linux) or macOS for development
-- **Python**: 3.10+ with `venv` support
+- **OS**: Ubuntu 20.04+ (or similar Linux distribution)
+- **User**: Non-root user with sudo access (e.g., `ubuntu`)
 - **Exchange Account**: Bybit account (testnet OK for testing)
 - **API Keys**: Bybit API key + secret (create in Bybit account settings)
+- **Discord Webhook** (optional): For notifications
 
 ---
 
-## Installation
+## One-Shot Installation (Recommended)
+
+### 1. Clone Repository
+
+```bash
+git clone <repository-url>
+cd xsmom-bot
+```
+
+### 2. Run Installer
+
+```bash
+chmod +x install.sh
+./install.sh
+```
+
+**What the installer does:**
+- ✅ Installs missing system packages (Python, pip, git)
+- ✅ Creates virtual environment and installs dependencies
+- ✅ Creates required directories (`logs/`, `state/`, `data/`, etc.)
+- ✅ Copies example config to `config/config.yaml`
+- ✅ **Prompts you for:**
+  - Bybit API key
+  - Bybit API secret
+  - Discord webhook URL (optional)
+- ✅ Stores secrets in `.env` file (secure, mode 600)
+- ✅ Installs and enables systemd services:
+  - `xsmom-bot.service` (main trading bot)
+  - `xsmom-optimizer.service + timer` (nightly optimization)
+  - `xsmom-meta-trainer.service + timer` (daily meta-label training)
+  - `xsmom-daily-report.service + timer` (daily performance reports)
+  - `xsmom-rollout-supervisor.service + timer` (staging/promotion lifecycle)
+- ✅ Validates installation (smoke tests)
+
+**During installation, you'll be prompted:**
+
+```
+[?] Bybit API Key (required): <enter your API key>
+[?] Bybit API Secret (required, hidden): <enter your secret>
+[?] Discord Webhook URL (optional, press Enter to skip): <enter webhook or skip>
+[?] Start service now? (y/N): <y to start immediately, N to start later>
+```
+
+**Installation location:** `/opt/xsmom-bot` (or `$HOME/xsmom-bot-app` if `/opt` unavailable)
+
+### 3. Verify Installation
+
+```bash
+# Check services are installed
+systemctl list-units | grep xsmom
+
+# Check timers are active
+systemctl list-timers | grep xsmom
+
+# Check bot service status
+sudo systemctl status xsmom-bot.service
+
+# View bot logs
+journalctl -u xsmom-bot.service -f
+```
+
+### 4. Configure for Testnet (Recommended First Step)
+
+```bash
+# Edit config
+sudo nano /opt/xsmom-bot/config/config.yaml
+```
+
+**Set testnet mode:**
+```yaml
+exchange:
+  testnet: true  # Use Bybit testnet (fake money)
+```
+
+**Use testnet API keys:**
+- Get testnet keys from: https://testnet.bybit.com/
+- Update `.env`:
+```bash
+sudo nano /opt/xsmom-bot/.env
+# Update BYBIT_API_KEY and BYBIT_API_SECRET with testnet keys
+```
+
+### 5. Start Bot
+
+```bash
+# Start bot service
+sudo systemctl start xsmom-bot.service
+
+# Enable auto-start on boot
+sudo systemctl enable xsmom-bot.service
+
+# Check status
+sudo systemctl status xsmom-bot.service
+```
+
+---
+
+## Manual Installation (Alternative)
+
+If you prefer manual setup or are on macOS/Windows:
 
 ### 1. Clone Repository
 
@@ -47,7 +147,7 @@ pip install -r requirements.txt
 ### 4. Configure Environment
 
 ```bash
-# Copy example .env file (if exists)
+# Copy example .env file
 cp .env.example .env
 
 # Edit .env and add your Bybit API keys
@@ -58,6 +158,7 @@ nano .env
 ```bash
 BYBIT_API_KEY=your_api_key_here
 BYBIT_API_SECRET=your_api_secret_here
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...  # Optional
 ```
 
 ### 5. Create Config File
