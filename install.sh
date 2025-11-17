@@ -650,6 +650,15 @@ main(){
   info "Setting permissions..."
   sudo chown -R "${RUN_AS}:${RUN_GROUP}" "${APP_DIR}"
   
+  # Set execute permissions on shell scripts in bin/
+  if [ -d "${APP_DIR}/bin" ]; then
+    info "Setting execute permissions on bin/ scripts..."
+    sudo find "${APP_DIR}/bin" -type f -name "*.sh" -exec chmod +x {} \;
+    # Also set execute on Python scripts in bin/ if any
+    sudo find "${APP_DIR}/bin" -type f -name "*.py" -exec chmod +x {} \;
+    info "✓ Execute permissions set on bin/ scripts"
+  fi
+  
   # Create virtualenv (idempotent: reuse if exists)
   info "Creating Python venv and installing requirements..."
   if [ ! -d "${APP_DIR}/venv" ]; then
