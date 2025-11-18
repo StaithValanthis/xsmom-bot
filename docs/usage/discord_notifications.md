@@ -23,9 +23,23 @@ All notifications use Discord webhooks and are designed to be **non-blocking** -
 
 ### 2. Configure Webhook URL
 
-You have **two options**:
+You have **three options**:
 
-#### Option A: Environment Variable (Recommended)
+#### Option A: During Installation (Easiest)
+
+When running `install.sh`, you'll be prompted for the Discord webhook URL:
+
+```bash
+[?] Discord Webhook URL (optional, press Enter to skip): <paste your webhook URL>
+```
+
+The installer will:
+- Write the webhook to `.env` as `DISCORD_WEBHOOK_URL` (primary)
+- Also write it to `config/config.yaml` under `notifications.discord.webhook_url` (fallback)
+
+This ensures the webhook is available even if environment variables aren't loaded.
+
+#### Option B: Environment Variable (Recommended for Manual Setup)
 
 Set the `DISCORD_WEBHOOK_URL` environment variable:
 
@@ -37,14 +51,22 @@ This is the **primary** method - it takes precedence over config file.
 
 **For systemd services:**
 
-Edit `/opt/xsmom-bot/.env` or the systemd service file:
+Edit `/opt/xsmom-bot/.env`:
+
+```bash
+sudo nano /opt/xsmom-bot/.env
+# Add or update:
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+```
+
+Or edit the systemd service file:
 
 ```ini
 [Service]
 Environment="DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/..."
 ```
 
-#### Option B: Config File (Fallback)
+#### Option C: Config File (Fallback)
 
 Edit `config/config.yaml`:
 
@@ -60,6 +82,22 @@ notifications:
 ```
 
 **⚠️ SECURITY WARNING:** Do **NOT** commit real webhook URLs to public repositories. The config file fallback is intended for local/private deployments.
+
+**Note:** The webhook URL in config is a **fallback** - if `DISCORD_WEBHOOK_URL` env var is set, it takes precedence.
+
+#### Option D: Update Existing Config (Helper Script)
+
+If you need to update the webhook URL in an existing installation:
+
+```bash
+# Interactive (prompts for URL)
+python tools/update_discord_webhook.py --config config/config.yaml
+
+# Non-interactive (provide URL)
+python tools/update_discord_webhook.py --config config/config.yaml --webhook-url "https://..."
+```
+
+This script safely updates `config.yaml` while preserving all other settings.
 
 ### 3. Enable Notifications
 

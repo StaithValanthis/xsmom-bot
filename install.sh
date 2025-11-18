@@ -226,10 +226,96 @@ prompt_secrets(){
     local discord_webhook=""
     read -r -p "[?] Discord Webhook URL (optional, press Enter to skip): " discord_webhook || true
     if [ -n "${discord_webhook}" ]; then
+      # Write to .env file
       if grep -q "^DISCORD_WEBHOOK_URL=" "${env_file}"; then
         sudo sed -i "s|^DISCORD_WEBHOOK_URL=.*|DISCORD_WEBHOOK_URL=${discord_webhook}|" "${env_file}"
       else
         echo "DISCORD_WEBHOOK_URL=${discord_webhook}" | sudo tee -a "${env_file}" > /dev/null
+      fi
+      
+      # Also write to config.yaml as fallback
+      local config_file="${dest}/config/config.yaml"
+      if [ -f "${config_file}" ]; then
+        # Use Python to safely update YAML (handles quotes, special chars, etc.)
+        local python_success=false
+        if command -v python3 &> /dev/null; then
+          # Check if PyYAML is available
+          if python3 -c "import yaml" 2>/dev/null; then
+            # Pass variables via environment to avoid heredoc expansion issues
+            export INSTALL_CONFIG_FILE="${config_file}"
+            export INSTALL_WEBHOOK_URL="${discord_webhook}"
+            sudo -u "${RUN_AS}" env INSTALL_CONFIG_FILE="${config_file}" INSTALL_WEBHOOK_URL="${discord_webhook}" python3 << 'PYTHON_EOF' 2>/dev/null && python_success=true || true
+import yaml
+import sys
+import os
+
+config_file = os.environ.get('INSTALL_CONFIG_FILE')
+webhook_url = os.environ.get('INSTALL_WEBHOOK_URL')
+
+if not config_file or not webhook_url:
+    sys.exit(1)
+
+try:
+    with open(config_file, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f) or {}
+    
+    # Ensure notifications.discord structure exists
+    if 'notifications' not in config:
+        config['notifications'] = {}
+    if 'discord' not in config['notifications']:
+        config['notifications']['discord'] = {}
+    
+    # Set webhook_url
+    config['notifications']['discord']['webhook_url'] = webhook_url
+    
+    # Enable notifications if not already set
+    if 'enabled' not in config['notifications']['discord']:
+        config['notifications']['discord']['enabled'] = True
+    
+    # Write back
+    with open(config_file, 'w', encoding='utf-8') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    
+    print("Updated config.yaml with Discord webhook URL")
+    sys.exit(0)
+except Exception as e:
+    print(f"Python YAML update failed: {e}", file=sys.stderr)
+    sys.exit(1)
+PYTHON_EOF
+            unset INSTALL_CONFIG_FILE INSTALL_WEBHOOK_URL
+          fi
+        fi
+        
+        # Fallback: Use sed if Python fails (less safe but works for simple cases)
+        if [ "$python_success" != "true" ]; then
+          # Check if notifications.discord.webhook_url exists
+          if grep -q "^[[:space:]]*webhook_url:" "${config_file}" 2>/dev/null; then
+            # Update existing webhook_url (handle indentation)
+            sudo sed -i "s|^[[:space:]]*webhook_url:.*|    webhook_url: \"${discord_webhook}\"|" "${config_file}" 2>/dev/null || true
+          else
+            # Add webhook_url to notifications.discord section
+            if grep -q "^notifications:" "${config_file}" 2>/dev/null; then
+              if grep -q "^[[:space:]]*discord:" "${config_file}" 2>/dev/null; then
+                # Insert after discord: line
+                sudo sed -i "/^[[:space:]]*discord:/a\\    webhook_url: \"${discord_webhook}\"" "${config_file}" 2>/dev/null || true
+              else
+                # Add discord section
+                sudo sed -i "/^notifications:/a\\  discord:\\n    webhook_url: \"${discord_webhook}\"" "${config_file}" 2>/dev/null || true
+              fi
+            else
+              # Add notifications section at end
+              echo "" | sudo tee -a "${config_file}" > /dev/null
+              echo "notifications:" | sudo tee -a "${config_file}" > /dev/null
+              echo "  discord:" | sudo tee -a "${config_file}" > /dev/null
+              echo "    webhook_url: \"${discord_webhook}\"" | sudo tee -a "${config_file}" > /dev/null
+            fi
+          fi
+          info "Updated config.yaml with Discord webhook URL (using fallback method)"
+        else
+          info "Updated config.yaml with Discord webhook URL"
+        fi
+      else
+        warn "config.yaml not found, webhook URL only written to .env"
       fi
     fi
     
@@ -680,7 +766,7 @@ main(){
   info "Creating config.yaml from example (if missing)..."
   ensure_active_config "${APP_DIR}"
   
-  # Prompt for and write secrets
+  # Prompt for and write secrets (must be after ensure_active_config so config.yaml exists)
   info "Configuring secrets..."
   prompt_secrets "${APP_DIR}"
   
