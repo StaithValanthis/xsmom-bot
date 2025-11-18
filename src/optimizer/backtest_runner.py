@@ -176,24 +176,35 @@ def fetch_historical_data(
             if timeframe_ms:
                 start_ts = end_ts - (cfg.exchange.candles_limit * timeframe_ms)
         
+        # Automatically use pagination if we need more than 1000 bars
+        max_per_request = cfg.data.max_candles_per_request if cfg.data else 1000
+        use_pagination = cfg.exchange.candles_limit > max_per_request
+        
+        # Calculate start_ts if we need pagination but don't have it
+        if use_pagination and start_ts is None:
+            timeframe_ms = ex._timeframe_to_ms(cfg.exchange.timeframe)
+            if timeframe_ms:
+                start_ts = end_ts - (cfg.exchange.candles_limit * timeframe_ms)
+                log.info(f"Auto-enabling pagination: need {cfg.exchange.candles_limit} bars (API limit: {max_per_request})")
+        
         bars: Dict[str, pd.DataFrame] = {}
         for sym in symbols_list:
             try:
-                if use_date_range and start_ts is not None:
-                    # Use date range fetching
+                if (use_date_range or use_pagination) and start_ts is not None:
+                    # Use date range fetching with pagination
                     raw = ex.fetch_ohlcv_range(
                         sym,
                         timeframe=cfg.exchange.timeframe,
                         start_ts=start_ts,
                         end_ts=end_ts,
-                        max_candles=cfg.data.max_candles_total,
+                        max_candles=min(cfg.exchange.candles_limit, cfg.data.max_candles_total if cfg.data else 50000),
                     )
                 else:
-                    # Use limit-based fetching (backward compatible)
+                    # Use limit-based fetching (backward compatible, capped at API limit)
                     raw = ex.fetch_ohlcv(
                         sym,
                         timeframe=cfg.exchange.timeframe,
-                        limit=cfg.exchange.candles_limit,
+                        limit=min(cfg.exchange.candles_limit, max_per_request),
                     )
                 
                 if raw:

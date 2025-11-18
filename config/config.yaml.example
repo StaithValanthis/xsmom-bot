@@ -9,7 +9,7 @@ exchange:
   min_usd_volume_24h: 100000000
   min_price: 0.05
   timeframe: 1h
-  candles_limit: 4000
+  candles_limit: 5000  # Increased to support default WFO (120/30/2 days = ~152 days = ~3648 bars at 1h)
   recv_window_ms: 10000
   include_symbols: []
   exclude_symbols: []

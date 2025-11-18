@@ -269,8 +269,9 @@ def aggregate_segment_results(
     aggregated = {}
     
     for key in metric_keys:
-        train_vals = [r["train_metrics"].get(key, np.nan) for r in segment_results]
-        oos_vals = [r["oos_metrics"].get(key, np.nan) for r in segment_results]
+        # Handle cases where train_metrics might not be present
+        train_vals = [r.get("train_metrics", {}).get(key, np.nan) for r in segment_results if "train_metrics" in r]
+        oos_vals = [r.get("oos_metrics", {}).get(key, np.nan) for r in segment_results if "oos_metrics" in r]
         
         train_vals = [v for v in train_vals if not np.isnan(v)]
         oos_vals = [v for v in oos_vals if not np.isnan(v)]

@@ -253,12 +253,21 @@ def run_full_cycle(
     
     # Calculate required bars for WFO (before creating WFOConfig)
     timeframe_hours = 1.0  # Assuming 1h bars (could be extracted from config)
-    min_train_days = 60  # WFOConfig default
-    min_oos_days = 7  # WFOConfig default
-    min_train_bars = int(min_train_days * 24 / timeframe_hours)  # 60 days * 24h = 1440 bars
-    min_oos_bars = int(min_oos_days * 24 / timeframe_hours)  # 7 days * 24h = 168 bars
+    
+    # Use adaptive minimums based on available data
+    # If we have limited data, reduce minimums; if we have plenty, use standard minimums
+    effective_min_train_days = min(60, max(30, int(available_bars * 0.4 / 24)))  # At least 30 days, up to 60
+    effective_min_oos_days = min(7, max(3, int(available_bars * 0.1 / 24)))  # At least 3 days, up to 7
+    
+    min_train_bars = int(effective_min_train_days * 24 / timeframe_hours)
+    min_oos_bars = int(effective_min_oos_days * 24 / timeframe_hours)
     embargo_bars_required = int(embargo_days * 24 / timeframe_hours)
     required_bars = min_train_bars + embargo_bars_required + min_oos_bars
+    
+    log.info(
+        f"Adaptive WFO minimums: train={effective_min_train_days}d, oos={effective_min_oos_days}d "
+        f"(available: {available_bars} bars = {available_bars * timeframe_hours / 24:.1f} days)"
+    )
     
     if available_bars < required_bars:
         available_days = available_bars * timeframe_hours / 24
@@ -296,10 +305,16 @@ def run_full_cycle(
                     f"(requested: {oos_days}, max: {opt_cfg.max_oos_days_when_available})"
                 )
     
+    # Calculate effective minimums based on available data for WFOConfig
+    effective_min_train_days_cfg = min(train_days, max(30, int(available_bars * 0.4 / 24)))
+    effective_min_oos_days_cfg = min(int(effective_oos_days), max(3, int(available_bars * 0.1 / 24)))
+    
     wfo_cfg = WFOConfig(
         train_days=train_days,
         oos_days=int(effective_oos_days),  # Convert to int for WFOConfig
         embargo_days=embargo_days,
+        min_train_days=effective_min_train_days_cfg,  # Adaptive minimum
+        min_oos_days=effective_min_oos_days_cfg,  # Adaptive minimum
         timeframe_hours=timeframe_hours,
     )
     
@@ -320,7 +335,17 @@ def run_full_cycle(
             oos_bars_count = len(seg.oos_bars[oos_sample_symbol]) if oos_sample_symbol else 0
             oos_days_approx = oos_bars_count * wfo_cfg.timeframe_hours / 24.0
             
-            stats = run_backtest_with_params(
+            # Evaluate on train data
+            train_stats = run_backtest_with_params(
+                base_cfg=live_cfg,
+                param_overrides={},
+                symbols=seg.symbols,
+                prefetch_bars=seg.train_bars,
+                return_curve=False,
+            )
+            
+            # Evaluate on OOS data
+            oos_stats = run_backtest_with_params(
                 base_cfg=live_cfg,
                 param_overrides={},
                 symbols=seg.symbols,
@@ -329,11 +354,12 @@ def run_full_cycle(
             )
             
             # Extract trade count if available
-            oos_trades = stats.get("trades", 0) if stats else 0
+            oos_trades = oos_stats.get("trades", 0) if oos_stats else 0
             
             baseline_segment_results.append({
                 "segment_id": seg.segment_id,
-                "oos_metrics": stats,
+                "train_metrics": train_stats,  # Added train metrics
+                "oos_metrics": oos_stats,
                 "oos_sample_size": {
                     "bars": oos_bars_count,
                     "days": oos_days_approx,
