@@ -38,6 +38,80 @@ The xsmom-bot automated optimizer implements a **full-cycle optimization pipelin
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## OOS Sample Size Requirements
+
+The optimizer now includes **sample-size-aware deployment logic** to prevent deployment decisions based on unreliable metrics from tiny out-of-sample windows.
+
+### Problem: Tiny OOS Windows
+
+When the OOS window is too small (e.g., 19 bars = ~0.8 days), metrics become mathematically meaningless:
+- Sharpe ratios can be extremely inflated (e.g., 289.70) due to small sample variance
+- Annualized returns become unreliable (e.g., 13,571.96%)
+- Baseline vs candidate comparisons become invalid
+
+### Solution: Sample Size Detection & Handling
+
+The optimizer now:
+
+1. **Tracks OOS sample size** for each segment (bars, days, trades)
+2. **Detects when OOS is too small** based on configurable thresholds
+3. **Adjusts deployment logic** based on sample size:
+   - If baseline OOS is too small: Evaluates candidates on **absolute metrics only** (no baseline comparison)
+   - If candidate OOS is too small: Rejects candidate (requires minimum sample size)
+   - If both are sufficient: Performs normal baseline vs candidate comparison
+
+### Configuration
+
+**Defaults are applied automatically** - you don't need to add these to your config unless you want to override them. However, for clarity and explicit control, you can add to `config/config.yaml`:
+
+```yaml
+optimizer:
+  # Minimum OOS sample size requirements for deployment decisions
+  oos_min_bars_for_deploy: 200      # Minimum OOS bars required (default: 200)
+  oos_min_days_for_deploy: 5.0      # Minimum OOS days (default: 5.0)
+  oos_min_trades_for_deploy: 30     # Minimum trades in OOS period (default: 30)
+  require_min_oos_for_deploy: true   # Enforce minimum requirements (default: true)
+  
+  # WFO window preferences (when data is available)
+  prefer_larger_oos_windows: true   # Use larger OOS windows when data allows (default: true)
+  max_oos_days_when_available: 60   # Maximum OOS days to use (default: 60)
+  
+  # Sample size awareness in comparisons
+  ignore_baseline_if_oos_too_small: true  # Ignore baseline if OOS too small (default: true)
+  warn_on_small_oos: true                 # Log warnings when OOS is too small (default: true)
+```
+
+**Note:** If your `config.yaml` doesn't have an `optimizer:` section, these defaults are still applied automatically via the config loader. The same applies to the `data:` section for pagination settings.
+
+### Behavior Examples
+
+**Scenario 1: Baseline OOS too small (19 bars)**
+```
+⚠️  Baseline OOS sample is too small: 19 bars (~0.8 days, 0 trades)
+Candidate 0: Skipping baseline comparison (baseline OOS too small)
+Candidate 0: Rejected (Sharpe 5.71 < 0.5)  # Evaluated on absolute metrics
+```
+
+**Scenario 2: Both baseline and candidate have sufficient OOS**
+```
+Baseline OOS: Sharpe=1.23, Annualized=15.2%, Sample: 720 bars (~30.0 days, 45 trades)
+Candidate 0: Sharpe improvement 0.12 >= 0.05 ✓
+Candidate 0: Annualized improvement 2.3% >= 3.0% ✗  # Rejected
+```
+
+**Scenario 3: Automatic OOS window expansion**
+```
+Using larger OOS window: 45.0 days (requested: 30, max: 60)
+# When prefer_larger_oos_windows=true and extra data is available
+```
+
+### Recommendations
+
+- **Minimum OOS**: At least 200 bars (~8.3 days at 1h timeframe) for reliable Sharpe ratios
+- **Ideal OOS**: 30-60 days for robust statistical significance
+- **Trade count**: At least 30 trades in OOS period for meaningful performance metrics
+- **When data is limited**: Reduce `oos_days` parameter or increase `candles_limit` in config
+
 ## Quick Start
 
 ### One-Time Setup
@@ -370,50 +444,148 @@ Saved to `logs/optimizer_full_cycle_YYYYMMDD_HHMMSS.json`:
 
 ### The Problem
 
-Bybit's API limits single OHLCV requests to **1000 bars per request**. When the optimizer requests more than 1000 bars (e.g., `candles_limit: 4000`), the system automatically paginates to fetch the full range.
+Bybit's API limits single OHLCV requests to **1000 bars per request**. This is a hard limit enforced by Bybit's API, not a configuration issue. When the optimizer requests more than 1000 bars (e.g., `candles_limit: 4000`), the system **automatically paginates** to fetch the full range.
+
+**What happens without pagination:**
+- Request 4000 bars → Bybit returns only 1000 (truncated)
+- Optimizer runs on incomplete data → unreliable results
+- WFO segments may fail due to insufficient history
+
+**What happens with pagination (current implementation):**
+- Request 4000 bars → System makes 4 API calls (1000 each)
+- Automatically deduplicates and sorts results
+- Returns full 4000 bars → Optimizer runs successfully
 
 ### How Pagination Works
 
-The optimizer uses two pagination strategies:
+The optimizer uses **automatic pagination** in `ExchangeWrapper.fetch_ohlcv()`:
 
-1. **Limit-based pagination** (`fetch_ohlcv`):
-   - Fetches "most recent N bars" by going backwards in time
-   - Used by default when `candles_limit > 1000`
-   - Automatically deduplicates and handles rate limits
+1. **Detection**: When `limit > 1000`, pagination is automatically triggered
+2. **Strategy**: Fetches chunks going **backwards in time** (most recent first)
+3. **Deduplication**: Removes duplicate timestamps across chunks
+4. **Sorting**: Returns bars in chronological order (oldest → newest)
+5. **Rate Limiting**: Adds delays between requests to avoid hitting Bybit limits
 
-2. **Date range pagination** (`fetch_ohlcv_range`):
-   - Fetches data for a specific time range (start_ts to end_ts)
-   - Uses forward pagination (oldest to newest)
-   - Available via `fetch_historical_data(..., use_date_range=True)`
+**Example flow for 4000 bars:**
+```
+Request 1: Most recent 1000 bars (timestamps: T-1000 to T-0)
+  ↓ (200ms delay)
+Request 2: Next 1000 bars (timestamps: T-2000 to T-1001)
+  ↓ (200ms delay)
+Request 3: Next 1000 bars (timestamps: T-3000 to T-2001)
+  ↓ (200ms delay)
+Request 4: Next 1000 bars (timestamps: T-4000 to T-3001)
+  ↓
+Result: 4000 bars, deduplicated, sorted oldest→newest
+```
+
+### Alternative: Date Range Pagination
+
+For explicit date ranges, use `fetch_ohlcv_range()`:
+
+```python
+# In optimizer/backtest_runner.py
+raw = ex.fetch_ohlcv_range(
+    symbol="BTC/USDT:USDT",
+    timeframe="1h",
+    start_ts=start_timestamp_ms,
+    end_ts=end_timestamp_ms,
+    max_candles=50000,
+)
+```
+
+This uses **forward pagination** (oldest → newest) and is useful when you need a specific time window rather than "most recent N bars".
 
 ### Configuration
 
-Control pagination behavior via `data.*` config keys:
+**Defaults are applied automatically** - you don't need to add these to your config unless you want to override them. However, for clarity and explicit control, you can add to `config/config.yaml`:
 
 ```yaml
 data:
   max_candles_per_request: 1000  # Bybit's per-request limit (do not change)
   max_candles_total: 50000       # Safety cap per symbol/timeframe
-  api_throttle_sleep_ms: 200     # Sleep between paginated requests (ms)
-  max_pagination_requests: 100    # Safety limit on pagination requests
+  api_throttle_sleep_ms: 200     # Sleep between paginated requests (milliseconds)
+  max_pagination_requests: 100   # Safety limit on number of pagination requests
 ```
 
-**Recommended settings:**
-- `max_candles_total`: Set to at least `(train_days + oos_days + embargo_days) * 24 / timeframe_hours`
+**Note:** If your `config.yaml` doesn't have a `data:` section, these defaults are still applied automatically via the config loader. Pagination will work out of the box with sensible defaults.
+
+**Parameter explanations:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_candles_per_request` | 1000 | Bybit's hard limit (do not change) |
+| `max_candles_total` | 50000 | Maximum total bars to fetch per symbol (safety cap) |
+| `api_throttle_sleep_ms` | 200 | Delay between pagination requests (milliseconds) |
+| `max_pagination_requests` | 100 | Maximum number of API calls per fetch (safety limit) |
+
+**Recommended settings for WFO:**
+- **Minimum `max_candles_total`**: `(train_days + oos_days + embargo_days) * 24 / timeframe_hours`
   - Example: For 120/30/2 days at 1h: `(152 * 24) = 3648` → set to `4000` or higher
-- `api_throttle_sleep_ms`: 200ms is usually safe; increase to 500ms if hitting rate limits
-- `max_pagination_requests`: 100 allows up to 100,000 bars (100 * 1000); adjust if needed
+  - Example: For 120/30/2 days at 5m: `(152 * 24 * 12) = 43,776` → set to `50000`
+- **`api_throttle_sleep_ms`**: 
+  - `200ms` is usually safe for most use cases
+  - Increase to `500ms` if you see rate limit errors
+  - Decrease to `100ms` if you need faster fetching (risky)
+- **`max_pagination_requests`**: 
+  - `100` allows up to 100,000 bars (100 * 1000)
+  - Increase if you need very long history (e.g., 200 for 200k bars)
 
-### Rate Limiting
+### Rate Limiting & Safety
 
-The pagination system includes built-in rate limiting:
+The pagination system includes multiple layers of rate limiting:
 
-- **Per-request delay**: `api_throttle_sleep_ms` between pagination chunks
-- **Rate limit detection**: Automatically waits 2 seconds on rate limit errors
-- **CCXT rate limiting**: Enabled by default (`enableRateLimit: True`)
+1. **Per-request delay**: `api_throttle_sleep_ms` between pagination chunks
+2. **Rate limit detection**: Automatically waits 2 seconds on rate limit errors (Bybit error code 10006)
+3. **CCXT rate limiting**: Enabled by default (`enableRateLimit: True` in ExchangeWrapper)
+4. **Safety caps**: `max_candles_total` and `max_pagination_requests` prevent runaway fetches
 
-If you see rate limit errors in logs:
-1. Increase `api_throttle_sleep_ms` (e.g., 500ms)
+**If you see rate limit errors in logs:**
+1. Increase `api_throttle_sleep_ms` (e.g., 500ms or 1000ms)
+2. Reduce `candles_limit` if you don't need full history
+3. Check Bybit API status page for service issues
+4. Consider caching data locally (future enhancement)
+
+### Testing Pagination
+
+Use the test harness to verify pagination works correctly:
+
+```bash
+# Test limit-based fetching (4000 bars)
+python tools/test_bybit_history.py \
+  --symbol BTC/USDT:USDT \
+  --timeframe 1h \
+  --target-bars 4000
+
+# Test date-range fetching (30 days)
+python tools/test_bybit_history.py \
+  --symbol BTC/USDT:USDT \
+  --timeframe 1h \
+  --days-back 30 \
+  --test-range
+
+# Test both
+python tools/test_bybit_history.py \
+  --symbol BTC/USDT:USDT \
+  --timeframe 1h \
+  --target-bars 4000 \
+  --days-back 30 \
+  --test-range
+```
+
+**Expected output:**
+```
+✓ Fetched 4000 bars (requested 4000)
+  Duration: 2.5 seconds
+  Date range: 2024-10-15 to 2024-11-14 (30.0 days)
+  Duplicates: 0
+  Estimated API requests: 4
+```
+
+If you see fewer bars than requested, check:
+1. Is `max_candles_total` set high enough?
+2. Are there rate limit errors in logs?
+3. Does the symbol have enough historical data available?
 2. Reduce number of symbols being fetched
 3. Check Bybit API status page
 

@@ -38,6 +38,14 @@ Controls pagination and rate limiting for fetching historical OHLCV data from By
 | `data.api_throttle_sleep_ms` | int | `200` | Sleep between paginated requests (milliseconds) |
 | `data.max_pagination_requests` | int | `100` | Safety limit on number of pagination requests per fetch |
 
+**⚠️ Defaults Applied Automatically:**
+
+These defaults are **automatically applied** even if the `data:` section is missing from your `config.yaml`. The system uses:
+1. **Pydantic model defaults** in `DataCfg` class
+2. **Config loader defaults** in `_merge_defaults()` function
+
+**You don't need to add these to your config** unless you want to override the defaults. However, it's recommended to include them in `config.yaml` for clarity and explicit control.
+
 **Notes:**
 - **Bybit API Limit**: Single requests are capped at 1000 bars. The system automatically paginates when `candles_limit > 1000`.
 - **Pagination**: Uses backward pagination (most recent N bars) by default, or forward pagination (date ranges) when using `fetch_ohlcv_range`.
@@ -204,6 +212,44 @@ Controls pagination and rate limiting for fetching historical OHLCV data from By
 | `notifications.discord.send_optimizer_results` | bool | `true` | Send optimizer result notifications |
 | `notifications.discord.send_daily_report` | bool | `true` | Send daily performance reports |
 | `notifications.discord.webhook_url` | str | `null` | Fallback webhook URL (if env var not set) |
+
+---
+
+## Optimizer (Deployment & OOS Sample Size)
+
+Controls when optimizer results are considered reliable enough for deployment decisions. Prevents deployment based on unreliable metrics from tiny out-of-sample windows.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `optimizer.oos_min_bars_for_deploy` | int | `200` | Minimum OOS bars required before trusting Sharpe for deployment |
+| `optimizer.oos_min_days_for_deploy` | float | `5.0` | Minimum OOS days (approximate, based on timeframe) |
+| `optimizer.oos_min_trades_for_deploy` | int | `30` | Minimum trades in OOS period (if available) |
+| `optimizer.require_min_oos_for_deploy` | bool | `true` | If true, no deployment when OOS is too small |
+| `optimizer.prefer_larger_oos_windows` | bool | `true` | Prefer larger OOS windows when enough data is available |
+| `optimizer.max_oos_days_when_available` | int | `60` | Use up to N days for OOS if data allows |
+| `optimizer.ignore_baseline_if_oos_too_small` | bool | `true` | Ignore baseline metrics if OOS sample is too small |
+| `optimizer.warn_on_small_oos` | bool | `true` | Log warnings when OOS sample is below minimum |
+
+**⚠️ Defaults Applied Automatically:**
+
+These defaults are **automatically applied** even if the `optimizer:` section is missing from your `config.yaml`. The system uses:
+1. **Pydantic model defaults** in `OptimizerCfg` class
+2. **Config loader defaults** in `_merge_defaults()` function
+
+**You don't need to add these to your config** unless you want to override the defaults. However, it's recommended to include them in `config.yaml` for clarity and explicit control.
+
+**Notes:**
+- **Problem**: Tiny OOS windows (e.g., 19 bars = ~0.8 days) produce unreliable metrics (inflated Sharpe ratios, meaningless annualized returns).
+- **Solution**: The optimizer tracks OOS sample size (bars, days, trades) and adjusts deployment logic:
+  - If baseline OOS is too small: Evaluates candidates on **absolute metrics only** (no baseline comparison)
+  - If candidate OOS is too small: Rejects candidate (requires minimum sample size)
+  - If both are sufficient: Performs normal baseline vs candidate comparison
+- **Recommendations**:
+  - Minimum OOS: At least 200 bars (~8.3 days at 1h timeframe) for reliable Sharpe ratios
+  - Ideal OOS: 30-60 days for robust statistical significance
+  - Trade count: At least 30 trades in OOS period for meaningful performance metrics
+
+See [`../usage/optimizer.md#oos-sample-size-requirements`](../usage/optimizer.md#oos-sample-size-requirements) for detailed examples and behavior.
 
 ---
 

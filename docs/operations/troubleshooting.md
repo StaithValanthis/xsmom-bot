@@ -225,6 +225,7 @@ journalctl -u xsmom-optimizer-full-cycle.service -n 100
 - Backtest failures → Check config validity, parameter ranges
 - Disk full → Check disk space
 - Memory issues → Check memory usage
+- **Only 1000 bars fetched** → Bybit 1000-item limit (see below)
 
 **Fix:**
 ```bash
@@ -236,7 +237,71 @@ free -h
 
 # Run optimizer with verbose logging
 python -m src.optimizer.full_cycle --base-config config/config.yaml --verbose
+
+# Test data fetching
+python tools/test_bybit_history.py --symbol BTC/USDT:USDT --timeframe 1h --target-bars 4000
 ```
+
+---
+
+### Optimizer Only Getting 1000 Bars (Bybit Limit)
+
+**Symptoms:**
+- Optimizer logs show "Fetched data for 36 symbols, 1000 bars per symbol"
+- WFO fails with "insufficient data" errors
+- Config shows `candles_limit: 4000` but only 1000 bars are fetched
+
+**Root cause:**
+Bybit's API limits single requests to 1000 bars. The system should automatically paginate, but if it's not working, check:
+
+**Check logs:**
+```bash
+journalctl -u xsmom-optimizer-full-cycle.service -n 100 | grep -i "fetch\|pagination\|1000"
+```
+
+**Common causes:**
+1. **Pagination disabled or misconfigured** → Check `data.*` config
+2. **Rate limiting** → Too many requests, hitting Bybit limits
+3. **Safety caps too low** → `max_candles_total` or `max_pagination_requests` too small
+4. **Data not available** → Symbol doesn't have enough history
+
+**Fix:**
+```bash
+# 1. Check data config
+cat /opt/xsmom-bot/config/config.yaml | grep -A 5 "^data:"
+
+# Should show:
+# data:
+#   max_candles_per_request: 1000
+#   max_candles_total: 50000
+#   api_throttle_sleep_ms: 200
+#   max_pagination_requests: 100
+
+# 2. Test pagination directly
+python tools/test_bybit_history.py \
+  --config /opt/xsmom-bot/config/config.yaml \
+  --symbol BTC/USDT:USDT \
+  --timeframe 1h \
+  --target-bars 4000
+
+# 3. If test fails, increase throttle delay
+nano /opt/xsmom-bot/config/config.yaml
+# Set: api_throttle_sleep_ms: 500  # Increase from 200 to 500
+
+# 4. Verify ExchangeWrapper is using data_cfg
+# Check that optimizer calls: ExchangeWrapper(cfg.exchange, data_cfg=cfg.data)
+```
+
+**Expected behavior:**
+- Requesting 4000 bars should make 4 API calls (1000 each)
+- Logs should show "Fetching 4000 bars for ... (paginating, max 1000 per request)"
+- Final result should have 4000 bars (or close to it)
+
+**If still failing:**
+1. Check Bybit API status (may be rate limiting)
+2. Increase `api_throttle_sleep_ms` to 1000ms
+3. Reduce `candles_limit` temporarily to test
+4. Check network connectivity to Bybit API
 
 ---
 

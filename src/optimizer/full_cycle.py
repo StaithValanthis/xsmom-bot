@@ -279,9 +279,26 @@ def run_full_cycle(
         raise RuntimeError(error_msg)
     
     # Generate WFO segments
+    # Adjust OOS window size if optimizer config prefers larger windows and data is available
+    opt_cfg = base_cfg.optimizer
+    effective_oos_days = oos_days
+    if opt_cfg.prefer_larger_oos_windows and available_bars > 0:
+        # Calculate how much data we have beyond minimum requirements
+        min_required_bars = int((train_days + embargo_days + oos_days) * 24 / timeframe_hours)
+        extra_bars = available_bars - min_required_bars
+        if extra_bars > 0:
+            # Use extra data to increase OOS window (up to max_oos_days_when_available)
+            extra_oos_bars = min(extra_bars, int((opt_cfg.max_oos_days_when_available - oos_days) * 24 / timeframe_hours))
+            if extra_oos_bars > 0:
+                effective_oos_days = oos_days + (extra_oos_bars * timeframe_hours / 24.0)
+                log.info(
+                    f"Using larger OOS window: {effective_oos_days:.1f} days "
+                    f"(requested: {oos_days}, max: {opt_cfg.max_oos_days_when_available})"
+                )
+    
     wfo_cfg = WFOConfig(
         train_days=train_days,
-        oos_days=oos_days,
+        oos_days=int(effective_oos_days),  # Convert to int for WFOConfig
         embargo_days=embargo_days,
         timeframe_hours=timeframe_hours,
     )
@@ -298,6 +315,11 @@ def run_full_cycle(
     baseline_segment_results = []
     for seg in segments:
         try:
+            # Calculate OOS sample size
+            oos_sample_symbol = list(seg.oos_bars.keys())[0] if seg.oos_bars else None
+            oos_bars_count = len(seg.oos_bars[oos_sample_symbol]) if oos_sample_symbol else 0
+            oos_days_approx = oos_bars_count * wfo_cfg.timeframe_hours / 24.0
+            
             stats = run_backtest_with_params(
                 base_cfg=live_cfg,
                 param_overrides={},
@@ -305,9 +327,18 @@ def run_full_cycle(
                 prefetch_bars=seg.oos_bars,
                 return_curve=False,
             )
+            
+            # Extract trade count if available
+            oos_trades = stats.get("trades", 0) if stats else 0
+            
             baseline_segment_results.append({
                 "segment_id": seg.segment_id,
                 "oos_metrics": stats,
+                "oos_sample_size": {
+                    "bars": oos_bars_count,
+                    "days": oos_days_approx,
+                    "trades": oos_trades,
+                },
             })
         except Exception as e:
             log.warning(f"Baseline eval failed for segment {seg.segment_id}: {e}")
@@ -317,10 +348,33 @@ def run_full_cycle(
         metric_keys=["sharpe", "annualized", "max_drawdown", "calmar"],
     )
     
+    # Extract OOS sample size info from aggregated results
+    baseline_oos_bars = baseline_aggregated.get("oos_sample_bars_mean", 0.0)
+    baseline_oos_days = baseline_aggregated.get("oos_sample_days_mean", 0.0)
+    baseline_oos_trades = baseline_aggregated.get("oos_sample_trades_mean", 0.0)
+    
+    # Check if baseline OOS is too small
+    opt_cfg = base_cfg.optimizer
+    baseline_oos_too_small = (
+        baseline_oos_bars < opt_cfg.oos_min_bars_for_deploy or
+        baseline_oos_days < opt_cfg.oos_min_days_for_deploy or
+        (opt_cfg.oos_min_trades_for_deploy > 0 and baseline_oos_trades < opt_cfg.oos_min_trades_for_deploy)
+    )
+    
+    if baseline_oos_too_small and opt_cfg.warn_on_small_oos:
+        log.warning(
+            f"⚠️  Baseline OOS sample is too small for reliable metrics: "
+            f"{baseline_oos_bars:.0f} bars (~{baseline_oos_days:.1f} days, {baseline_oos_trades:.0f} trades). "
+            f"Minimum required: {opt_cfg.oos_min_bars_for_deploy} bars, {opt_cfg.oos_min_days_for_deploy} days, "
+            f"{opt_cfg.oos_min_trades_for_deploy} trades. "
+            f"Baseline metrics may be unreliable."
+        )
+    
     log.info(
         f"Baseline OOS: "
         f"Sharpe={baseline_aggregated.get('oos_sharpe_mean', 0.0):.2f}, "
-        f"Annualized={baseline_aggregated.get('oos_annualized_mean', 0.0):.2%}"
+        f"Annualized={baseline_aggregated.get('oos_annualized_mean', 0.0):.2%}, "
+        f"Sample: {baseline_oos_bars:.0f} bars (~{baseline_oos_days:.1f} days, {baseline_oos_trades:.0f} trades)"
     )
     
     # Run BO on each segment
@@ -378,6 +432,12 @@ def run_full_cycle(
                 if stats and "equity_curve" in stats:
                     equity_curve = stats.pop("equity_curve")
                     
+                    # Calculate OOS sample size
+                    oos_sample_symbol = list(seg.oos_bars.keys())[0] if seg.oos_bars else None
+                    oos_bars_count = len(seg.oos_bars[oos_sample_symbol]) if oos_sample_symbol else 0
+                    oos_days_approx = oos_bars_count * wfo_cfg.timeframe_hours / 24.0
+                    oos_trades = stats.get("trades", 0) if stats else 0
+                    
                     # Run Monte Carlo stress test
                     mc_cfg = MCConfig(
                         n_runs=mc_n_runs,
@@ -393,6 +453,11 @@ def run_full_cycle(
                         "segment_id": seg.segment_id,
                         "oos_metrics": stats,
                         "mc_summary": mc_summary,
+                        "oos_sample_size": {
+                            "bars": oos_bars_count,
+                            "days": oos_days_approx,
+                            "trades": oos_trades,
+                        },
                     })
             except Exception as e:
                 log.warning(f"Candidate eval failed for segment {seg.segment_id}: {e}")
@@ -421,11 +486,21 @@ def run_full_cycle(
                 }
                 aggregated.update(mc_aggregated)
             
+            # Extract OOS sample size info
+            cand_oos_bars = aggregated.get("oos_sample_bars_mean", 0.0)
+            cand_oos_days = aggregated.get("oos_sample_days_mean", 0.0)
+            cand_oos_trades = aggregated.get("oos_sample_trades_mean", 0.0)
+            
             candidate_results.append({
                 "candidate_id": cand_idx,
                 "params": cand_params,
                 "aggregated_metrics": aggregated,
                 "segment_results": cand_segment_results,
+                "oos_sample_size": {
+                    "bars": cand_oos_bars,
+                    "days": cand_oos_days,
+                    "trades": cand_oos_trades,
+                },
             })
     
     if not candidate_results:
@@ -435,6 +510,8 @@ def run_full_cycle(
     best_candidate = None
     best_score = float("-inf")
     
+    opt_cfg = base_cfg.optimizer
+    
     for cand in candidate_results:
         metrics = cand["aggregated_metrics"]
         sharpe = metrics.get("oos_sharpe_mean", 0.0)
@@ -442,16 +519,84 @@ def run_full_cycle(
         max_dd = abs(metrics.get("oos_max_drawdown_mean", 0.0))
         p99_dd = abs(metrics.get("mean_p99_dd", 0.0))
         
+        # Get candidate OOS sample size
+        cand_oos_size = cand.get("oos_sample_size", {})
+        cand_oos_bars = cand_oos_size.get("bars", 0.0)
+        cand_oos_days = cand_oos_size.get("days", 0.0)
+        cand_oos_trades = cand_oos_size.get("trades", 0.0)
+        
+        # Check if candidate OOS is too small
+        cand_oos_too_small = (
+            cand_oos_bars < opt_cfg.oos_min_bars_for_deploy or
+            cand_oos_days < opt_cfg.oos_min_days_for_deploy or
+            (opt_cfg.oos_min_trades_for_deploy > 0 and cand_oos_trades < opt_cfg.oos_min_trades_for_deploy)
+        )
+        
+        if cand_oos_too_small and opt_cfg.warn_on_small_oos:
+            log.warning(
+                f"Candidate {cand['candidate_id']}: OOS sample too small "
+                f"({cand_oos_bars:.0f} bars, ~{cand_oos_days:.1f} days, {cand_oos_trades:.0f} trades). "
+                f"Metrics may be unreliable."
+            )
+        
+        # If both baseline and candidate OOS are too small, skip deployment comparison
+        if opt_cfg.require_min_oos_for_deploy and (baseline_oos_too_small or cand_oos_too_small):
+            if baseline_oos_too_small and opt_cfg.ignore_baseline_if_oos_too_small:
+                log.info(
+                    f"Candidate {cand['candidate_id']}: Skipping baseline comparison "
+                    f"(baseline OOS too small: {baseline_oos_bars:.0f} bars, ~{baseline_oos_days:.1f} days). "
+                    f"Will evaluate candidate on absolute metrics only."
+                )
+                # Evaluate candidate on absolute metrics only (no baseline comparison)
+                # Still check safety thresholds
+                if p99_dd > tail_dd_limit:
+                    log.warning(f"Candidate {cand['candidate_id']}: Rejected (tail DD {p99_dd:.2%} > {tail_dd_limit:.2%})")
+                    continue
+                
+                # If candidate OOS is also too small, reject it
+                if cand_oos_too_small:
+                    log.info(
+                        f"Candidate {cand['candidate_id']}: Rejected (OOS sample too small: "
+                        f"{cand_oos_bars:.0f} bars, ~{cand_oos_days:.1f} days). "
+                        f"Require minimum {opt_cfg.oos_min_bars_for_deploy} bars, {opt_cfg.oos_min_days_for_deploy} days."
+                    )
+                    continue
+                
+                # Candidate OOS is acceptable, evaluate on absolute metrics
+                # Use reasonable absolute thresholds (e.g., Sharpe > 0.5, positive annualized)
+                if sharpe < 0.5:
+                    log.info(f"Candidate {cand['candidate_id']}: Rejected (Sharpe {sharpe:.2f} < 0.5)")
+                    continue
+                
+                if annualized < 0.0:
+                    log.info(f"Candidate {cand['candidate_id']}: Rejected (negative annualized return {annualized:.2%})")
+                    continue
+                
+                # Candidate passes absolute checks
+                score = sharpe * 0.5 + annualized * 10.0 * 0.3 + (metrics.get("calmar", 0.0) * 0.2)
+                if score > best_score:
+                    best_score = score
+                    best_candidate = cand
+                continue
+            else:
+                # Baseline too small but we're not ignoring it, or candidate too small
+                log.info(
+                    f"Candidate {cand['candidate_id']}: Rejected (OOS sample size requirements not met). "
+                    f"Baseline: {baseline_oos_bars:.0f} bars, Candidate: {cand_oos_bars:.0f} bars."
+                )
+                continue
+        
         # Safety checks
         if p99_dd > tail_dd_limit:
             log.warning(f"Candidate {cand['candidate_id']}: Rejected (tail DD {p99_dd:.2%} > {tail_dd_limit:.2%})")
             continue
         
+        # Only compare to baseline if both have sufficient OOS sample size
         baseline_sharpe = baseline_aggregated.get("oos_sharpe_mean", 0.0)
         baseline_annualized = baseline_aggregated.get("oos_annualized_mean", 0.0)
         baseline_dd = abs(baseline_aggregated.get("oos_max_drawdown_mean", 0.0))
         
-        # Improvement checks
+        # Improvement checks (only if baseline is reliable)
         sharpe_improve = sharpe - baseline_sharpe
         annualized_improve = annualized - baseline_annualized
         dd_increase = max_dd - baseline_dd
@@ -459,14 +604,16 @@ def run_full_cycle(
         if sharpe_improve < min_improve_sharpe:
             log.info(
                 f"Candidate {cand['candidate_id']}: Sharpe improvement "
-                f"{sharpe_improve:.4f} < {min_improve_sharpe:.4f}"
+                f"{sharpe_improve:.4f} < {min_improve_sharpe:.4f} "
+                f"(candidate: {sharpe:.2f}, baseline: {baseline_sharpe:.2f})"
             )
             continue
         
         if annualized_improve < min_improve_annualized:
             log.info(
                 f"Candidate {cand['candidate_id']}: Annualized improvement "
-                f"{annualized_improve:.2%} < {min_improve_annualized:.2%}"
+                f"{annualized_improve:.2%} < {min_improve_annualized:.2%} "
+                f"(candidate: {annualized:.2%}, baseline: {baseline_annualized:.2%})"
             )
             continue
         
@@ -478,6 +625,7 @@ def run_full_cycle(
             continue
         
         # Score candidate
+        calmar = metrics.get("calmar", 0.0)
         score = sharpe * 0.5 + annualized * 10.0 * 0.3 + calmar * 0.2
         
         if score > best_score:

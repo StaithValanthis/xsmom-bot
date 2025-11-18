@@ -490,4 +490,21 @@ notifications:
       compare_to_backtest: true  # Compare live costs to backtest assumptions
       alert_threshold_pct: 20.0  # Alert if costs exceed backtest by N%
 
+# Optimizer deployment and OOS sample size requirements
+# Controls when optimizer results are considered reliable enough for deployment
+optimizer:
+  # Minimum OOS sample size requirements for deployment decisions
+  oos_min_bars_for_deploy: 200      # Minimum OOS bars required before trusting Sharpe for deployment
+  oos_min_days_for_deploy: 5.0      # Minimum OOS days (approximate, based on timeframe)
+  oos_min_trades_for_deploy: 30     # Optional: minimum trades in OOS period (if available)
+  require_min_oos_for_deploy: true   # If true, no deployment when OOS is too small
+  
+  # WFO window preferences (when data is available)
+  prefer_larger_oos_windows: true   # Prefer larger OOS windows when enough data is available
+  max_oos_days_when_available: 60   # Use up to N days for OOS if data allows (default: 60)
+  
+  # Sample size awareness in comparisons
+  ignore_baseline_if_oos_too_small: true  # Ignore baseline metrics if OOS sample is too small
+  warn_on_small_oos: true                 # Log warnings when OOS sample is below minimum
+
 sleeve_constraints: {}

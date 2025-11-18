@@ -283,6 +283,22 @@ class DataCfg(BaseModel):
     api_throttle_sleep_ms: int = 200  # Sleep between paginated calls (milliseconds)
     max_pagination_requests: int = 100  # Safety limit on number of pagination requests
 
+class OptimizerCfg(BaseModel):
+    """Configuration for optimizer deployment decisions and OOS sample size requirements."""
+    # Minimum OOS sample size requirements for deployment decisions
+    oos_min_bars_for_deploy: int = 200  # Minimum OOS bars required before trusting Sharpe for deployment
+    oos_min_days_for_deploy: float = 5.0  # Minimum OOS days (approximate, based on timeframe)
+    oos_min_trades_for_deploy: int = 30  # Optional: minimum trades in OOS period (if available)
+    require_min_oos_for_deploy: bool = True  # If true, no deployment when OOS is too small
+    
+    # WFO window preferences (when data is available)
+    prefer_larger_oos_windows: bool = True  # Prefer larger OOS windows when enough data is available
+    max_oos_days_when_available: int = 60  # Use up to N days for OOS if data allows (default: 60)
+    
+    # Sample size awareness in comparisons
+    ignore_baseline_if_oos_too_small: bool = True  # Ignore baseline metrics if OOS sample is too small
+    warn_on_small_oos: bool = True  # Log warnings when OOS sample is below minimum
+
 class RiskCfg(BaseModel):
     atr_len: int = 28
     atr_mult_sl: float = 2.0
@@ -399,6 +415,7 @@ class AppConfig(BaseModel):
     costs: CostsCfg = CostsCfg()
     notifications: NotificationsCfg = NotificationsCfg()
     data: DataCfg = DataCfg()  # Historical data fetching configuration
+    optimizer: OptimizerCfg = OptimizerCfg()  # Optimizer deployment and OOS requirements
     
     # Rollout/optimizer configs (optional, for rollout system)
     rollout: Optional[Dict[str, Any]] = None
@@ -464,6 +481,16 @@ def _merge_defaults(raw: Dict[str, Any]) -> Dict[str, Any]:
     raw["data"].setdefault("max_candles_total", 50000)
     raw["data"].setdefault("api_throttle_sleep_ms", 200)
     raw["data"].setdefault("max_pagination_requests", 100)
+    
+    raw.setdefault("optimizer", {})
+    raw["optimizer"].setdefault("oos_min_bars_for_deploy", 200)
+    raw["optimizer"].setdefault("oos_min_days_for_deploy", 5.0)
+    raw["optimizer"].setdefault("oos_min_trades_for_deploy", 30)
+    raw["optimizer"].setdefault("require_min_oos_for_deploy", True)
+    raw["optimizer"].setdefault("prefer_larger_oos_windows", True)
+    raw["optimizer"].setdefault("max_oos_days_when_available", 60)
+    raw["optimizer"].setdefault("ignore_baseline_if_oos_too_small", True)
+    raw["optimizer"].setdefault("warn_on_small_oos", True)
     
     raw.setdefault("risk", {})
     raw["risk"].setdefault("api_circuit_breaker", {"enabled": True, "max_errors": 5, "window_seconds": 300, "cooldown_seconds": 600})

@@ -297,5 +297,27 @@ def aggregate_segment_results(
             aggregated["oos_sharpe_stability"] = 1.0 - (np.std(oos_sharpes) / (abs(np.mean(oos_sharpes)) + 1e-6))
             aggregated["oos_sharpe_consistency"] = float(np.sum(np.array(oos_sharpes) > 0) / len(oos_sharpes))
     
+    # Aggregate OOS sample size metadata (if present)
+    oos_sample_sizes = [r.get("oos_sample_size", {}) for r in segment_results]
+    if oos_sample_sizes and any(s for s in oos_sample_sizes):
+        oos_bars = [s.get("bars", 0) for s in oos_sample_sizes if s]
+        oos_days = [s.get("days", 0.0) for s in oos_sample_sizes if s]
+        oos_trades = [s.get("trades", 0) for s in oos_sample_sizes if s]
+        
+        if oos_bars:
+            aggregated["oos_sample_bars_mean"] = float(np.mean(oos_bars))
+            aggregated["oos_sample_bars_min"] = float(np.min(oos_bars))
+            aggregated["oos_sample_bars_max"] = float(np.max(oos_bars))
+        
+        if oos_days:
+            aggregated["oos_sample_days_mean"] = float(np.mean(oos_days))
+            aggregated["oos_sample_days_min"] = float(np.min(oos_days))
+            aggregated["oos_sample_days_max"] = float(np.max(oos_days))
+        
+        if oos_trades:
+            aggregated["oos_sample_trades_mean"] = float(np.mean(oos_trades))
+            aggregated["oos_sample_trades_min"] = float(np.min(oos_trades))
+            aggregated["oos_sample_trades_max"] = float(np.max(oos_trades))
+    
     return aggregated
 
