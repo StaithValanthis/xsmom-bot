@@ -1,0 +1,23 @@
+[Unit]
+Description=XSMOM optimizer service (database-backed, continuous optimization)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=xsmom
+Group=xsmom
+WorkingDirectory=/opt/xsmom-bot
+EnvironmentFile=/opt/xsmom-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/xsmom-bot
+Environment=PATH=/opt/xsmom-bot/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/xsmom-bot/venv/bin/python -m src.optimizer.service watch --base-config /opt/xsmom-bot/config/config.yaml --live-config /opt/xsmom-bot/config/config.yaml --db-path /opt/xsmom-bot/data/optimizer.db --trials-per-iter 10 --sleep-seconds 1800
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

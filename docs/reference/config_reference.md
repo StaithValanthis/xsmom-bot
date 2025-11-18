@@ -219,6 +219,8 @@ These defaults are **automatically applied** even if the `data:` section is miss
 
 Controls when optimizer results are considered reliable enough for deployment decisions. Prevents deployment based on unreliable metrics from tiny out-of-sample windows.
 
+### OOS Sample Size Requirements
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `optimizer.oos_min_bars_for_deploy` | int | `200` | Minimum OOS bars required before trusting Sharpe for deployment |
@@ -229,6 +231,22 @@ Controls when optimizer results are considered reliable enough for deployment de
 | `optimizer.max_oos_days_when_available` | int | `60` | Use up to N days for OOS if data allows |
 | `optimizer.ignore_baseline_if_oos_too_small` | bool | `true` | Ignore baseline metrics if OOS sample is too small |
 | `optimizer.warn_on_small_oos` | bool | `true` | Log warnings when OOS sample is below minimum |
+
+### Database & Persistence (Optimizer Service)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `optimizer.db_path` | str | `"data/optimizer.db"` | Path to SQLite database for trial storage |
+| `optimizer.study_name_prefix` | str | `"xsmom_wfo"` | Prefix for Optuna study names |
+
+### Historical Lookup & Filtering
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `optimizer.skip_known_params` | bool | `true` | Skip already-tested parameter combinations |
+| `optimizer.enable_bad_combo_filter` | bool | `true` | Enable bad combination filtering |
+| `optimizer.bad_combo_min_score` | float | `-1.0` | Below this score = bad combo (auto-marked) |
+| `optimizer.bad_combo_dd_threshold` | float | `0.3` | Max drawdown threshold (30% = bad combo) |
 
 **⚠️ Defaults Applied Automatically:**
 
@@ -250,6 +268,17 @@ These defaults are **automatically applied** even if the `optimizer:` section is
   - Trade count: At least 30 trades in OOS period for meaningful performance metrics
 
 See [`../usage/optimizer.md#oos-sample-size-requirements`](../usage/optimizer.md#oos-sample-size-requirements) for detailed examples and behavior.
+
+**Optimizer Service:**
+
+The optimizer service provides database-backed, continuous optimization with historical lookup and bad-combo filtering. See [`../usage/optimizer_service.md`](../usage/optimizer_service.md) for full documentation.
+
+**Key Features:**
+- **SQLite persistence**: All trials stored in `optimizer.db_path`
+- **Optuna warm-start**: Studies persist across runs
+- **Historical lookup**: Skips duplicate parameter combinations
+- **Bad-combo filtering**: Automatically avoids poor parameter regions
+- **Query interface**: Inspect historical results via `python -m src.optimizer.query`
 
 ---
 

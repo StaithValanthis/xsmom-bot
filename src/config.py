@@ -32,7 +32,7 @@ class HurstCfg(BaseModel):
 
 class RegimeFilterCfg(BaseModel):
     enabled: bool = False
-    ema_len: int = 200
+    ema_len: int = 200  # Lock at 200 (roadmap: not optimized)
     slope_min_bps_per_day: float = 0.0
     use_abs: bool = False
     hurst: HurstCfg = HurstCfg()
@@ -146,13 +146,30 @@ class StrategyCfg(BaseModel):
 
     market_neutral: bool = True
     gross_leverage: float = 1.5
-    max_weight_per_asset: float = 0.2
+    max_weight_per_asset: float = 0.10  # Lock at 0.10 (roadmap: not optimized)
+
+    # NEW: Volatility breakout entry timing (roadmap)
+    volatility_entry: Dict[str, Any] = Field(default_factory=lambda: {
+        "enabled": False,
+        "atr_lookback": 48,
+        "expansion_mult": 1.5,  # ATR must exceed 1.5x recent ATR mean
+    })
+    
+    # NEW: Carry budget fraction (roadmap: optimize in optimizer)
+    carry: Dict[str, Any] = Field(default_factory=lambda: {
+        "budget_frac": 0.25,  # 25% of risk capital to carry sleeve
+    })
 
     # Filters
-    adx_filter: AdxFilterCfg = AdxFilterCfg()
+    adx_filter: AdxFilterCfg = AdxFilterCfg()  # Disabled by default (roadmap: remove from optimizer)
     symbol_filter: SymbolFilterCfg = SymbolFilterCfg()
     regime_filter: RegimeFilterCfg = RegimeFilterCfg()
     time_of_day_whitelist: TimeOfDayWhitelistCfg = TimeOfDayWhitelistCfg()
+    
+    # Meta-labeler (roadmap: remove from optimizer, feature-flag off by default)
+    meta_label: Dict[str, Any] = Field(default_factory=lambda: {
+        "enabled": False,  # Disabled by default (roadmap)
+    })
 
     # Sizing extras
     funding_tilt: FundingTiltCfg = FundingTiltCfg()
@@ -174,7 +191,7 @@ class StrategyCfg(BaseModel):
     # confirmation_timeframe/lookback/require_mtf_alignment removed per parameter review (partial wiring, not used)
 
     # NEW: majors regime & kelly sections
-    majors_regime: MajorsRegimeCfg = MajorsRegimeCfg()
+    majors_regime: MajorsRegimeCfg = MajorsRegimeCfg()  # Disabled by default (roadmap: remove from optimizer)
     kelly: KellyCfg = KellyCfg()
 
 # -----------------------------
@@ -264,6 +281,16 @@ class PartialLaddersCfg(BaseModel):
     sizes: List[float] = Field(default_factory=list)
     reduce_only: bool = True
 
+class ProfitTargetCfg(BaseModel):
+    """R-multiple profit target configuration."""
+    r_multiple: float  # R-multiple threshold (e.g., 2.0 for 2R)
+    exit_pct: float  # Percentage of position to exit at this level (e.g., 0.5 for 50%)
+
+class ProfitTargetsCfg(BaseModel):
+    """Explicit R-multiple profit targets (roadmap improvement)."""
+    enabled: bool = False
+    targets: List[ProfitTargetCfg] = Field(default_factory=list)
+
 class ProfitLockCfg(BaseModel):
     enabled: bool = False
     triggers_r: List[float] = Field(default_factory=list)
@@ -282,6 +309,23 @@ class DataCfg(BaseModel):
     max_candles_total: int = 50000  # Safety cap per symbol/timeframe
     api_throttle_sleep_ms: int = 200  # Sleep between paginated calls (milliseconds)
     max_pagination_requests: int = 100  # Safety limit on number of pagination requests
+    
+    # NEW: Historical OHLCV cache (roadmap)
+    cache: Dict[str, Any] = Field(default_factory=lambda: {
+        "enabled": False,
+        "db_path": "data/ohlcv_cache.db",
+        "max_candles_total": 50000,
+    })
+    
+    # NEW: Data quality validation (roadmap)
+    validation: Dict[str, Any] = Field(default_factory=lambda: {
+        "enabled": True,
+        "check_ohlc_consistency": True,
+        "check_negative_volume": True,
+        "check_gaps": True,
+        "check_spikes": True,
+        "spike_zscore_threshold": 5.0,
+    })
 
 class OptimizerCfg(BaseModel):
     """Configuration for optimizer deployment decisions and OOS sample size requirements."""
@@ -298,6 +342,16 @@ class OptimizerCfg(BaseModel):
     # Sample size awareness in comparisons
     ignore_baseline_if_oos_too_small: bool = True  # Ignore baseline metrics if OOS sample is too small
     warn_on_small_oos: bool = True  # Log warnings when OOS sample is below minimum
+    
+    # Database and persistence
+    db_path: str = "data/optimizer.db"  # Path to SQLite database
+    study_name_prefix: str = "xsmom_wfo"  # Prefix for Optuna study names
+    
+    # Historical lookup and filtering
+    skip_known_params: bool = True  # Skip already-tested parameter combinations
+    enable_bad_combo_filter: bool = True  # Enable bad combination filtering
+    bad_combo_min_score: float = -1.0  # Below this score = bad combo
+    bad_combo_dd_threshold: float = 0.3  # 30% DD = bad combo
 
 class RiskCfg(BaseModel):
     atr_len: int = 28
@@ -308,9 +362,9 @@ class RiskCfg(BaseModel):
     fast_check_seconds: int = 2
     stop_timeframe: str = "5m"
 
-    trailing_enabled: bool = False
-    trail_atr_mult: float = 0.0
-    breakeven_after_r: float = 0.0
+    trailing_enabled: bool = True  # Enable by default (roadmap: refine trailing stops)
+    trail_atr_mult: float = 1.0  # Lock at 1.0 (roadmap: not optimized)
+    breakeven_after_r: float = 0.5  # Enable by default (roadmap: enable breakeven moves)
 
     stop_on_close_only: bool = False
     stop_confirm_bars: int = 0
@@ -331,7 +385,7 @@ class RiskCfg(BaseModel):
     use_trailing_killswitch: bool = False
     # min_close_pnl_pct removed per parameter review (dead code)
 
-    max_hours_in_trade: int = 0
+    max_hours_in_trade: int = 48  # Enable by default (roadmap: add time-based exits)
 
     # Margin protection (MAKE MONEY hardening)
     margin_soft_limit_pct: float = 0.0  # 0.0 = disabled, e.g., 80.0 for 80% margin usage
@@ -351,8 +405,33 @@ class RiskCfg(BaseModel):
     exit_on_regime_flip: ExitOnRegimeFlipCfg = ExitOnRegimeFlipCfg()
     adaptive: AdaptiveRiskCfg = AdaptiveRiskCfg()
     partial_ladders: PartialLaddersCfg = PartialLaddersCfg()
+    profit_targets: ProfitTargetsCfg = ProfitTargetsCfg()  # NEW: R-multiple profit targets
     no_progress: NoProgressCfg = NoProgressCfg()
     profit_lock: ProfitLockCfg = ProfitLockCfg()
+    
+    # NEW: Fixed risk per trade (roadmap)
+    sizing_mode: str = "inverse_vol"  # "inverse_vol" or "fixed_r"
+    risk_per_trade_pct: float = 0.005  # 0.5% per trade (if sizing_mode == "fixed_r")
+    
+    # NEW: Correlation limits (roadmap)
+    correlation: Dict[str, Any] = Field(default_factory=lambda: {
+        "enabled": False,
+        "lookback_hours": 48,
+        "max_allowed_corr": 0.8,
+        "max_high_corr_positions": 2,
+    })
+    
+    # NEW: Max position count hard cap (roadmap)
+    max_open_positions_hard: int = 8
+    
+    # NEW: Volatility regime-based leverage (roadmap)
+    volatility_regime: Dict[str, Any] = Field(default_factory=lambda: {
+        "enabled": False,
+        "lookback_hours": 72,
+        "high_vol_threshold": 0.0,  # ATR-based metric (computed dynamically)
+        "low_vol_threshold": 0.0,
+        "max_scale_down": 0.5,  # Scale down to 50% of gross leverage in high vol
+    })
 
     # Legacy compat (removed per parameter review - dead code)
     # profit_lock_steps, breakeven_extra_bps, trail_after_partial_mult, age_tighten removed

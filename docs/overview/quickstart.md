@@ -296,8 +296,26 @@ python -m src.main live --config config/config.yaml
    - Adjust `strategy.signal_power`, `strategy.k_min/k_max`, etc.
 
 3. **Set Up Automated Optimization:**
-   - Read [`usage/optimizer.md`](../usage/optimizer.md)
-   - Configure systemd timer for weekly optimization
+   - Read [`usage/optimizer.md`](../usage/optimizer.md) for the full-cycle optimizer
+   - Read [`usage/optimizer_service.md`](../usage/optimizer_service.md) for the database-backed optimizer service
+   - **Quick start with optimizer service:**
+     ```bash
+     # Run once
+     python -m src.optimizer.service run-once --trials 25
+     
+     # Or run continuously (watch mode)
+     python -m src.optimizer.service watch --trials-per-iter 10 --sleep-seconds 1800
+     
+     # Or use systemd service
+     sudo cp systemd/xsmom-optimizer-service.service /etc/systemd/system/
+     sudo systemctl enable xsmom-optimizer-service
+     sudo systemctl start xsmom-optimizer-service
+     ```
+   - **Query historical results:**
+     ```bash
+     python -m src.optimizer.query list-studies
+     python -m src.optimizer.query top-trials --study-name xsmom_wfo_v1_... --limit 20
+     ```
 
 4. **Deploy to Production:**
    - Read [`operations/deployment_ubuntu_systemd.md`](../operations/deployment_ubuntu_systemd.md)

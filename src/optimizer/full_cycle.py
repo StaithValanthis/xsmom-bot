@@ -121,6 +121,11 @@ def run_wfo_bo_segment(
     base_cfg: AppConfig,
     param_space: ParameterSpace,
     bo_config: Dict[str, Any],
+    db: Optional[Any] = None,  # OptimizerDB
+    study_id: Optional[int] = None,
+    study_name: Optional[str] = None,
+    storage_url: Optional[str] = None,
+    opt_cfg: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]]]:
     """
     Run Bayesian optimization on a WFO training segment.
@@ -159,13 +164,33 @@ def run_wfo_bo_segment(
             log.warning(f"Eval failed: {e}")
             return float("-inf")
     
-    # Run Bayesian optimization
+    # Get optimizer config for filtering
+    skip_known = True
+    check_bad_combos = True
+    bad_combo_min_score = None
+    bad_combo_dd_threshold = None
+    
+    if opt_cfg:
+        skip_known = opt_cfg.get("skip_known_params", True)
+        check_bad_combos = opt_cfg.get("enable_bad_combo_filter", True)
+        bad_combo_min_score = opt_cfg.get("bad_combo_min_score")
+        bad_combo_dd_threshold = opt_cfg.get("bad_combo_dd_threshold")
+    
+    # Run Bayesian optimization with DB persistence if available
     optimizer = BayesianOptimizer(
         param_space=param_space,
         objective_fn=eval_fn,
         n_trials=bo_config.get("n_trials", 100),
         n_startup_trials=bo_config.get("n_startup_trials", 10),
         seed=bo_config.get("seed"),
+        study_name=study_name,
+        storage_url=storage_url,
+        db=db,
+        study_id=study_id,
+        skip_known_params=skip_known,
+        check_bad_combos=check_bad_combos,
+        bad_combo_min_score=bad_combo_min_score,
+        bad_combo_dd_threshold=bad_combo_dd_threshold,
     )
     
     best_params, best_score = optimizer.optimize()
@@ -195,6 +220,11 @@ def run_full_cycle(
     tail_dd_limit: float = 0.70,
     deploy: bool = False,
     seed: Optional[int] = None,
+    db: Optional[Any] = None,  # OptimizerDB
+    study_id: Optional[int] = None,
+    study_name: Optional[str] = None,
+    storage_url: Optional[str] = None,
+    opt_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run full optimization cycle: WFO + BO + MC + deployment.
@@ -416,7 +446,15 @@ def run_full_cycle(
     for seg in segments:
         try:
             best_params, best_score, trial_history = run_wfo_bo_segment(
-                seg, base_cfg, param_space, bo_config
+                seg,
+                base_cfg,
+                param_space,
+                bo_config,
+                db=db,
+                study_id=study_id,
+                study_name=study_name,
+                storage_url=storage_url,
+                opt_cfg=opt_cfg,
             )
             segment_best_params.append(best_params)
             segment_scores.append(best_score)

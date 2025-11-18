@@ -451,14 +451,25 @@ risk:
     min_bar_separation: 1
 
 optimizer:
-  walk_forward:
-    n_splits: 6
-    embargo_frac: 0.02
-    lookback_bars: 600
-    objective: sharpe
-    max_params: 256
-  last_best_params: {}
-  last_updated: null
+  # OOS sample size requirements
+  oos_min_bars_for_deploy: 200
+  oos_min_days_for_deploy: 5.0
+  oos_min_trades_for_deploy: 30
+  require_min_oos_for_deploy: true
+  prefer_larger_oos_windows: true
+  max_oos_days_when_available: 60
+  ignore_baseline_if_oos_too_small: true
+  warn_on_small_oos: true
+  
+  # Database and persistence (for optimizer service)
+  db_path: "data/optimizer.db"  # SQLite database path
+  study_name_prefix: "xsmom_wfo"  # Prefix for Optuna study names
+  
+  # Historical lookup and filtering
+  skip_known_params: true  # Skip already-tested parameter combinations
+  enable_bad_combo_filter: true  # Enable bad combination filtering
+  bad_combo_min_score: -1.0  # Below this score = bad combo
+  bad_combo_dd_threshold: 0.3  # 30% DD = bad combo
 
 paths:
   state_path: /opt/xsmom-bot/state.json

@@ -568,6 +568,28 @@ class FastSLTPThread(threading.Thread):
         rx = getattr(self.cfg.risk, "exit_on_regime_flip", None)
         self.exit_regime_enabled = bool(rx and rx.enabled)
         self.exit_regime_confirm = int(getattr(rx, "confirm_bars", 1) or 1)
+        
+        # NEW: R-multiple profit targets (roadmap)
+        pt_cfg = getattr(self.cfg.risk, "profit_targets", None)
+        self.pt_enabled = bool(pt_cfg and getattr(pt_cfg, "enabled", False))
+        self.pt_targets = []
+        if self.pt_enabled and pt_cfg:
+            targets_list = getattr(pt_cfg, "targets", []) or []
+            for tgt in targets_list:
+                try:
+                    # Handle both Pydantic models and dicts
+                    if hasattr(tgt, "r_multiple"):
+                        r_mult = float(tgt.r_multiple)
+                        exit_pct = float(tgt.exit_pct)
+                    else:
+                        r_mult = float(tgt.get("r_multiple", 0.0) if isinstance(tgt, dict) else 0.0)
+                        exit_pct = float(tgt.get("exit_pct", 0.0) if isinstance(tgt, dict) else 0.0)
+                    if r_mult > 0 and 0 < exit_pct <= 1.0:
+                        self.pt_targets.append({"r_multiple": r_mult, "exit_pct": exit_pct})
+                except Exception:
+                    pass
+            # Sort by r_multiple ascending
+            self.pt_targets.sort(key=lambda x: x["r_multiple"])
 
     def _adaptive_scales(self, symbol: str, last_close: float) -> Tuple[float, float, float]:
         ad = getattr(self.cfg.risk, "adaptive", None)
@@ -736,6 +758,51 @@ class FastSLTPThread(threading.Thread):
         if changed:
             pinfo["ladder_done"] = done
             self.state.setdefault("perpos", {})[symbol] = pinfo
+    
+    def _r_multiple_profit_targets(self, symbol: str, qty: float, rr_now: float, last_close: float):
+        """
+        NEW: R-multiple profit targets (roadmap improvement).
+        Exits portion of position at configured R-multiple levels.
+        """
+        if not self.pt_enabled or qty == 0 or not self.pt_targets:
+            return
+        
+        pinfo = self.state.get("perpos", {}).get(symbol) or {}
+        pt_done = pinfo.get("profit_targets_done", []) or []
+        
+        # Ensure pt_done list matches targets
+        while len(pt_done) < len(self.pt_targets):
+            pt_done.append(False)
+        
+        changed = False
+        for i, tgt in enumerate(self.pt_targets):
+            if pt_done[i]:
+                continue
+            
+            r_mult = float(tgt["r_multiple"])
+            exit_pct = float(tgt["exit_pct"])
+            
+            if rr_now >= r_mult:
+                side = "sell" if qty > 0 else "buy"
+                # Calculate exit quantity based on current position size
+                q = max(0.0, abs(qty) * exit_pct)
+                if q <= 0:
+                    continue
+                
+                try:
+                    if self.dry:
+                        log.info(f"[DRY-R-TARGET] {symbol} {side} {q} at {r_mult:.2f}R")
+                    else:
+                        self.ex.create_order_safe(symbol, side, q, None, post_only=False, reduce_only=True)
+                        log.info(f"[R-TARGET] {symbol} {side} {q} at {r_mult:.2f}R (exit_pct={exit_pct:.1%})")
+                    pt_done[i] = True
+                    changed = True
+                except Exception as e:
+                    log.warning(f"R-multiple profit target error {symbol}: {e}")
+        
+        if changed:
+            pinfo["profit_targets_done"] = pt_done
+            self.state.setdefault("perpos", {})[symbol] = pinfo
 
     def _place_exit(self, symbol: str, qty: float, reason: str, exit_px: Optional[float]):
         side_close = "sell" if qty > 0 else "buy"
@@ -859,6 +926,9 @@ class FastSLTPThread(threading.Thread):
                     self.state["perpos"][sym] = pinfo
 
                     self._partial_ladders(sym, qty, rr_now, last_c)
+                    
+                    # NEW: R-multiple profit targets (roadmap)
+                    self._r_multiple_profit_targets(sym, qty, rr_now, last_c)
 
                     max_hours = int(getattr(self.cfg.risk, "max_hours_in_trade", 0) or 0)
                     if max_hours > 0:
@@ -1806,6 +1876,73 @@ def run_live(cfg: AppConfig, dry: bool = False):
 
             # --- Dynamic symbol filter (banlist/downsizing) ---
             targets = _apply_symbol_filter_to_targets(state, cfg, targets)
+            
+            # NEW: Max position count hard cap (roadmap)
+            max_pos_hard = int(getattr(cfg.risk, "max_open_positions_hard", 0) or 0)
+            if max_pos_hard > 0:
+                current_positions = sum(1 for p in (positions or {}).values() if abs(float(p.get("net_qty", 0.0) or 0.0)) > 0)
+                new_targets_count = int((targets != 0).sum())
+                if current_positions + new_targets_count > max_pos_hard:
+                    # Limit to top N by absolute weight
+                    max_new = max(0, max_pos_hard - current_positions)
+                    if max_new < new_targets_count:
+                        # Sort by absolute weight and keep top N
+                        sorted_targets = targets.abs().sort_values(ascending=False)
+                        keep_syms = set(sorted_targets.head(max_new).index)
+                        targets = targets.copy()
+                        for sym in targets.index:
+                            if sym not in keep_syms:
+                                targets.loc[sym] = 0.0
+                        log.info(f"[RISK] Max position cap: limited to {max_new} new positions (current={current_positions}, hard_cap={max_pos_hard})")
+            
+            # NEW: Correlation limits (roadmap)
+            corr_cfg = getattr(cfg.risk, "correlation", None)
+            if corr_cfg and corr_cfg.get("enabled", False):
+                try:
+                    lookback_hours = int(corr_cfg.get("lookback_hours", 48))
+                    max_corr = float(corr_cfg.get("max_allowed_corr", 0.8))
+                    max_high_corr = int(corr_cfg.get("max_high_corr_positions", 2))
+                    
+                    # Get candidate symbols (non-zero targets)
+                    candidate_syms = [s for s in targets.index if abs(targets.loc[s]) > 1e-6]
+                    if len(candidate_syms) > 1:
+                        # Compute correlation matrix
+                        lookback_bars = min(lookback_hours, len(closes_used))
+                        if lookback_bars > 10:
+                            returns = closes_used[candidate_syms].pct_change().dropna()
+                            if len(returns) >= lookback_bars:
+                                returns_window = returns.tail(lookback_bars)
+                                corr_matrix = returns_window.corr()
+                                
+                                # Find high-correlation pairs
+                                high_corr_pairs = []
+                                for i, sym1 in enumerate(candidate_syms):
+                                    for sym2 in candidate_syms[i+1:]:
+                                        if sym1 in corr_matrix.index and sym2 in corr_matrix.columns:
+                                            corr_val = float(corr_matrix.loc[sym1, sym2])
+                                            if abs(corr_val) >= max_corr:
+                                                high_corr_pairs.append((sym1, sym2, abs(corr_val)))
+                                
+                                # If too many high-correlation positions, remove lowest-weight ones
+                                if len(high_corr_pairs) > 0:
+                                    # Build graph of high-correlation symbols
+                                    high_corr_syms = set()
+                                    for s1, s2, _ in high_corr_pairs:
+                                        high_corr_syms.add(s1)
+                                        high_corr_syms.add(s2)
+                                    
+                                    # Count how many high-correlation symbols are in targets
+                                    high_corr_in_targets = [s for s in high_corr_syms if abs(targets.loc[s]) > 1e-6]
+                                    
+                                    if len(high_corr_in_targets) > max_high_corr:
+                                        # Remove lowest-weight high-correlation symbols
+                                        sorted_high_corr = sorted(high_corr_in_targets, key=lambda s: abs(targets.loc[s]))
+                                        remove_count = len(high_corr_in_targets) - max_high_corr
+                                        for sym in sorted_high_corr[:remove_count]:
+                                            targets.loc[sym] = 0.0
+                                        log.info(f"[RISK] Correlation limit: removed {remove_count} high-correlation positions (max={max_high_corr}, corr>={max_corr:.2f})")
+                except Exception as e:
+                    log.warning(f"[RISK] Correlation limit check failed (non-fatal): {e}", exc_info=False)
 
             # >>> CARRY/BASIS SLEEVE: build after momentum gates, before portfolio scaler
             try:
