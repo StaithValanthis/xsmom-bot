@@ -21,6 +21,21 @@ data:
   max_candles_total: 50000       # Safety cap per symbol/timeframe (prevents runaway fetches)
   api_throttle_sleep_ms: 200     # Sleep between paginated requests (milliseconds)
   max_pagination_requests: 100   # Safety limit on number of pagination requests per fetch
+  
+  # NEW: Historical OHLCV cache (roadmap - reduces API calls)
+  cache:
+    enabled: false  # Disabled by default (enable to reduce API calls)
+    db_path: "data/ohlcv_cache.db"
+    max_candles_total: 50000
+  
+  # NEW: Data quality validation (roadmap)
+  validation:
+    enabled: true  # Enabled by default (checks OHLC consistency, gaps, spikes)
+    check_ohlc_consistency: true
+    check_negative_volume: true
+    check_gaps: true
+    check_spikes: true
+    spike_zscore_threshold: 5.0
 
 strategy:
   ensemble:
@@ -43,23 +58,23 @@ strategy:
     lookback_bars: 4
     z_boost: 0.10
 
-  signal_power: 1.35
-  lookbacks: [1, 6, 24]
+  signal_power: 1.35  # Optimized in optimizer (range: [1.0, 1.5])
+  lookbacks: [1, 6, 24]  # Optimized: lookbacks[0] and lookbacks[2] (short and long)
   lookback_weights: [1.0, 1.0, 1.0]
-  vol_lookback: 96
+  vol_lookback: 96  # Optimized in optimizer (range: [48, 144], for inverse-vol sizing)
 
   market_neutral: true
-  gross_leverage: 0.95
-  max_weight_per_asset: 0.09
+  gross_leverage: 0.95  # Optimized in optimizer (range: [0.75, 1.5])
+  max_weight_per_asset: 0.10  # Locked at 0.10 (roadmap: not optimized)
 
   regime_filter:
     enabled: true
-    ema_len: 200
-    slope_min_bps_per_day: 3.5
+    ema_len: 200  # Locked at 200 (roadmap: not optimized)
+    slope_min_bps_per_day: 3.5  # Optimized in optimizer
     use_abs: true
 
   adx_filter:
-    enabled: true
+    enabled: false  # Disabled by default (roadmap: removed from optimizer)
     len: 14
     min_adx: 28.0
     require_rising: true
@@ -143,7 +158,7 @@ strategy:
     symbols_low_liq: []
 
   majors_regime:
-    enabled: true
+    enabled: false  # Disabled by default (roadmap: removed from optimizer)
     majors:
       - BTC/USDT:USDT
       - ETH/USDT:USDT
@@ -151,6 +166,10 @@ strategy:
     slope_bps_per_day: 1.0
     action: downweight
     downweight_factor: 0.6
+  
+  # NEW: Meta-labeler (roadmap: disabled by default, removed from optimizer)
+  meta_label:
+    enabled: false  # Disabled by default
 
   kelly:
     enabled: true
@@ -243,7 +262,7 @@ strategy:
 
   carry:
     enabled: true
-    budget_frac: 0.20
+    budget_frac: 0.25  # Optimized in optimizer (roadmap: carry budget optimization)
     hedge_market_neutral: true
     per_asset_cap: 0.14
     funding:
@@ -255,6 +274,12 @@ strategy:
       use: true
       min_annualized: 0.05
       min_zscore: 0.8
+  
+  # NEW: Volatility breakout entry gate (roadmap)
+  volatility_entry:
+    enabled: false  # Disabled by default
+    atr_lookback: 48
+    expansion_mult: 1.5  # Require ATR > 1.5x rolling mean before allowing new entries
 
 risk:
   target_daily_vol_bps: 60
@@ -377,14 +402,56 @@ risk:
   cooldown_minutes_after_stop: 20
   reentry_after_loss_minutes: 30
 
-  partial_tp_enabled: true
+  # Entry/Exit improvements (roadmap)
+  trailing_enabled: true  # Enabled by default
+  trail_atr_mult: 1.0  # Locked at 1.0 (not optimized)
+  breakeven_after_r: 0.5  # Enabled by default (move stop to entry after 0.5R profit)
+  max_hours_in_trade: 48  # Enabled by default (exit after 48 hours)
+  
+  # NEW: R-multiple profit targets (roadmap)
+  profit_targets:
+    enabled: false  # Disabled by default
+    targets:
+      - { r_multiple: 2.0, exit_pct: 0.5 }   # Exit 50% at 2R
+      - { r_multiple: 3.0, exit_pct: 0.25 }  # Exit 25% at 3R
+  
+  # Legacy partial TP (deprecated, use profit_targets instead)
+  partial_tp_enabled: false
   partial_tp_r: 0.75
   partial_tp_size: 0.45
+  
+  # NEW: Fixed risk-per-trade sizing (roadmap)
+  sizing_mode: "inverse_vol"  # "inverse_vol" (default) or "fixed_r"
+  risk_per_trade_pct: 0.005  # 0.5% per trade (if sizing_mode == "fixed_r")
+  
+  # NEW: Correlation limits (roadmap)
+  correlation:
+    enabled: false  # Disabled by default
+    lookback_hours: 48
+    max_allowed_corr: 0.8
+    max_high_corr_positions: 2
+  
+  # NEW: Max position count hard cap (roadmap)
+  max_open_positions_hard: 8
+  
+  # NEW: Volatility regime-based leverage scaling (roadmap)
+  volatility_regime:
+    enabled: false  # Disabled by default
+    lookback_hours: 72
+    high_vol_mult: 1.5  # ATR must exceed 1.5x baseline to trigger scaling
+    max_scale_down: 0.5  # Scale down to 50% of gross leverage in high vol
+  
+  # NEW: Long-term drawdown tracking (roadmap)
+  long_term_dd:
+    enabled: false  # Disabled by default
+    max_dd_90d: 0.3   # 30% max drawdown over 90 days
+    max_dd_180d: 0.4  # 40% max drawdown over 180 days
+    max_dd_365d: 0.5  # 50% max drawdown over 365 days
+  
   max_daily_loss_pct: 12.0
   trade_disable_minutes: 0
   use_trailing_killswitch: true
   min_close_pnl_pct: 0.0
-  max_hours_in_trade: 10
 
   trailing_unlocks:
     enabled: false

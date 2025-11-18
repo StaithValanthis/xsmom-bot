@@ -195,7 +195,9 @@
 
 ---
 
-### Trailing Stop (Optional)
+### Trailing Stop ✅
+
+**Status:** ✅ **Enabled by default** (roadmap improvement)
 
 **Mechanism:**
 1. Track highest price since entry (for longs) or lowest price (for shorts)
@@ -204,8 +206,8 @@
 4. Exit position if price hits trailing stop level
 
 **Configuration:**
-- `risk.trailing_enabled`: Enable trailing stops (default: false)
-- `risk.trail_atr_mult`: Trailing stop multiplier (default: 0.0)
+- `risk.trailing_enabled`: Enable trailing stops (default: **true** — enabled by default)
+- `risk.trail_atr_mult`: Trailing stop multiplier (default: **1.0** — locked, not optimized)
 
 **Implementation:**
 - `src/live.py::FastSLTPThread` - Monitors trailing stops every 2 seconds
@@ -224,7 +226,9 @@
 
 ---
 
-### Breakeven Move (Optional)
+### Breakeven Move ✅
+
+**Status:** ✅ **Enabled by default** (roadmap improvement)
 
 **Mechanism:**
 1. Track profit since entry (in units of R, where R = entry_price - stop_price)
@@ -232,7 +236,7 @@
 3. Exit position if price hits breakeven stop (protects capital)
 
 **Configuration:**
-- `risk.breakeven_after_r`: Breakeven threshold (default: 0.0 = disabled)
+- `risk.breakeven_after_r`: Breakeven threshold (default: **0.5** — enabled by default, triggers at 0.5R profit)
 
 **Implementation:**
 - `src/live.py::FastSLTPThread` - Monitors breakeven moves every 2 seconds
@@ -251,17 +255,56 @@
 
 ---
 
-### Partial Profit-Taking (Optional)
+### R-Multiple Profit Targets (NEW) ✅
+
+**Status:** ✅ **Implemented** (roadmap improvement)
 
 **Mechanism:**
-1. Track profit since entry (in units of R)
-2. Exit portion of position at `partial_tp_r × R` profit (default: 0.75×R)
+1. Track profit since entry (in units of R, where R = entry_price - stop_price)
+2. Exit portions of position at configured R-multiple levels (e.g., 2R, 3R)
 3. Keep remaining position open (let winners run)
 
+**Example Configuration:**
+```yaml
+risk:
+  profit_targets:
+    enabled: true
+    targets:
+      - { r_multiple: 2.0, exit_pct: 0.5 }   # Exit 50% at 2R
+      - { r_multiple: 3.0, exit_pct: 0.25 }  # Exit 25% at 3R
+```
+
 **Configuration:**
-- `risk.partial_tp_enabled`: Enable partial TP (default: false)
-- `risk.partial_tp_r`: Partial TP threshold (default: 0.0)
-- `risk.partial_tp_size`: Portion to exit (default: 0.0)
+- `risk.profit_targets.enabled`: Enable R-multiple profit targets (default: false)
+- `risk.profit_targets.targets[]`: List of `{r_multiple, exit_pct}` targets
+
+**Rationale:**
+- Locks in profits at multiple levels (risk reduction)
+- Lets winners run (maintains upside potential)
+- More flexible than single partial TP
+
+### Time-Based Exits ✅
+
+**Status:** ✅ **Enabled by default** (roadmap improvement)
+
+**Mechanism:**
+1. Track time since entry for each position
+2. Exit position if held longer than `max_hours_in_trade` hours
+3. Prevents positions from sitting indefinitely
+
+**Configuration:**
+- `risk.max_hours_in_trade`: Maximum hours in trade (default: **48** — enabled by default)
+
+**Rationale:**
+- Prevents stale positions (force exit after time limit)
+- Reduces overnight/weekend risk
+- Ensures portfolio turnover
+
+### Partial Profit-Taking (Legacy)
+
+**Status:** ⚠️ **Deprecated** — Use `risk.profit_targets` instead
+
+The legacy `risk.partial_tp_*` parameters still work but are superseded by the new R-multiple profit targets system.
 
 **Implementation:**
 - `src/live.py::FastSLTPThread` - Monitors partial TP every 2 seconds
@@ -311,15 +354,61 @@
 
 ## Position Sizing Controls
 
+### Sizing Modes ✅
+
+**Status:** ✅ **Implemented** (roadmap improvement)
+
+The bot supports two sizing modes:
+
+#### 1. Inverse-Volatility Sizing (Default)
+
+**Mode:** `risk.sizing_mode = "inverse_vol"`
+
+Equal risk contribution per asset (risk parity style). Positions are weighted inversely to volatility:
+
+```
+weight_i = (1 / volatility_i) / sum(1 / volatility_j)
+```
+
+**Configuration:**
+- `risk.sizing_mode`: Set to `"inverse_vol"` (default)
+- `strategy.vol_lookback`: Volatility lookback period (default: 96 bars)
+
+**Rationale:** Higher volatility → smaller position (less risk), lower volatility → larger position (more capital).
+
+#### 2. Fixed Risk-Per-Trade (NEW)
+
+**Mode:** `risk.sizing_mode = "fixed_r"`
+
+Fixed percentage of equity risked per trade using ATR-based stop-loss distance:
+
+```
+position_size = (risk_per_trade_pct × equity) / stop_distance
+stop_distance = ATR × atr_mult_sl
+```
+
+**Configuration:**
+- `risk.sizing_mode`: Set to `"fixed_r"`
+- `risk.risk_per_trade_pct`: Risk per trade as fraction of equity (default: 0.005 = 0.5%)
+- `risk.atr_mult_sl`: Stop-loss multiplier (default: 2.0)
+
+**Example:**
+- Equity: $10,000
+- Risk per trade: 0.5% = $50
+- ATR: $500, Stop multiplier: 2.0 → Stop distance: $1,000
+- Position size: $50 / $1,000 = 0.05 units per $1 equity
+
+**Rationale:** Fixed risk per trade ensures consistent risk exposure regardless of volatility.
+
 ### Per-Asset Caps
 
 **Mechanism:**
-1. Cap each asset's weight at threshold (default: 9% of portfolio)
+1. Cap each asset's weight at threshold (default: 10% of portfolio, **locked** — not optimized)
 2. Redistribute excess to other positions
 3. Apply absolute notional cap (default: $20k per asset)
 
 **Configuration:**
-- `strategy.max_weight_per_asset`: Per-asset weight cap (default: 0.09)
+- `strategy.max_weight_per_asset`: Per-asset weight cap (default: **0.10** — locked, not optimized)
 - `liquidity.notional_cap_usdt`: Absolute notional cap (default: 20000.0)
 
 **Implementation:**
@@ -390,6 +479,117 @@
 - Recent portfolio volatility: 18% annualized (too low)
 - Scale factor: 24% / 18% = 1.33×
 - Scale all positions by 1.33× (increase exposure)
+
+### Max Open Positions (NEW) ✅
+
+**Status:** ✅ **Implemented** (roadmap improvement)
+
+**Mechanism:**
+1. Count current open positions and new target positions
+2. If `current + new > max_open_positions_hard`, limit to top N by absolute weight
+3. Remove lowest-weight positions until count <= limit
+
+**Configuration:**
+- `risk.max_open_positions_hard`: Maximum open positions (default: 8)
+
+**Implementation:**
+- `src/live.py::run_live()` - Enforced after target building
+
+**Rationale:**
+- Prevents over-concentration (limits position count)
+- Ensures diversification (forces selection of best opportunities)
+- Hard cap protects against runaway position building
+
+### Correlation Limits (NEW) ✅
+
+**Status:** ✅ **Implemented** (roadmap improvement)
+
+**Mechanism:**
+1. Compute rolling correlation matrix for candidate assets (default: 48 hours)
+2. Identify high-correlation pairs (`correlation > max_allowed_corr`, default: 0.8)
+3. If too many high-correlation positions (`> max_high_corr_positions`, default: 2), remove lowest-weight positions
+
+**Configuration:**
+- `risk.correlation.enabled`: Enable correlation limits (default: false)
+- `risk.correlation.lookback_hours`: Correlation lookback period (default: 48)
+- `risk.correlation.max_allowed_corr`: Maximum allowed correlation (default: 0.8)
+- `risk.correlation.max_high_corr_positions`: Max positions with high correlations (default: 2)
+
+**Implementation:**
+- `src/live.py::run_live()` - Post-processing step after target building
+
+**Rationale:**
+- Reduces correlated risk exposure (prevents over-concentration in similar assets)
+- Improves diversification (forces selection of uncorrelated opportunities)
+- Reduces tail risk (correlated positions fail together)
+
+**Example:**
+- 5 positions identified with correlations > 0.8
+- `max_high_corr_positions = 2`
+- Remove 3 lowest-weight positions → Keep top 2
+
+### Volatility Regime-Based Leverage Scaling (NEW) ✅
+
+**Status:** ✅ **Implemented** (roadmap improvement)
+
+**Mechanism:**
+1. Compute ATR of BTC (or portfolio proxy) over lookback period (default: 72 hours)
+2. Compare current ATR to rolling mean ATR (baseline)
+3. If `current_atr / baseline_atr >= high_vol_mult` (default: 1.5), scale down gross leverage
+4. Scale factor: Linear interpolation from 1.0 (at threshold) to `max_scale_down` (default: 0.5) as vol increases
+
+**Configuration:**
+- `risk.volatility_regime.enabled`: Enable vol regime scaling (default: false)
+- `risk.volatility_regime.lookback_hours`: ATR lookback period (default: 72)
+- `risk.volatility_regime.high_vol_mult`: High-vol threshold (default: 1.5× baseline)
+- `risk.volatility_regime.max_scale_down`: Minimum scale factor in high vol (default: 0.5 = 50%)
+
+**Implementation:**
+- `src/live.py::run_live()` - Applied after portfolio scalers, before final caps
+
+**Rationale:**
+- Reduces exposure in high-volatility regimes (protects capital)
+- Maintains normal exposure in low-vol regimes (doesn't over-restrict)
+- Adaptive risk management (scales with market conditions)
+
+**Example:**
+- Baseline ATR: $500
+- Current ATR: $750
+- Ratio: 1.5× (exactly at threshold) → Scale: 1.0 (no change)
+- Current ATR: $1,000
+- Ratio: 2.0× → Scale: 0.67 (linear interpolation between 1.0 and 0.5)
+- All positions scaled by 0.67× (reduced exposure)
+
+### Long-Term Drawdown Tracking (NEW) ✅
+
+**Status:** ✅ **Implemented** (roadmap improvement)
+
+**Mechanism:**
+1. Track equity history over **365 days** (extended from 60 days)
+2. Compute drawdowns from high watermarks over 90-day, 180-day, and 365-day windows
+3. Log warnings if drawdowns exceed configured thresholds (optional)
+
+**Configuration:**
+- `risk.long_term_dd.enabled`: Enable long-term DD tracking (default: false)
+- `risk.long_term_dd.max_dd_90d`: 90-day DD threshold (default: 0.3 = 30%)
+- `risk.long_term_dd.max_dd_180d`: 180-day DD threshold (default: 0.4 = 40%)
+- `risk.long_term_dd.max_dd_365d`: 365-day DD threshold (default: 0.5 = 50%)
+
+**Implementation:**
+- `src/risk.py::compute_long_term_drawdowns()` - Computes 90/180/365-day DDs
+- `src/live.py::run_live()` - Logs warnings if thresholds exceeded
+
+**Rationale:**
+- Tracks long-term performance (beyond 30-day window)
+- Identifies extended drawdown periods (slow death scenarios)
+- Optional alerts help identify when manual intervention may be needed
+
+**Example:**
+- Current equity: $9,000
+- 90-day high: $12,000 → 90-day DD: 25% (below 30% threshold)
+- 180-day high: $10,500 → 180-day DD: 14.3% (below 40% threshold)
+- 365-day high: $11,000 → 365-day DD: 18.2% (below 50% threshold)
+- All below thresholds → No warnings
 
 ---
 
@@ -490,9 +690,28 @@ risk:
 risk:
   max_daily_loss_pct: 5.0          # Standard daily loss limit
   atr_mult_sl: 2.0                  # Standard stops
-  trail_atr_mult: 1.5               # Standard trailing stops
+  trailing_enabled: true            # Trailing stops enabled
+  trail_atr_mult: 1.0               # Standard trailing stops (locked)
+  breakeven_after_r: 0.5            # Breakeven at 0.5R (enabled)
+  max_hours_in_trade: 48            # Time-based exits (enabled)
+  profit_targets:                   # R-multiple profit targets
+    enabled: false                  # Disabled by default
+    targets:
+      - { r_multiple: 2.0, exit_pct: 0.5 }
+  sizing_mode: "inverse_vol"        # Inverse-volatility sizing
+  # sizing_mode: "fixed_r"          # Or fixed risk-per-trade
+  # risk_per_trade_pct: 0.005       # 0.5% per trade (if fixed_r)
+  max_open_positions_hard: 8        # Max position count cap
+  correlation:                      # Correlation limits
+    enabled: false                  # Disabled by default
+    max_allowed_corr: 0.8
+    max_high_corr_positions: 2
+  volatility_regime:                # Vol regime scaling
+    enabled: false                  # Disabled by default
+    high_vol_mult: 1.5
+    max_scale_down: 0.5
   gross_leverage: 0.95              # Standard leverage
-  max_weight_per_asset: 0.09        # Standard per-asset cap
+  max_weight_per_asset: 0.10        # Standard per-asset cap (locked)
 ```
 
 **Aggressive (Higher Risk):**

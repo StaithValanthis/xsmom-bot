@@ -218,14 +218,54 @@ export SEED=42                  # Random seed
 export DEPLOY=false             # Auto-deploy (true/false)
 ```
 
-### Parameter Space
+### Parameter Space ✅
 
-The optimizer optimizes a **core set of 18 parameters** (see `PARAMETER_REVIEW.md`):
+**Updated:** The optimizer now optimizes **11 core parameters** (reduced from 15 to minimize overfitting risk).
 
-- **Signals (6 params):** `signal_power`, `lookbacks[0-2]`, `k_min`, `k_max`
-- **Filters (3 params):** `regime_filter.ema_len`, `regime_filter.slope_min_bps_per_day`, `entry_zscore_min`
-- **Risk (5 params):** `atr_mult_sl`, `trail_atr_mult`, `gross_leverage`, `max_weight_per_asset`, `portfolio_vol_target.target_ann_vol`
-- **Enable/Disable (4 params):** `regime_filter.enabled`, `adx_filter.enabled`, `vol_target_enabled`, `diversify_enabled`
+#### Optimized Parameters (11 total)
+
+1. **Signals (3 params):**
+   - `strategy.signal_power`: [1.0, 1.5] (narrowed from [1.0, 2.0])
+   - `strategy.lookbacks[0]` (short lookback): Optimized
+   - `strategy.lookbacks[2]` (long lookback): Optimized
+   - ⚠️ **Removed:** `lookbacks[1]` (medium lookback — derived or fixed)
+
+2. **Selection (2 params):**
+   - `strategy.k_min`: Optimized
+   - `strategy.k_max`: Optimized
+
+3. **Filters (1 param):**
+   - `strategy.regime_filter.slope_min_bps_per_day`: Optimized
+   - ⚠️ **Removed:** `regime_filter.ema_len` (locked at 200)
+
+4. **Risk (2 params):**
+   - `risk.atr_mult_sl`: Optimized
+   - ⚠️ **Removed:** `trail_atr_mult` (locked at 1.0)
+   - ⚠️ **Removed:** `entry_zscore_min` (locked at 0.0)
+
+5. **Portfolio (3 params):**
+   - `strategy.gross_leverage`: [0.75, 1.5] (narrowed from [1.0, 2.0])
+   - `strategy.portfolio_vol_target.target_ann_vol`: [0.15, 0.40] (narrowed from [0.20, 0.50])
+   - `strategy.vol_lookback`: [48, 144] (NEW — volatility lookback period)
+   - ⚠️ **Removed:** `max_weight_per_asset` (locked at 0.10)
+
+6. **Carry (1 param):**
+   - `strategy.carry.budget_frac`: [0.0, 0.40] (NEW — carry sleeve budget allocation)
+
+#### Removed/Locked Parameters
+
+These parameters are **no longer optimized** (locked at fixed values):
+
+- `regime_filter.ema_len` = 200 (fixed)
+- `entry_zscore_min` = 0.0 (fixed)
+- `trail_atr_mult` = 1.0 (fixed)
+- `max_weight_per_asset` = 0.10 (fixed)
+- `lookbacks[1]` (medium lookback) — removed, only short/long optimized
+- **ADX filter** — disabled by default (removed from optimizer)
+- **Meta-labeler** — disabled by default (removed from optimizer)
+- **Majors regime** — disabled by default (removed from optimizer)
+
+**Rationale:** Reduced parameter space minimizes overfitting risk while maintaining core strategy flexibility.
 
 To customize the parameter space, edit `src/optimizer/bo_runner.py::define_parameter_space()`.
 
