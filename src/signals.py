@@ -114,6 +114,45 @@ def volatility_tier(atr_pct: float, low_thr_bps: float=40.0, high_thr_bps: float
         return "high"
     return "mid"
 
+def check_volatility_breakout(df: pd.DataFrame, atr_lookback: int = 48, expansion_mult: float = 1.5) -> bool:
+    """
+    NEW: Check if volatility breakout condition is met (roadmap).
+    
+    Returns True if current ATR exceeds expansion_mult × rolling mean of ATR.
+    
+    Args:
+        df: DataFrame with 'high', 'low', 'close' columns
+        atr_lookback: Lookback period for ATR computation and mean
+        expansion_mult: Multiplier for ATR mean (e.g., 1.5 = 50% expansion)
+    
+    Returns:
+        True if volatility breakout detected, False otherwise
+    """
+    try:
+        if df.empty or len(df) < atr_lookback:
+            return False
+        
+        # Compute ATR
+        atr_series = compute_atr(df, n=14, method="rma")
+        if atr_series.empty or len(atr_series) < atr_lookback:
+            return False
+        
+        # Current ATR
+        current_atr = float(atr_series.iloc[-1])
+        if current_atr <= 0:
+            return False
+        
+        # Rolling mean of ATR
+        atr_mean = float(atr_series.tail(atr_lookback).mean())
+        if atr_mean <= 0:
+            return False
+        
+        # Check if current ATR exceeds expansion threshold
+        breakout = current_atr >= (expansion_mult * atr_mean)
+        return breakout
+    except Exception:
+        return False
+
 # NOTE (auto-wiring):
 # If your eligibility step didn't match our pattern, call this explicitly where you
 # finalize zscores and before selection:

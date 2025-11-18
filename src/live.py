@@ -1330,14 +1330,34 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 state["day_high_equity"] = day_high_equity
                 write_json(state_path, state)
 
-            # Update equity history for portfolio drawdown tracking
+            # Update equity history for portfolio drawdown tracking (roadmap: extended to 365 days)
             if eq > 0:
                 equity_history = state.get("equity_history", {})
                 equity_history[utcnow().isoformat()] = eq
-                # Keep only last 60 days of history (cleanup old entries)
-                cutoff = (utcnow() - pd.Timedelta(days=60)).isoformat()
+                # Keep only last 365 days of history (roadmap: extended from 60 days)
+                cutoff = (utcnow() - pd.Timedelta(days=365)).isoformat()
                 equity_history = {k: v for k, v in equity_history.items() if k >= cutoff}
                 state["equity_history"] = equity_history
+                
+                # NEW: Long-term drawdown tracking (roadmap)
+                long_term_dd_cfg = getattr(cfg.risk, "long_term_dd", None)
+                if long_term_dd_cfg and long_term_dd_cfg.get("enabled", False):
+                    try:
+                        from .risk import compute_long_term_drawdowns
+                        dd_90d, dd_180d, dd_365d = compute_long_term_drawdowns(equity_history, eq)
+                        
+                        max_dd_90d = float(long_term_dd_cfg.get("max_dd_90d", 0.3))
+                        max_dd_180d = float(long_term_dd_cfg.get("max_dd_180d", 0.4))
+                        max_dd_365d = float(long_term_dd_cfg.get("max_dd_365d", 0.5))
+                        
+                        if dd_90d is not None and dd_90d >= max_dd_90d:
+                            log.warning(f"[LONG-DD] 90-day drawdown: {dd_90d:.2%} (threshold: {max_dd_90d:.2%})")
+                        if dd_180d is not None and dd_180d >= max_dd_180d:
+                            log.warning(f"[LONG-DD] 180-day drawdown: {dd_180d:.2%} (threshold: {max_dd_180d:.2%})")
+                        if dd_365d is not None and dd_365d >= max_dd_365d:
+                            log.warning(f"[LONG-DD] 365-day drawdown: {dd_365d:.2%} (threshold: {max_dd_365d:.2%})")
+                    except Exception as e:
+                        log.debug(f"[LONG-DD] Long-term DD check failed: {e}")
 
             # ===========================
             # EMERGENCY STOP CHECK (periodic)
@@ -1695,6 +1715,41 @@ def run_live(cfg: AppConfig, dry: bool = False):
                         eligible_syms = []
                     else:
                         majors_downweight = float(getattr(mj, "downweight_factor", 0.6))
+            
+            # NEW: Volatility breakout entry gate (roadmap)
+            vol_entry_cfg = getattr(cfg.strategy, "volatility_entry", None)
+            if vol_entry_cfg and vol_entry_cfg.get("enabled", False):
+                try:
+                    atr_lookback = int(vol_entry_cfg.get("atr_lookback", 48))
+                    expansion_mult = float(vol_entry_cfg.get("expansion_mult", 1.5))
+                    
+                    blocked_vol = 0
+                    keep_vol = []
+                    for s in list(eligible_syms):
+                        df_b = bars.get(s)
+                        if df_b is None or df_b.empty:
+                            keep_vol.append(s)
+                            continue
+                        
+                        try:
+                            from .signals import check_volatility_breakout
+                            if check_volatility_breakout(df_b, atr_lookback=atr_lookback, expansion_mult=expansion_mult):
+                                keep_vol.append(s)
+                            else:
+                                blocked_vol += 1
+                        except Exception:
+                            keep_vol.append(s)  # On error, allow entry
+                    
+                    eligible_syms = keep_vol
+                    if blocked_vol > 0:
+                        log.info(f"[VOL-BREAKOUT] Gate: {blocked_vol}/{len(closes.columns)} symbols blocked (need {expansion_mult:.1f}x ATR expansion)")
+                    
+                    if len(eligible_syms) == 0:
+                        log.info("[VOL-BREAKOUT] Gate blocked all symbols; staying flat.")
+                        time.sleep(max(1, int(getattr(cfg.execution, "poll_seconds", 5))))
+                        continue
+                except Exception as e:
+                    log.warning(f"[VOL-BREAKOUT] Gate check failed (non-fatal): {e}", exc_info=False)
 
             closes_used = closes[eligible_syms]
 
@@ -2060,9 +2115,60 @@ def run_live(cfg: AppConfig, dry: bool = False):
             except Exception:
                 s_kelly = 1.0
 
-            gross_mult = float(s_vol * s_dd * s_kelly)
+            # NEW: Volatility regime-based leverage scaling (roadmap)
+            vol_regime_cfg = getattr(cfg.risk, "volatility_regime", None)
+            vol_regime_scale = 1.0
+            if vol_regime_cfg and vol_regime_cfg.get("enabled", False):
+                try:
+                    lookback_hours = int(vol_regime_cfg.get("lookback_hours", 72))
+                    high_vol_mult = float(vol_regime_cfg.get("high_vol_mult", 1.5))
+                    max_scale_down = float(vol_regime_cfg.get("max_scale_down", 0.5))
+                    
+                    # Compute volatility metric (ATR of BTC or portfolio proxy)
+                    # Use BTC/USDT:USDT as proxy if available, else use first symbol
+                    proxy_symbol = None
+                    for sym in ["BTC/USDT:USDT", "BTCUSDT"]:
+                        if sym in closes_used.columns:
+                            proxy_symbol = sym
+                            break
+                    if proxy_symbol is None and len(closes_used.columns) > 0:
+                        proxy_symbol = closes_used.columns[0]
+                    
+                    if proxy_symbol:
+                        try:
+                            proxy_bars = bars.get(proxy_symbol)
+                            if proxy_bars is not None and not proxy_bars.empty:
+                                # Compute ATR over lookback
+                                atr_series = compute_atr(proxy_bars, n=28, method="rma")
+                                lookback_bars = min(lookback_hours, len(atr_series))
+                                if lookback_bars > 10:
+                                    current_atr = float(atr_series.iloc[-1])
+                                    baseline_atr = float(atr_series.tail(lookback_bars).mean())
+                                    
+                                    if baseline_atr > 0:
+                                        vol_ratio = current_atr / baseline_atr
+                                        
+                                        # Scale down when vol is high
+                                        if vol_ratio >= high_vol_mult:
+                                            # High vol: scale down towards max_scale_down
+                                            # Linear interpolation: vol_ratio=high_vol_mult -> scale=1.0, vol_ratio=2*high_vol_mult -> scale=max_scale_down
+                                            excess_ratio = (vol_ratio - high_vol_mult) / max(high_vol_mult, 1e-12)
+                                            vol_regime_scale = max(max_scale_down, 1.0 - (excess_ratio * (1.0 - max_scale_down)))
+                                        else:
+                                            # Normal or low vol: no scaling
+                                            vol_regime_scale = 1.0
+                                        
+                                        log.info(f"[VOL-REGIME] ATR ratio={vol_ratio:.2f} (baseline={baseline_atr:.4f}, current={current_atr:.4f}) → scale={vol_regime_scale:.2f}")
+                        except Exception as e:
+                            log.debug(f"[VOL-REGIME] Failed to compute vol regime: {e}")
+                            vol_regime_scale = 1.0
+                except Exception as e:
+                    log.warning(f"[VOL-REGIME] Volatility regime scaling failed (non-fatal): {e}", exc_info=False)
+                    vol_regime_scale = 1.0
+            
+            gross_mult = float(s_vol * s_dd * s_kelly * vol_regime_scale)
             targets *= gross_mult
-            log.info(f"[SIZING] portfolio scaler: vol_mult={s_vol:.2f} dd_mult={s_dd:.2f} kelly_mult={s_kelly:.2f} → gross_mult={gross_mult:.2f}")
+            log.info(f"[SIZING] portfolio scaler: vol_mult={s_vol:.2f} dd_mult={s_dd:.2f} kelly_mult={s_kelly:.2f} vol_regime={vol_regime_scale:.2f} → gross_mult={gross_mult:.2f}")
 
             # --- HARDENING: re-apply per-asset cap AFTER all multipliers ---
             try:
@@ -2073,32 +2179,63 @@ def run_live(cfg: AppConfig, dry: bool = False):
                 pass
 
             
-            # --- RISK-BASED NOTIONAL CAP (ATR stop sizing) ---
-            # Limit each symbol's weight so loss at initial SL ≤ risk_per_trade × equity.
-            try:
-                atr_len_rb = int(getattr(cfg.risk, "atr_len", 28))
-                atr_mult_sl_rb = float(getattr(cfg.risk, "atr_mult_sl", 2.0))
-                risk_per_trade_rb = float(getattr(cfg.risk, "risk_per_trade", 0.0))
-                if risk_per_trade_rb > 0 and atr_mult_sl_rb > 0 and eq and eq > 0:
-                    for _s in list(targets.index):
-                        try:
-                            df_b = bars.get(_s)
-                            if df_b is None or df_b.empty:
+            # --- FIXED RISK-PER-TRADE SIZING (roadmap) ---
+            # If sizing_mode == "fixed_r", size positions based on fixed % risk per trade
+            sizing_mode = str(getattr(cfg.risk, "sizing_mode", "inverse_vol") or "inverse_vol").strip().lower()
+            if sizing_mode == "fixed_r" and eq and eq > 0:
+                try:
+                    atr_len_rb = int(getattr(cfg.risk, "atr_len", 28))
+                    atr_mult_sl_rb = float(getattr(cfg.risk, "atr_mult_sl", 2.0))
+                    risk_per_trade_pct = float(getattr(cfg.risk, "risk_per_trade_pct", 0.005))  # Default 0.5%
+                    
+                    if risk_per_trade_pct > 0 and atr_mult_sl_rb > 0:
+                        risk_amount = risk_per_trade_pct * eq  # Risk in notional USDT
+                        
+                        for _s in list(targets.index):
+                            try:
+                                w_old = float(targets.loc[_s])
+                                if abs(w_old) < 1e-6:
+                                    continue
+                                
+                                df_b = bars.get(_s)
+                                if df_b is None or df_b.empty:
+                                    log.debug(f"[FIXED-R] Skipping {_s}: no bars")
+                                    continue
+                                
+                                close_last = float(df_b["close"].iloc[-1])
+                                if close_last <= 0:
+                                    continue
+                                
+                                # Compute ATR and stop distance
+                                atr_val = float(compute_atr(df_b, n=atr_len_rb, method="rma").iloc[-1])
+                                if atr_val <= 0:
+                                    log.debug(f"[FIXED-R] Skipping {_s}: invalid ATR")
+                                    continue
+                                
+                                # Stop distance in price units
+                                stop_distance = atr_val * atr_mult_sl_rb
+                                
+                                # Position size: risk_amount / stop_distance
+                                # This gives us the position size in units
+                                position_size_units = risk_amount / max(stop_distance, 1e-12)
+                                
+                                # Convert to weight: (position_size_units * price) / equity
+                                position_notional = position_size_units * close_last
+                                w_fixed = position_notional / max(eq, 1e-12)
+                                
+                                # Apply sign and cap to existing max_weight_per_asset
+                                max_w = float(getattr(cfg.strategy, "max_weight_per_asset", 0.10))
+                                w_fixed = np.sign(w_old) * min(abs(w_fixed), max_w if max_w > 0 else 0.10)
+                                
+                                targets.loc[_s] = w_fixed
+                                
+                            except Exception as e:
+                                log.debug(f"[FIXED-R] Error sizing {_s}: {e}")
                                 continue
-                            close_last = float(df_b["close"].iloc[-1])
-                            if close_last <= 0:
-                                continue
-                            atr_val = float(compute_atr(df_b, n=atr_len_rb, method="rma").iloc[-1])
-                            stop_pct = (atr_val * atr_mult_sl_rb) / max(close_last, 1e-12)
-                            if stop_pct <= 0:
-                                continue
-                            cap_w_risk = risk_per_trade_rb / stop_pct
-                            w_old = float(targets.loc[_s])
-                            targets.loc[_s] = float((cap_w_risk if w_old >= 0 else -cap_w_risk)) if abs(w_old) > cap_w_risk else w_old
-                        except Exception:
-                            continue
-            except Exception as _e_rb:
-                log.debug(f"risk-based cap skipped: {_e_rb}")
+                        
+                        log.info(f"[FIXED-R] Applied fixed risk sizing: {risk_per_trade_pct:.1%} per trade, {int((targets != 0).sum())} positions")
+                except Exception as e_rb:
+                    log.warning(f"[FIXED-R] Fixed risk sizing failed (non-fatal): {e_rb}", exc_info=False)
 
             # --- HARDENING: enforce per-symbol notional cap in weights \(if set\) ---
             try:

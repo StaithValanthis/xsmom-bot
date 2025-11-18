@@ -428,9 +428,16 @@ class RiskCfg(BaseModel):
     volatility_regime: Dict[str, Any] = Field(default_factory=lambda: {
         "enabled": False,
         "lookback_hours": 72,
-        "high_vol_threshold": 0.0,  # ATR-based metric (computed dynamically)
-        "low_vol_threshold": 0.0,
+        "high_vol_mult": 1.5,  # ATR must exceed 1.5x baseline to trigger scaling
         "max_scale_down": 0.5,  # Scale down to 50% of gross leverage in high vol
+    })
+    
+    # NEW: Long-term drawdown tracking (roadmap)
+    long_term_dd: Dict[str, Any] = Field(default_factory=lambda: {
+        "enabled": False,
+        "max_dd_90d": 0.3,   # 30% max drawdown over 90 days
+        "max_dd_180d": 0.4,  # 40% max drawdown over 180 days
+        "max_dd_365d": 0.5,  # 50% max drawdown over 365 days
     })
 
     # Legacy compat (removed per parameter review - dead code)

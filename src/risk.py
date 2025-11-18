@@ -78,3 +78,48 @@ def check_max_portfolio_drawdown(
     should_stop = current_dd_pct >= float(max_drawdown_pct)
     
     return should_stop, current_dd_pct, high_watermark
+
+
+def compute_long_term_drawdowns(
+    equity_history: Dict[str, float],
+    current_equity: float,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    NEW: Compute long-term drawdowns (90-day, 180-day, 365-day) (roadmap).
+    
+    Args:
+        equity_history: Dict mapping ISO timestamps to equity values
+        current_equity: Current portfolio equity
+    
+    Returns:
+        Tuple of (dd_90d, dd_180d, dd_365d) as fractions (0.0-1.0), or None if insufficient data
+    """
+    if not equity_history or current_equity <= 0:
+        return None, None, None
+    
+    now = datetime.utcnow()
+    
+    def _compute_dd_for_window(days: int) -> Optional[float]:
+        cutoff = now - timedelta(days=days)
+        high_watermark = None
+        
+        for ts_str, equity in equity_history.items():
+            try:
+                ts = pd.Timestamp(ts_str)
+                if ts >= cutoff:
+                    if high_watermark is None or equity > high_watermark:
+                        high_watermark = equity
+            except (ValueError, TypeError):
+                continue
+        
+        if high_watermark is None or high_watermark <= 0:
+            return None
+        
+        dd = _drawdown_pct(high_watermark, current_equity) / 100.0  # Convert to fraction
+        return dd
+    
+    dd_90d = _compute_dd_for_window(90)
+    dd_180d = _compute_dd_for_window(180)
+    dd_365d = _compute_dd_for_window(365)
+    
+    return dd_90d, dd_180d, dd_365d

@@ -10,6 +10,8 @@ import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
 from .config import ExchangeCfg
 from .risk_controller import APICircuitBreaker
+from .data.cache import get_cache_instance, OHLCVCache
+from .data.validator import validate_ohlcv
 
 log = logging.getLogger("exchange")
 
@@ -31,6 +33,14 @@ class ExchangeWrapper:
         """
         self.cfg = cfg
         self.data_cfg = data_cfg
+        
+        # Initialize OHLCV cache if enabled
+        self.cache: Optional[OHLCVCache] = None
+        if data_cfg and data_cfg.cache.get("enabled", False):
+            cache_path = data_cfg.cache.get("db_path", "data/ohlcv_cache.db")
+            self.cache = get_cache_instance(cache_path)
+            if self.cache:
+                log.info(f"OHLCV cache enabled: {cache_path}")
         
         # Circuit breaker for API failures (MAKE MONEY hardening)
         # Get config from risk_cfg if provided, else default
@@ -147,6 +157,8 @@ class ExchangeWrapper:
         Bybit limits single requests to 1000 bars. This method automatically
         paginates to fetch more data when limit > 1000.
         
+        NEW: Supports OHLCV cache and data validation (roadmap).
+        
         Args:
             symbol: Symbol to fetch (e.g., 'BTC/USDT:USDT')
             timeframe: Bar timeframe (e.g., '1h', '5m')
@@ -156,6 +168,25 @@ class ExchangeWrapper:
         Returns:
             List of [timestamp, open, high, low, close, volume] arrays
         """
+        # Check cache first if enabled
+        if self.cache and since is not None:
+            # Try to get from cache
+            cached_bars = self.cache.get_ohlcv(symbol, timeframe, start_ts=since)
+            if cached_bars and len(cached_bars) >= limit:
+                # Validate cached data
+                if self.data_cfg and self.data_cfg.validation.get("enabled", True):
+                    val_result = validate_ohlcv(
+                        cached_bars,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        **{k: v for k, v in self.data_cfg.validation.items() if k != "enabled"}
+                    )
+                    if val_result.is_valid():
+                        log.debug(f"[CACHE] Using {len(cached_bars)} cached bars for {symbol}")
+                        return cached_bars[:limit]
+                    else:
+                        log.warning(f"[CACHE] Cached data failed validation for {symbol}, fetching fresh")
+        
         # Bybit API limit per request (configurable via data_cfg)
         if self.data_cfg:
             MAX_BARS_PER_REQUEST = self.data_cfg.max_candles_per_request
@@ -269,6 +300,25 @@ class ExchangeWrapper:
                 all_bars = all_bars[-limit:]
         
         log.debug(f"Fetched {len(all_bars)} bars for {symbol} (requested {limit})")
+        
+        # Validate data before returning
+        if self.data_cfg and self.data_cfg.validation.get("enabled", True):
+            val_result = validate_ohlcv(
+                all_bars,
+                symbol=symbol,
+                timeframe=timeframe,
+                **{k: v for k, v in self.data_cfg.validation.items() if k != "enabled"}
+            )
+            if not val_result.is_valid():
+                log.warning(f"[VALIDATE] {symbol}: Data validation failed but continuing (errors: {len(val_result.errors)})")
+        
+        # Store in cache if enabled
+        if self.cache and all_bars:
+            try:
+                self.cache.store_ohlcv(symbol, timeframe, all_bars)
+            except Exception as e:
+                log.debug(f"[CACHE] Failed to store {symbol}: {e}")
+        
         return all_bars
     
     def fetch_ohlcv_range(
@@ -330,7 +380,36 @@ class ExchangeWrapper:
             f"(max {max_candles} candles)"
         )
         
+        # Check cache first if enabled
         all_bars = []
+        if self.cache:
+            try:
+                cached_bars = self.cache.get_ohlcv(symbol, timeframe, start_ts=start_ts, end_ts=end_ts)
+                if cached_bars:
+                    # Check if cache covers the full range
+                    cached_start = cached_bars[0][0] if cached_bars else None
+                    cached_end = cached_bars[-1][0] if cached_bars else None
+                    
+                    if cached_start and cached_end:
+                        # If cache covers full range, use it
+                        if cached_start <= start_ts and cached_end >= end_ts:
+                            log.debug(f"[CACHE] Using {len(cached_bars)} cached bars for {symbol} (full range)")
+                            all_bars = cached_bars
+                        else:
+                            # Partial cache: use what we have, fetch missing parts
+                            log.debug(f"[CACHE] Partial cache for {symbol}: {cached_start} to {cached_end}, fetching gaps")
+                            all_bars = cached_bars
+            except Exception as e:
+                log.debug(f"[CACHE] Cache check failed for {symbol}: {e}")
+        
+        # If we have cached data, determine what's missing
+        if all_bars:
+            # Find gaps in cached data
+            cached_ts_set = {bar[0] for bar in all_bars}
+            # For now, fetch everything fresh if cache is partial (can be optimized later)
+            if len(all_bars) < max_candles:
+                all_bars = []  # Fetch fresh if cache is incomplete
+        
         current_since = start_ts
         request_count = 0
         seen_timestamps = set()
@@ -420,6 +499,24 @@ class ExchangeWrapper:
             f"{pd.Timestamp(end_ts, unit='ms', tz='UTC')}, "
             f"{request_count} requests)"
         )
+        
+        # Validate data before returning
+        if self.data_cfg and self.data_cfg.validation.get("enabled", True):
+            val_result = validate_ohlcv(
+                all_bars,
+                symbol=symbol,
+                timeframe=timeframe,
+                **{k: v for k, v in self.data_cfg.validation.items() if k != "enabled"}
+            )
+            if not val_result.is_valid():
+                log.warning(f"[VALIDATE] {symbol}: Data validation failed but continuing (errors: {len(val_result.errors)})")
+        
+        # Store in cache if enabled
+        if self.cache and all_bars:
+            try:
+                self.cache.store_ohlcv(symbol, timeframe, all_bars)
+            except Exception as e:
+                log.debug(f"[CACHE] Failed to store {symbol}: {e}")
         
         return all_bars
     
