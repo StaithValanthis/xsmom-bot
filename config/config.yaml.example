@@ -1,34 +1,49 @@
+# ============================================================================
+# XSMOM Crypto Trading Bot - Example Configuration
+# ============================================================================
+# This is a minimal, production-ready example config showing core parameters.
+# See docs/reference/config_reference.md for full documentation.
+#
+# ROADMAP ALIGNMENT: This config reflects the simplified parameter space:
+# - Optimizer uses only 11 core parameters (reduced from 15+)
+# - Legacy filters (ADX, meta-labeler, majors regime) disabled by default
+# - New risk features (R-multiple targets, fixed-R sizing, vol regime) included
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Exchange Configuration
+# ----------------------------------------------------------------------------
 exchange:
   id: bybit
   account_type: swap
   quote: USDT
   only_perps: true
   unified_margin: true
-  testnet: false
+  testnet: false  # Set to true for testing
   max_symbols: 36
   min_usd_volume_24h: 100000000
   min_price: 0.05
   timeframe: 1h
-  candles_limit: 5000  # Increased to support default WFO (120/30/2 days = ~152 days = ~3648 bars at 1h)
+  candles_limit: 5000
   recv_window_ms: 10000
-  include_symbols: []
-  exclude_symbols: []
+  include_symbols: []  # Optional: whitelist specific symbols
+  exclude_symbols: []  # Optional: blacklist symbols
 
-# Historical data fetching configuration
-# Controls pagination and rate limiting for fetching >1000 bars from Bybit
+# ----------------------------------------------------------------------------
+# Data Pipeline (NEW: Roadmap features)
+# ----------------------------------------------------------------------------
 data:
-  max_candles_per_request: 1000  # Bybit's per-request limit (do not change)
-  max_candles_total: 50000       # Safety cap per symbol/timeframe (prevents runaway fetches)
-  api_throttle_sleep_ms: 200     # Sleep between paginated requests (milliseconds)
-  max_pagination_requests: 100   # Safety limit on number of pagination requests per fetch
+  max_candles_per_request: 1000  # Bybit API limit
+  max_candles_total: 50000
+  api_throttle_sleep_ms: 200
   
-  # NEW: Historical OHLCV cache (roadmap - reduces API calls)
+  # Historical OHLCV cache (reduces API calls)
   cache:
-    enabled: false  # Disabled by default (enable to reduce API calls)
+    enabled: false  # Enable to cache historical data locally
     db_path: "data/ohlcv_cache.db"
     max_candles_total: 50000
   
-  # NEW: Data quality validation (roadmap)
+  # Data quality validation
   validation:
     enabled: true  # Enabled by default (checks OHLC consistency, gaps, spikes)
     check_ohlc_consistency: true
@@ -37,232 +52,55 @@ data:
     check_spikes: true
     spike_zscore_threshold: 5.0
 
+# ----------------------------------------------------------------------------
+# Core Strategy Parameters (11 optimized parameters)
+# ----------------------------------------------------------------------------
 strategy:
-  ensemble:
-    enabled: true
-    weights:
-      xsec: 0.6
-      ts: 0.2
-      breakout: 0.2
-    ts_len: 48
-    breakout_len: 96
-
-  funding_trim:
-    enabled: true
-    threshold_bps: 1.2
-    slope_per_bps: 0.20
-    max_reduction: 0.6
-
-  confirmation:
-    enabled: true
-    lookback_bars: 4
-    z_boost: 0.10
-
-  signal_power: 1.35  # Optimized in optimizer (range: [1.0, 1.5])
-  lookbacks: [1, 6, 24]  # Optimized: lookbacks[0] and lookbacks[2] (short and long)
+  # Signal generation (optimized in optimizer)
+  signal_power: 1.35  # Optimizer range: [1.0, 1.5]
+  lookbacks: [12, 24, 48]  # Optimized: lookbacks[0] (short) and lookbacks[2] (long)
   lookback_weights: [1.0, 1.0, 1.0]
-  vol_lookback: 96  # Optimized in optimizer (range: [48, 144], for inverse-vol sizing)
-
+  vol_lookback: 96  # Optimizer range: [48, 144]
+  
+  # Position selection (optimized in optimizer)
+  k_min: 2  # Optimizer range: [2, 4]
+  k_max: 6  # Optimizer range: [4, 8]
+  
+  # Portfolio sizing (optimized in optimizer)
   market_neutral: true
-  gross_leverage: 0.95  # Optimized in optimizer (range: [0.75, 1.5])
-  max_weight_per_asset: 0.10  # Locked at 0.10 (roadmap: not optimized)
-
+  gross_leverage: 0.95  # Optimizer range: [0.75, 1.5]
+  max_weight_per_asset: 0.10  # Locked at 0.10 (not optimized)
+  
+  # Core filters
   regime_filter:
     enabled: true
-    ema_len: 200  # Locked at 200 (roadmap: not optimized)
-    slope_min_bps_per_day: 3.5  # Optimized in optimizer
+    ema_len: 200  # Locked at 200 (not optimized)
+    slope_min_bps_per_day: 3.5  # Optimizer range: [1.0, 5.0]
     use_abs: true
-
-  adx_filter:
-    enabled: false  # Disabled by default (roadmap: removed from optimizer)
-    len: 14
-    min_adx: 28.0
-    require_rising: true
-    use_di_alignment: true
-    min_di_separation: 0.0
-    di_hysteresis_bps: 0.0
-
+  
   symbol_filter:
     enabled: true
     whitelist: []
     banlist: []
-    exclude: []
     score:
       enabled: true
-      min_sample_trades: 4
-      ema_alpha: 0.25
-      min_win_rate_pct: 50.0
-      pf_downweight_threshold: 1.10
-      downweight_factor: 0.60
-      block_below_win_rate_pct: 0.0
-      pf_block_threshold: 1.25
-      pnl_block_threshold_usdt_per_trade: -0.015
-      ban_minutes: 1440
-      grace_trades_after_unban: 1
-      decay_days: 14
-      pf_warn_threshold: 1.20
-      rolling_window_hours: 168
-      max_daily_loss_per_symbol_usdt: 0.8
-
-  time_of_day_whitelist:
-    enabled: true
-    use_ema: true
-    ema_alpha: 0.20
-    min_trades_per_hour: 12
-    min_hours_allowed: 5
-    threshold_bps: 0.14
-    fixed_hours: []
-    downweight_factor: 0.58
-    boost_good_hours: true
-    boost_factor: 1.15
-    fixed_good_hours: []
-    require_consecutive_good_hours: 3
-    blackout_hours_utc: []
-    timezone: UTC
-
-  funding_tilt:
-    enabled: true
-    weight: 0.25
-
-  diversify:
-    enabled: true
-    corr_lookback: 48
-    max_pair_corr: 0.70
-
-  vol_target:
-    enabled: false
-    target_daily_vol_bps: 100.0
-    min_scale: 0.6
-    max_scale: 1.3
-
-  entry_throttle:
-    max_new_positions_per_cycle: 3
-    max_open_positions: 12
-    per_symbol_trade_cooldown_min: 45
-    min_entry_zscore: 0.80
-
-  soft_kill:
-    enabled: true
-    soft_daily_loss_pct: 5.0
-    resume_after_minutes: 60
-
-  soft_win_lock:
-    enabled: false
-    arm_after_r: 0.0
-    lock_r: 0.0
-    cooldown_minutes: 0
-
-  liquidity_caps:
-    enabled: false
-    max_weight_low_liq: 0.08
-    symbols_low_liq: []
-
-  majors_regime:
-    enabled: false  # Disabled by default (roadmap: removed from optimizer)
-    majors:
-      - BTC/USDT:USDT
-      - ETH/USDT:USDT
-    ema_len: 200
-    slope_bps_per_day: 1.0
-    action: downweight
-    downweight_factor: 0.6
+      min_trades: 8
+      win_rate_threshold: 0.40
+      pf_threshold: 1.2
+      ban_hours: 24
   
-  # NEW: Meta-labeler (roadmap: disabled by default, removed from optimizer)
-  meta_label:
-    enabled: false  # Disabled by default
-
-  kelly:
-    enabled: true
-    base_frac: 0.5
-    half_kelly: true
-    min_scale: 0.5
-    max_scale: 1.6
-
-  confirmation_timeframe: 4h
-  confirmation_lookback: 6
-  require_mtf_alignment: true
-
-  dynamic_entry_band:
-    enabled: true
-    high_corr:
-      threshold: 0.80
-      zmin: 0.75
-    mid_corr:
-      threshold: 0.60
-      zmin: 0.60
-    low_corr:
-      threshold: 0.45
-      zmin: 0.50
-
-  selection:
-    enabled: true
-    k_min: 2
-    k_max: 6
-    kappa: 6.0
-    fallback_k: 6
-
+  # Portfolio volatility targeting (optimized in optimizer)
   portfolio_vol_target:
     enabled: true
-    target_ann_vol: 0.24
+    target_ann_vol: 0.24  # Optimizer range: [0.15, 0.40]
     lookback_hours: 72
     min_scale: 0.5
     max_scale: 1.6
-    bars_per_year: 8760.0
-
-  breadth_gate:
-    enabled: true
-    min_fraction: 0.20
-    zero_when_blocked: true
-
-  sleeve_constraints:
-    meme:
-      symbols: [DOGEUSDT, PEPEUSDT, SHIBUSDT]
-      max_total_weight: 0.10
-      sleeve_vol_bps: 60.0
-
-  shock_mode:
-    enabled: true
-    vol_z_threshold: 2.5
-    cap_scale: 0.7
-
-  cluster_diversify:
-    enabled: true
-    lookback: 240
-    corr_threshold: 0.75
-    max_per_cluster: 2
-
-  meta_label:
-    enabled: true
-    min_prob: 0.72
-    learning_rate: 0.05
-    l2: 0.001
-    breakout_len: 96
-    vol_len: 48
-    state_path: meta_label_state.json
-
-  trailing:
-    adaptive:
-      enabled: true
-      base_mult: 1.0
-      by_vol:
-        low: 0.9
-        mid: 1.0
-        high: 1.2
-      ema:
-        len: 200
-        slope_min_bps_per_day: 0.0
-        use_abs: false
-        bull_mult: 0.95
-        bear_mult: 1.1
-
-  dynamic_k: true
-
-  dispersion_gate:
-    threshold: 0.60
-
+  
+  # Carry sleeve (optimized in optimizer)
   carry:
     enabled: true
-    budget_frac: 0.25  # Optimized in optimizer (roadmap: carry budget optimization)
+    budget_frac: 0.25  # Optimizer range: [0.0, 0.40] - fraction of risk capital for carry
     hedge_market_neutral: true
     per_asset_cap: 0.14
     funding:
@@ -275,195 +113,187 @@ strategy:
       min_annualized: 0.05
       min_zscore: 0.8
   
-  # NEW: Volatility breakout entry gate (roadmap)
+  # Volatility breakout entry gate (NEW: Roadmap)
   volatility_entry:
     enabled: false  # Disabled by default
     atr_lookback: 48
-    expansion_mult: 1.5  # Require ATR > 1.5x rolling mean before allowing new entries
-
-risk:
-  target_daily_vol_bps: 60
-  vol_clamp_min: 0.6
-  vol_clamp_max: 1.3
-  fractional_kelly: 0.5
-  dd_soft_kill:
-    enabled: true
-    lookback_days: 30
-    soft_kill_at_drawdown: 0.12
-    resume_after_minutes: 120
+    expansion_mult: 1.5  # Require ATR > 1.5x rolling mean before new entries
   
-  # MAKE MONEY hardening: Margin protection
-  margin_soft_limit_pct: 0.0  # 0.0 = disabled, e.g., 80.0 for 80% margin usage
-  margin_hard_limit_pct: 0.0  # 0.0 = disabled, e.g., 90.0 for 90% margin usage (close positions)
-  margin_action: "pause"  # "pause" = stop new trades, "close" = close all positions
+  # Entry throttling
+  entry_throttle:
+    max_new_positions_per_cycle: 3
+    max_open_positions: 12
+    per_symbol_trade_cooldown_min: 45
+    min_entry_zscore: 0.0  # Locked at 0.0 (not optimized)
   
-  # MAKE MONEY hardening: API circuit breaker
-  api_circuit_breaker:
+  # Kelly scaling (optional)
+  kelly:
     enabled: true
-    max_errors: 5  # Max errors in window
-    window_seconds: 300  # 5 minutes
-    cooldown_seconds: 600  # 10 minutes cooldown after trip
-
-liquidity:
-  adv_cap_pct: 0.08
-  notional_cap_usdt: 20000.0
-
-execution:
-  reload_positions_on_start: true
-  order_type: limit
-  post_only: true
-  child_order_ttl_ms: 750
-  cancel_retries_max: 2
-  maker_ttl_secs: 25
-  price_offset_bps: 2.8
-  slippage_bps_guard: 25.0
-  set_leverage: 1
-  rebalance_minute: 1
-  poll_seconds: 10
-  align_after_funding_minutes: 0
-  funding_hours_utc: []
-  min_notional_per_order_usdt: 5.0
-  min_rebalance_delta_bps: 6.0
-
-  throttle:
-    min_seconds_between_entries_per_symbol: 30
-    max_entries_per_hour_per_symbol: 2
-    max_entries_per_day_per_symbol: 6
-
-  pyramiding:
+    base_frac: 0.5
+    half_kelly: true
+    min_scale: 0.5
+    max_scale: 1.6
+  
+  # ========================================================================
+  # ADVANCED / OPTIONAL FEATURES (disabled by default)
+  # ========================================================================
+  # These features are available but not part of the core optimizer space.
+  # Enable only if you understand their impact.
+  
+  # ADX filter (roadmap: disabled by default, removed from optimizer)
+  adx_filter:
     enabled: false
-    allow_when_rr_ge: 0.8
+    min_adx: 25.0
+  
+  # Meta-labeler (roadmap: disabled by default, removed from optimizer)
+  meta_label:
+    enabled: false
+  
+  # Majors regime filter (roadmap: disabled by default, removed from optimizer)
+  majors_regime:
+    enabled: false
+    majors:
+      - BTC/USDT:USDT
+      - ETH/USDT:USDT
+    ema_len: 200
+    slope_bps_per_day: 1.0
+    action: downweight
+    downweight_factor: 0.6
+  
+  # Time-of-day whitelist (optional)
+  time_of_day_whitelist:
+    enabled: false
+    use_ema: true
+    ema_alpha: 0.20
+    min_trades_per_hour: 12
+    min_hours_allowed: 5
+    threshold_bps: 0.14
+    fixed_hours: []
+    boost_good_hours: false
+    boost_factor: 1.15
+    fixed_good_hours: []
+    require_consecutive_good_hours: 3
+    blackout_hours_utc: []
+    timezone: UTC
+  
+  # Funding tilt/trim (optional)
+  funding_tilt:
+    enabled: false
+    weight: 0.25
+  
+  funding_trim:
+    enabled: false
+    threshold_bps: 1.2
+    slope_per_bps: 0.20
+    max_reduction: 0.6
+  
+  # Diversification (optional)
+  diversify:
+    enabled: false
+    corr_lookback: 48
+    max_pair_corr: 0.70
+  
+  # Soft kill switch (optional)
+  soft_kill:
+    enabled: false
+    soft_daily_loss_pct: 5.0
+    resume_after_minutes: 60
+  
+  # Liquidity caps (optional)
+  liquidity_caps:
+    enabled: false
+    max_weight_low_liq: 0.08
+    symbols_low_liq: []
 
-  cancel_open_orders_on_start: false
-
-  stale_orders:
-    enabled: true
-    cleanup_interval_sec: 60
-    max_age_sec: 180
-    reprice_if_far_bps: 15.0
-    cancel_if_not_targeted: true
-    keep_reduce_only: true
-
-  spread_guard:
-    enabled: true
-    max_spread_bps: 9
-    skip_if_wider: true
-
-  dynamic_offset:
-    enabled: true
-    base_bps: 2.8
-    per_spread_coeff: 0.50
-    max_offset_bps: 3.0
-
-  microstructure:
-    enabled: true
-    min_obi: 0.20
-    max_spread_bps: 6
-    min_top_of_book_depth_usd: 10000
-
-  bump_to_exchange_min: true
-  offset_mode: dynamic
-  offset_bps_min: 0.5
-  offset_bps_max: 2.5
-  spread_guard_bps_max: 15
-  min_order_notional_usd: 5.0
-  cancel_stale_after_seconds: 15
-
-  retry:
-    enabled: true
-    on_request_timeout: 1
-    backoff_seconds: 1
-
+# ----------------------------------------------------------------------------
+# Risk Management (Position & Portfolio Level)
+# ----------------------------------------------------------------------------
 risk:
+  # Stop-loss (optimized in optimizer)
   atr_len: 28
-  atr_mult_sl: 1.7
-  atr_mult_tp: 0.0
-  use_tp: false
+  atr_mult_sl: 1.7  # Optimizer range: [1.5, 3.0]
+  catastrophic_atr_mult: 3.5
+  
+  # Fast SL/TP checking
   fast_check_seconds: 2
   stop_timeframe: 5m
-
-  trailing_enabled: true
-  trail_atr_mult: 1.10
-
-  trailing_sl:
-    enabled: true
-    type: ma_atr
-    ma_len: 34
-    atr_length: 28
-    multiplier: 1.6
-    cooldown_bars: 2
-
-  breakeven_after_r: 0.60
   stop_on_close_only: false
   stop_confirm_bars: 0
   min_hold_minutes: 0
-  catastrophic_atr_mult: 2.0
   stop_buffer_bps: 0.0
   cooldown_minutes_after_stop: 20
-  reentry_after_loss_minutes: 30
-
-  # Entry/Exit improvements (roadmap)
-  trailing_enabled: true  # Enabled by default
-  trail_atr_mult: 1.0  # Locked at 1.0 (not optimized)
-  breakeven_after_r: 0.5  # Enabled by default (move stop to entry after 0.5R profit)
-  max_hours_in_trade: 48  # Enabled by default (exit after 48 hours)
   
-  # NEW: R-multiple profit targets (roadmap)
+  # Trailing stops (roadmap: enabled by default)
+  trailing_enabled: true
+  trail_atr_mult: 1.0  # Locked at 1.0 (not optimized)
+  
+  # Breakeven moves (roadmap: enabled by default)
+  breakeven_after_r: 0.5  # Move stop to entry after 0.5R profit
+  
+  # Time-based exits (roadmap: enabled by default)
+  max_hours_in_trade: 48  # Exit after 48 hours
+  
+  # R-multiple profit targets (NEW: Roadmap)
   profit_targets:
-    enabled: false  # Disabled by default
+    enabled: false  # Disabled by default (enable for explicit profit-taking)
     targets:
       - { r_multiple: 2.0, exit_pct: 0.5 }   # Exit 50% at 2R
       - { r_multiple: 3.0, exit_pct: 0.25 }  # Exit 25% at 3R
   
-  # Legacy partial TP (deprecated, use profit_targets instead)
-  partial_tp_enabled: false
-  partial_tp_r: 0.75
-  partial_tp_size: 0.45
-  
-  # NEW: Fixed risk-per-trade sizing (roadmap)
+  # Sizing modes (NEW: Roadmap)
   sizing_mode: "inverse_vol"  # "inverse_vol" (default) or "fixed_r"
   risk_per_trade_pct: 0.005  # 0.5% per trade (if sizing_mode == "fixed_r")
   
-  # NEW: Correlation limits (roadmap)
+  # Portfolio-level risk
+  max_daily_loss_pct: 5.0
+  max_portfolio_drawdown_pct: 0.0  # 0.0 = disabled, e.g., 15.0 for 15% max DD
+  portfolio_dd_window_days: 30
+  trade_disable_minutes: 0
+  use_trailing_killswitch: false
+  
+  # Max position count hard cap (NEW: Roadmap)
+  max_open_positions_hard: 8
+  
+  # Correlation limits (NEW: Roadmap)
   correlation:
     enabled: false  # Disabled by default
     lookback_hours: 48
     max_allowed_corr: 0.8
     max_high_corr_positions: 2
   
-  # NEW: Max position count hard cap (roadmap)
-  max_open_positions_hard: 8
-  
-  # NEW: Volatility regime-based leverage scaling (roadmap)
+  # Volatility regime-based leverage scaling (NEW: Roadmap)
   volatility_regime:
     enabled: false  # Disabled by default
     lookback_hours: 72
     high_vol_mult: 1.5  # ATR must exceed 1.5x baseline to trigger scaling
     max_scale_down: 0.5  # Scale down to 50% of gross leverage in high vol
   
-  # NEW: Long-term drawdown tracking (roadmap)
+  # Long-term drawdown tracking (NEW: Roadmap)
   long_term_dd:
     enabled: false  # Disabled by default
     max_dd_90d: 0.3   # 30% max drawdown over 90 days
     max_dd_180d: 0.4  # 40% max drawdown over 180 days
     max_dd_365d: 0.5  # 50% max drawdown over 365 days
   
-  max_daily_loss_pct: 12.0
-  trade_disable_minutes: 0
-  use_trailing_killswitch: true
-  min_close_pnl_pct: 0.0
-
-  trailing_unlocks:
-    enabled: false
-    triggers_r: []
-    lock_r: []
-
-  exit_on_regime_flip:
+  # Margin protection (MAKE MONEY hardening)
+  margin_soft_limit_pct: 0.0  # 0.0 = disabled, e.g., 80.0 for 80% margin usage
+  margin_hard_limit_pct: 0.0  # 0.0 = disabled, e.g., 90.0 for 90% margin usage
+  margin_action: "pause"  # "pause" = stop new trades, "close" = close all positions
+  
+  # API circuit breaker (MAKE MONEY hardening)
+  api_circuit_breaker:
     enabled: true
-    confirm_bars: 1
-
+    max_errors: 5  # Max errors in window
+    window_seconds: 300  # 5 minutes
+    cooldown_seconds: 600  # 10 minutes cooldown after trip
+  
+  # ========================================================================
+  # ADVANCED RISK FEATURES (optional)
+  # ========================================================================
+  
+  # Adaptive risk scaling
   adaptive:
-    enabled: true
+    enabled: false
     low_thr_bps: 40.0
     high_thr_bps: 120.0
     sl_scale:
@@ -474,34 +304,39 @@ risk:
       low: 1.2
       mid: 1.0
       high: 0.8
-    ladder_r_scale:
-      low: 1.1
-      mid: 1.0
-      high: 0.9
-
+  
+  # Partial profit ladders
   partial_ladders:
-    enabled: true
+    enabled: false
     r_levels: [0.80]
     sizes: [0.30]
     reduce_only: true
-
+  
+  # No-progress exits
   no_progress:
-    enabled: true
+    enabled: false
     min_minutes: 120
     min_rr: 0.70
     min_close_pnl_pct: 0.0
-    tiers: null
-
+  
+  # Exit on regime flip
+  exit_on_regime_flip:
+    enabled: false
+    confirm_bars: 1
+  
+  # Trailing unlocks
+  trailing_unlocks:
+    enabled: false
+    triggers_r: []
+    lock_r: []
+  
+  # Profit lock
   profit_lock:
     enabled: false
     triggers_r: []
     lock_to_r: []
-
-  profit_lock_steps: null
-  breakeven_extra_bps: 0.0
-  trail_after_partial_mult: 0.10
-  age_tighten: null
-
+  
+  # Anti-churn (reduces overtrading)
   anti_churn:
     enabled: true
     cooldown_minutes: 20
@@ -517,6 +352,81 @@ risk:
       hysteresis_z: 0.10
     min_bar_separation: 1
 
+# ----------------------------------------------------------------------------
+# Execution & Order Management
+# ----------------------------------------------------------------------------
+execution:
+  reload_positions_on_start: true
+  order_type: limit
+  post_only: true
+  price_offset_bps: 2.8
+  set_leverage: 1
+  rebalance_minute: 1
+  poll_seconds: 10
+  align_after_funding_minutes: 0
+  funding_hours_utc: []
+  min_notional_per_order_usdt: 5.0
+  min_rebalance_delta_bps: 6.0
+  
+  throttle:
+    min_seconds_between_entries_per_symbol: 30
+    max_entries_per_hour_per_symbol: 2
+    max_entries_per_day_per_symbol: 6
+  
+  # Spread guard (optional)
+  spread_guard:
+    enabled: true
+    max_spread_bps: 9
+    skip_if_wider: true
+  
+  # Dynamic offset (optional)
+  dynamic_offset:
+    enabled: true
+    base_bps: 2.8
+    per_spread_coeff: 0.50
+    max_offset_bps: 3.0
+  
+  # Microstructure checks (optional)
+  microstructure:
+    enabled: true
+    min_obi: 0.20
+    max_spread_bps: 6
+    min_top_of_book_depth_usd: 10000
+  
+  # Stale order cleanup
+  stale_orders:
+    enabled: true
+    cleanup_interval_sec: 60
+    max_age_sec: 180
+    reprice_if_far_bps: 15.0
+    cancel_if_not_targeted: true
+    keep_reduce_only: true
+  
+  # Retry logic
+  retry:
+    enabled: true
+    on_request_timeout: 1
+    backoff_seconds: 1
+  
+  cancel_open_orders_on_start: false
+  bump_to_exchange_min: true
+  offset_mode: dynamic
+  offset_bps_min: 0.5
+  offset_bps_max: 2.5
+  spread_guard_bps_max: 15
+  min_order_notional_usd: 5.0
+  cancel_stale_after_seconds: 15
+
+# ----------------------------------------------------------------------------
+# Liquidity Constraints
+# ----------------------------------------------------------------------------
+liquidity:
+  adv_cap_pct: 0.08
+  notional_cap_usdt: 20000.0
+
+# ----------------------------------------------------------------------------
+# Optimizer Configuration
+# ----------------------------------------------------------------------------
 optimizer:
   # OOS sample size requirements
   oos_min_bars_for_deploy: 200
@@ -528,16 +438,19 @@ optimizer:
   ignore_baseline_if_oos_too_small: true
   warn_on_small_oos: true
   
-  # Database and persistence (for optimizer service)
-  db_path: "data/optimizer.db"  # SQLite database path
-  study_name_prefix: "xsmom_wfo"  # Prefix for Optuna study names
+  # Database and persistence
+  db_path: "data/optimizer.db"
+  study_name_prefix: "xsmom_wfo"
   
   # Historical lookup and filtering
-  skip_known_params: true  # Skip already-tested parameter combinations
-  enable_bad_combo_filter: true  # Enable bad combination filtering
-  bad_combo_min_score: -1.0  # Below this score = bad combo
-  bad_combo_dd_threshold: 0.3  # 30% DD = bad combo
+  skip_known_params: true
+  enable_bad_combo_filter: true
+  bad_combo_min_score: -1.0
+  bad_combo_dd_threshold: 0.3
 
+# ----------------------------------------------------------------------------
+# Paths & Logging
+# ----------------------------------------------------------------------------
 paths:
   state_path: /opt/xsmom-bot/state.json
   logs_dir: /opt/xsmom-bot/logs
@@ -549,40 +462,22 @@ logging:
   file_backups: 5
   audit_unknown_keys: true
 
+# ----------------------------------------------------------------------------
+# Notifications
+# ----------------------------------------------------------------------------
 notifications:
   discord:
-    enabled: false
+    enabled: false  # Set to true and provide webhook_url
     send_optimizer_results: true
     send_daily_report: true
-    # Fallback webhook if DISCORD_WEBHOOK_URL env var is not set.
-    # NOTE: This is the actual webhook; do NOT commit this to a public repo.
-    webhook_url: null
+    webhook_url: null  # Set via DISCORD_WEBHOOK_URL env var or here (NOT in git!)
   
-  # MAKE MONEY hardening: Monitoring and alerts
+  # Monitoring and alerts
   monitoring:
     no_trade:
       enabled: true
       threshold_hours: 4.0  # Alert if no trades for N hours
     cost_tracking:
       enabled: true
-      compare_to_backtest: true  # Compare live costs to backtest assumptions
+      compare_to_backtest: true
       alert_threshold_pct: 20.0  # Alert if costs exceed backtest by N%
-
-# Optimizer deployment and OOS sample size requirements
-# Controls when optimizer results are considered reliable enough for deployment
-optimizer:
-  # Minimum OOS sample size requirements for deployment decisions
-  oos_min_bars_for_deploy: 200      # Minimum OOS bars required before trusting Sharpe for deployment
-  oos_min_days_for_deploy: 5.0      # Minimum OOS days (approximate, based on timeframe)
-  oos_min_trades_for_deploy: 30     # Optional: minimum trades in OOS period (if available)
-  require_min_oos_for_deploy: true   # If true, no deployment when OOS is too small
-  
-  # WFO window preferences (when data is available)
-  prefer_larger_oos_windows: true   # Prefer larger OOS windows when enough data is available
-  max_oos_days_when_available: 60   # Use up to N days for OOS if data allows (default: 60)
-  
-  # Sample size awareness in comparisons
-  ignore_baseline_if_oos_too_small: true  # Ignore baseline metrics if OOS sample is too small
-  warn_on_small_oos: true                 # Log warnings when OOS sample is below minimum
-
-sleeve_constraints: {}
