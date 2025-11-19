@@ -1,0 +1,15 @@
+[Unit]
+Description=Weekly XSMOM Full-Cycle Optimizer Run
+Requires=xsmom-optimizer-full-cycle.service
+
+[Timer]
+# Run every Sunday at 02:00 UTC
+OnCalendar=*-*-Sun 02:00:00 UTC
+AccuracySec=1m
+RandomizedDelaySec=10m
+Persistent=true
+Unit=xsmom-optimizer-full-cycle.service
+
+[Install]
+WantedBy=timers.target
+

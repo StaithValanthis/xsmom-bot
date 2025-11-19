@@ -1,0 +1,25 @@
+[Unit]
+Description=XSMOM Full-Cycle Optimizer (WFO + BO + MC)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/xsmom-bot
+EnvironmentFile=/opt/xsmom-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/xsmom-bot
+Environment=PATH=/opt/xsmom-bot/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/bin/bash -lc '/opt/xsmom-bot/bin/run-optimizer-full-cycle.sh /opt/xsmom-bot/config/config.yaml'
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xsmom-optimizer-full-cycle
+
+# Full-cycle optimizer can take 1-2 hours, so set a generous timeout
+TimeoutStartSec=7200
+
+[Install]
+WantedBy=multi-user.target
+

@@ -529,6 +529,12 @@ install_optimizer_units(){
   install_timer_unit "${dest}" "xsmom-optimizer"
 }
 
+install_full_cycle_optimizer_units(){
+  local dest="$1"
+  install_service_unit "${dest}" "xsmom-optimizer-full-cycle"
+  install_timer_unit "${dest}" "xsmom-optimizer-full-cycle"
+}
+
 install_meta_trainer_units(){
   local dest="$1"
   install_service_unit "${dest}" "xsmom-meta-trainer"
@@ -846,6 +852,10 @@ main(){
     info "Installing optimizer service + timer..."
     install_optimizer_units "${APP_DIR}"
     
+    # Full-cycle optimizer service + timer
+    info "Installing full-cycle optimizer service + timer..."
+    install_full_cycle_optimizer_units "${APP_DIR}"
+    
     # Meta-trainer service + timer
     info "Installing meta-trainer service + timer..."
     install_meta_trainer_units "${APP_DIR}"
@@ -867,12 +877,14 @@ main(){
     
     # Enable timers
     sudo systemctl enable xsmom-optimizer.timer 2>/dev/null || warn "Failed to enable xsmom-optimizer.timer"
+    sudo systemctl enable xsmom-optimizer-full-cycle.timer 2>/dev/null || warn "Failed to enable xsmom-optimizer-full-cycle.timer"
     sudo systemctl enable xsmom-meta-trainer.timer 2>/dev/null || warn "Failed to enable xsmom-meta-trainer.timer"
     sudo systemctl enable xsmom-daily-report.timer 2>/dev/null || warn "Failed to enable xsmom-daily-report.timer"
     sudo systemctl enable xsmom-rollout-supervisor.timer 2>/dev/null || warn "Failed to enable xsmom-rollout-supervisor.timer"
     
     # Start timers (services run on schedule)
     sudo systemctl start xsmom-optimizer.timer 2>/dev/null || warn "Failed to start xsmom-optimizer.timer"
+    sudo systemctl start xsmom-optimizer-full-cycle.timer 2>/dev/null || warn "Failed to start xsmom-optimizer-full-cycle.timer"
     sudo systemctl start xsmom-meta-trainer.timer 2>/dev/null || warn "Failed to start xsmom-meta-trainer.timer"
     sudo systemctl start xsmom-daily-report.timer 2>/dev/null || warn "Failed to start xsmom-daily-report.timer"
     sudo systemctl start xsmom-rollout-supervisor.timer 2>/dev/null || warn "Failed to start xsmom-rollout-supervisor.timer"
@@ -924,6 +936,7 @@ main(){
   info "Installed services:"
   echo "  - ${SERVICE_NAME}.service (main trading bot)"
   echo "  - xsmom-optimizer.service + timer (nightly optimization)"
+  echo "  - xsmom-optimizer-full-cycle.service + timer (weekly full-cycle: WFO + BO + MC)"
   echo "  - xsmom-meta-trainer.service + timer (daily meta-label training)"
   echo "  - xsmom-daily-report.service + timer (daily performance reports)"
   echo "  - xsmom-rollout-supervisor.service + timer (staging/promotion lifecycle)"
