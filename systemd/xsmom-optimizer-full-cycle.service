@@ -17,8 +17,13 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=xsmom-optimizer-full-cycle
 
-# Full-cycle optimizer can take 1-2 hours, so set a generous timeout
-TimeoutStartSec=7200
+# Full-cycle optimizer can take 3-6 hours depending on:
+# - Number of BO trials (default: 100)
+# - Number of MC runs (default: 1000)
+# - Number of WFO segments
+# - Data size and API response times
+# Set timeout to 6 hours (21600 seconds) to allow completion
+TimeoutStartSec=21600
 
 [Install]
 WantedBy=multi-user.target
