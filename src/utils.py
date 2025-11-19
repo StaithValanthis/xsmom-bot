@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -156,6 +157,19 @@ def write_json_atomic(path: str, data: Any) -> None:
 
         # Atomic rename (will fail if target exists and is different filesystem)
         try:
+            # Check if target path is a directory (shouldn't happen, but handle gracefully)
+            if os.path.isdir(path):
+                log.error(f"write_json_atomic: target path is a directory, not a file: {path}")
+                # Try to remove the directory (backup first if it has contents)
+                import shutil
+                backup_path = f"{path}.backup.{int(time.time())}"
+                try:
+                    shutil.move(path, backup_path)
+                    log.warning(f"write_json_atomic: moved directory {path} to {backup_path}")
+                except Exception as backup_err:
+                    log.error(f"write_json_atomic: failed to backup directory {path}: {backup_err}")
+                    raise OSError(f"Cannot write to {path}: it is a directory")
+            
             os.rename(temp_path, path)
             log.debug(f"write_json_atomic: successfully wrote {path}")
         except OSError as e:
@@ -167,7 +181,8 @@ def write_json_atomic(path: str, data: Any) -> None:
             log.error(f"write_json_atomic: failed to rename temp file to {path}: {e}")
             raise
 
-    except json.JSONEncodeError as e:
+    except (TypeError, ValueError) as e:
+        # json.dump() raises TypeError for non-serializable objects, ValueError for other encoding issues
         log.error(f"write_json_atomic: JSON encode error for {path}: {e}")
         raise
 
