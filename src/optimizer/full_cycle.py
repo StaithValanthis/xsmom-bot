@@ -171,10 +171,18 @@ def run_wfo_bo_segment(
     bad_combo_dd_threshold = None
     
     if opt_cfg:
-        skip_known = opt_cfg.get("skip_known_params", True)
-        check_bad_combos = opt_cfg.get("enable_bad_combo_filter", True)
-        bad_combo_min_score = opt_cfg.get("bad_combo_min_score")
-        bad_combo_dd_threshold = opt_cfg.get("bad_combo_dd_threshold")
+        # Handle both dict and Pydantic model
+        if isinstance(opt_cfg, dict):
+            skip_known = opt_cfg.get("skip_known_params", True)
+            check_bad_combos = opt_cfg.get("enable_bad_combo_filter", True)
+            bad_combo_min_score = opt_cfg.get("bad_combo_min_score")
+            bad_combo_dd_threshold = opt_cfg.get("bad_combo_dd_threshold")
+        else:
+            # Pydantic model - access attributes directly
+            skip_known = getattr(opt_cfg, "skip_known_params", True)
+            check_bad_combos = getattr(opt_cfg, "enable_bad_combo_filter", True)
+            bad_combo_min_score = getattr(opt_cfg, "bad_combo_min_score", None)
+            bad_combo_dd_threshold = getattr(opt_cfg, "bad_combo_dd_threshold", None)
     
     # Run Bayesian optimization with DB persistence if available
     optimizer = BayesianOptimizer(
